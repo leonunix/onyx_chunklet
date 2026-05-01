@@ -198,6 +198,27 @@ fn drain_marks_target_chunklets_used_on_replacement() {
     );
 }
 
+/// Regression: create_cpg used to accept HaDomain::Numa / PcieSwitch even
+/// though only HaDomain::Pd is wired. The CPG would persist fine but every
+/// subsequent create_ld_in_cpg failed at allocator validation. Reject up
+/// front so operators see the failure immediately.
+#[test]
+fn create_cpg_rejects_unsupported_ha_domain() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let spec = onyx_chunklet::pool::CpgSpec {
+        name: "bad".into(),
+        raid_level: onyx_chunklet::types::RaidLevel::Mirror,
+        set_size: 2,
+        row_size: 1,
+        strip_size_log2: 0,
+        ha_domain: onyx_chunklet::types::HaDomain::Numa,
+    };
+    let err = pool.create_cpg(spec).err().unwrap();
+    assert!(format!("{}", err).contains("HaDomain") || format!("{}", err).contains("Numa"));
+    assert!(pool.list_cpgs().is_empty(), "CPG must not persist on rejection");
+}
+
 /// Regression: rebuild used to leave the OLD chunklet on a drained
 /// (alive but evicted) PD marked Used, even though the descriptor no
 /// longer referenced it. After many drains a "drained" PD's bitmap

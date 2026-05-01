@@ -222,6 +222,16 @@ impl Pool {
     /// Create a new CPG with the given spec. The CPG persists on every PD's
     /// manifest. Returns the new `CpgId`.
     pub fn create_cpg(self: &Arc<Self>, spec: CpgSpec) -> ChunkletResult<CpgId> {
+        // Reject HaDomain values that the allocator can't honor. Without this
+        // a CPG with HaDomain::Numa / PcieSwitch persists fine, then every
+        // create_ld_in_cpg fails downstream — confusing for operators because
+        // the CPG list shows a config that "works" but never produces an LD.
+        if !spec.ha_domain.is_supported() {
+            return Err(ChunkletError::Unsupported(format!(
+                "CPG HaDomain {:?} (only Pd is wired)",
+                spec.ha_domain
+            )));
+        }
         let _commit = self.manifest_lock.lock();
         let new_id = CpgId::new_v4();
         let desc = CpgDescriptor {
