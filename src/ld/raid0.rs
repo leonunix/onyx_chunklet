@@ -38,6 +38,7 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{compute_strip_bytes, resolve_members, LogicalDisk};
 use crate::pd::PhysicalDisk;
+use crate::pool::PdHealth;
 use crate::types::{LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
 
 const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
@@ -53,6 +54,15 @@ impl LdRaid0 {
     pub fn open(
         desc: LdDescriptor,
         pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+    ) -> ChunkletResult<Self> {
+        let pd_health = crate::ld::healthy_pd_map(pds);
+        Self::open_with_health(desc, pds, &pd_health)
+    }
+
+    pub(crate) fn open_with_health(
+        desc: LdDescriptor,
+        pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
     ) -> ChunkletResult<Self> {
         if desc.raid_level != RaidLevel::Raid0 {
             return Err(ChunkletError::Invariant(format!(
@@ -88,7 +98,7 @@ impl LdRaid0 {
             )));
         }
         let usable_per_chunklet = (CHUNKLET_USER_BYTES / strip_bytes) * strip_bytes;
-        let members = resolve_members(pds, &desc)?;
+        let members = resolve_members(pds, pd_health, &desc)?;
         let capacity = (desc.row_size as u64) * (desc.num_rows as u64) * usable_per_chunklet;
         Ok(Self {
             desc,

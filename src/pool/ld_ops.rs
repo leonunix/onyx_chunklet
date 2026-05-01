@@ -325,23 +325,23 @@ impl Pool {
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", id)))?;
         let inner: Arc<dyn LogicalDisk> = match desc.raid_level {
             RaidLevel::Plain => {
-                let plain = LdPlain::open(desc, &s.pds)?;
+                let plain = LdPlain::open_with_health(desc, &s.pds, &s.pd_health)?;
                 Arc::new(plain)
             }
             RaidLevel::Mirror => {
-                let mirror = LdMirror::open(desc, &s.pds)?;
+                let mirror = LdMirror::open_with_health(desc, &s.pds, &s.pd_health)?;
                 Arc::new(mirror)
             }
             RaidLevel::Raid5 => {
-                let raid5 = LdRaid5::open(desc, &s.pds)?;
+                let raid5 = LdRaid5::open_with_health(desc, &s.pds, &s.pd_health)?;
                 Arc::new(raid5)
             }
             RaidLevel::Raid0 => {
-                let raid0 = LdRaid0::open(desc, &s.pds)?;
+                let raid0 = LdRaid0::open_with_health(desc, &s.pds, &s.pd_health)?;
                 Arc::new(raid0)
             }
             RaidLevel::Raid6 => {
-                let raid6 = LdRaid6::open(desc, &s.pds)?;
+                let raid6 = LdRaid6::open_with_health(desc, &s.pds, &s.pd_health)?;
                 Arc::new(raid6)
             }
         };
@@ -410,7 +410,14 @@ impl Pool {
     }
 
     pub(crate) fn snapshot_free_views(&self) -> ChunkletResult<Vec<PdFreeView>> {
-        let pds = self.state.read().pds.clone();
+        let s = self.state.read();
+        let pds = s
+            .pds
+            .iter()
+            .filter(|(pd_id, _)| s.pd_health.get(pd_id) != Some(&crate::pool::PdHealth::Failed))
+            .map(|(pd_id, pd)| (*pd_id, pd.clone()))
+            .collect();
+        drop(s);
         let map = crate::pool::collect_free_indices_per_pd(&pds, /* include_spare */ false)?;
         Ok(map
             .into_iter()

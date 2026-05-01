@@ -44,6 +44,14 @@ const STRIPE_LOCK_BUCKETS: usize = 1024;
 // StripWrite}` import sites keep working.
 pub(crate) use crate::io::backend::{submit_strip_writes as parallel_strip_writes, StripWrite};
 
+pub fn healthy_pd_map(
+    pds: &std::collections::BTreeMap<crate::types::PdId, Arc<PhysicalDisk>>,
+) -> std::collections::BTreeMap<crate::types::PdId, crate::pool::PdHealth> {
+    pds.keys()
+        .map(|pd| (*pd, crate::pool::PdHealth::Healthy))
+        .collect()
+}
+
 /// Public interface every LD implementation exposes.
 pub trait LogicalDisk: Send + Sync {
     fn id(&self) -> LdId;
@@ -146,10 +154,15 @@ pub(crate) fn compute_strip_bytes(strip_size_log2: u8) -> ChunkletResult<u64> {
 /// on first IO.
 pub(crate) fn resolve_members(
     pds: &std::collections::BTreeMap<crate::types::PdId, Arc<PhysicalDisk>>,
+    pd_health: &std::collections::BTreeMap<crate::types::PdId, crate::pool::PdHealth>,
     desc: &LdDescriptor,
 ) -> ChunkletResult<Vec<Option<Arc<PhysicalDisk>>>> {
     let mut out = Vec::with_capacity(desc.members.len());
     for m in &desc.members {
+        if pd_health.get(&m.pd) == Some(&crate::pool::PdHealth::Failed) {
+            out.push(None);
+            continue;
+        }
         match pds.get(&m.pd) {
             None => out.push(None),
             Some(pd) => {

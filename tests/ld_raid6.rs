@@ -7,7 +7,6 @@ use std::thread;
 
 use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::ld::raid6::LdRaid6;
-use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE};
 use onyx_chunklet::{Pool, PoolConfig};

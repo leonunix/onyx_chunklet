@@ -22,7 +22,7 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{gf256, LdMirror, LdRaid5, LdRaid6};
 use crate::pd::PhysicalDisk;
-use crate::pool::Pool;
+use crate::pool::{PdHealth, Pool};
 use crate::types::{
     ChunkletState, LdId, LdRole, PdId, RaidLevel, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
 };
@@ -101,6 +101,7 @@ impl Pool {
             .find_ld(ld_id)
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", ld_id)))?;
         let pds_snapshot = self.state.read().pds.clone();
+        let pd_health = self.state.read().pd_health.clone();
 
         let mut report = ScrubReport {
             ld_id,
@@ -131,13 +132,13 @@ impl Pool {
                 return Ok(report);
             }
             RaidLevel::Mirror => {
-                self.scrub_mirror(&desc, &pds_snapshot, &mut report)?;
+                self.scrub_mirror(&desc, &pds_snapshot, &pd_health, &mut report)?;
             }
             RaidLevel::Raid5 => {
-                self.scrub_raid5(&desc, &pds_snapshot, &mut report)?;
+                self.scrub_raid5(&desc, &pds_snapshot, &pd_health, &mut report)?;
             }
             RaidLevel::Raid6 => {
-                self.scrub_raid6(&desc, &pds_snapshot, &mut report)?;
+                self.scrub_raid6(&desc, &pds_snapshot, &pd_health, &mut report)?;
             }
         }
         if report.marked_bad > 0 {
@@ -151,9 +152,10 @@ impl Pool {
         &self,
         desc: &LdDescriptor,
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
         report: &mut ScrubReport,
     ) -> ChunkletResult<()> {
-        let _ld = LdMirror::open(desc.clone(), pds_snapshot)?;
+        let _ld = LdMirror::open_with_health(desc.clone(), pds_snapshot, pd_health)?;
         let n = desc.set_size as usize;
         let n_sets = (desc.row_size as usize) * (desc.num_rows as usize);
         let batches = batches_per_chunklet();
@@ -236,9 +238,10 @@ impl Pool {
         &self,
         desc: &LdDescriptor,
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
         report: &mut ScrubReport,
     ) -> ChunkletResult<()> {
-        let ld = LdRaid5::open(desc.clone(), pds_snapshot)?;
+        let ld = LdRaid5::open_with_health(desc.clone(), pds_snapshot, pd_health)?;
         let n = desc.set_size as usize;
         let k = ld.data_per_set();
         let n_sets = (desc.row_size as usize) * (desc.num_rows as usize);
@@ -311,9 +314,10 @@ impl Pool {
         &self,
         desc: &LdDescriptor,
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
         report: &mut ScrubReport,
     ) -> ChunkletResult<()> {
-        let ld = LdRaid6::open(desc.clone(), pds_snapshot)?;
+        let ld = LdRaid6::open_with_health(desc.clone(), pds_snapshot, pd_health)?;
         let n = desc.set_size as usize;
         let k = ld.data_per_set();
         let n_sets = (desc.row_size as usize) * (desc.num_rows as usize);

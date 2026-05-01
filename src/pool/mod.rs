@@ -23,12 +23,14 @@
 //!   quorum repair is still TBD.
 
 mod cpg;
+mod disk;
 mod drain;
 mod ld_ops;
 mod rebuild;
 mod scrub;
 
 pub use cpg::{CpgDescriptor, CpgList, CpgSpec};
+pub use disk::{AutoRecoverReport, LdRecoverReport, PdSpareRebalance, SpareRebalanceReport};
 pub use drain::DrainReport;
 pub use ld_ops::LdSpec;
 pub use rebuild::RebuildReport;
@@ -245,6 +247,7 @@ impl Pool {
         let mut declared_count: Option<u32> = None;
         // Pick the LD/CPG view from the PD with the highest manifest_gen.
         let mut best_view: Option<(u64, Vec<u8>, Vec<u8>)> = None;
+        let mut best_pd_list: Option<(u64, Vec<PoolPdEntry>)> = None;
 
         for pd in opened {
             if pd.pool_id() != pool_id {
@@ -258,7 +261,9 @@ impl Pool {
             let info = pd.info();
             let (body, _, gen) = pd.snapshot();
             match declared_count {
-                None => declared_count = Some(body.pool_pd_count),
+                None => {
+                    declared_count = Some(body.pool_pd_count);
+                }
                 Some(c) if c != body.pool_pd_count => {
                     return Err(ChunkletError::PoolMismatch(format!(
                         "PD {} reports pool_pd_count={}, expected {}",
@@ -279,6 +284,10 @@ impl Pool {
                     best_view = Some((gen, body.ld_list_bytes.clone(), body.cpg_list_bytes.clone()))
                 }
             }
+            match &best_pd_list {
+                Some((best_gen, _)) if *best_gen >= gen => {}
+                _ => best_pd_list = Some((gen, body.pd_list.clone())),
+            }
             pd_seq_to_id.insert(info.pd_seq_in_pool, info.pd_id);
             pds.insert(info.pd_id, pd);
         }
@@ -292,6 +301,11 @@ impl Pool {
                 )));
             }
         }
+        let declared_pd_list = best_pd_list.map(|(_, list)| list).unwrap_or_default();
+        let pd_flags: BTreeMap<PdId, u32> = declared_pd_list
+            .iter()
+            .map(|entry| (entry.pd_id, entry.flags))
+            .collect();
         for i in 0..actual_count {
             if !pd_seq_to_id.contains_key(&i) {
                 return Err(ChunkletError::PoolMismatch(format!(
@@ -314,7 +328,21 @@ impl Pool {
         Ok(Arc::new(Self {
             pool_id,
             state: RwLock::new(PoolState {
-                pd_health: pds.keys().map(|id| (*id, PdHealth::Healthy)).collect(),
+                pd_health: pds
+                    .keys()
+                    .map(|id| {
+                        let health = if pd_flags
+                            .get(id)
+                            .map(|flags| flags & crate::superblock::pool_pd_flags::FAILED != 0)
+                            .unwrap_or(false)
+                        {
+                            PdHealth::Failed
+                        } else {
+                            PdHealth::Healthy
+                        };
+                        (*id, health)
+                    })
+                    .collect(),
                 pds,
                 pd_seq_to_id,
                 draining: std::collections::BTreeSet::new(),
@@ -356,6 +384,7 @@ impl Pool {
         let mut pds = BTreeMap::new();
         let mut declared_count: Option<u32> = None;
         let mut declared_pd_list: Option<Vec<PoolPdEntry>> = None;
+        let mut declared_pd_list_gen: u64 = 0;
         let mut best_view: Option<(u64, Vec<u8>, Vec<u8>)> = None;
         let mut best_view_gen: u64 = 0;
 
@@ -373,7 +402,6 @@ impl Pool {
             match declared_count {
                 None => {
                     declared_count = Some(body.pool_pd_count);
-                    declared_pd_list = Some(body.pd_list.clone());
                 }
                 Some(c) if c != body.pool_pd_count => {
                     return Err(ChunkletError::PoolMismatch(format!(
@@ -386,6 +414,10 @@ impl Pool {
             if best_view.is_none() || gen > best_view_gen {
                 best_view = Some((gen, body.ld_list_bytes.clone(), body.cpg_list_bytes.clone()));
                 best_view_gen = gen;
+            }
+            if declared_pd_list.is_none() || gen > declared_pd_list_gen {
+                declared_pd_list = Some(body.pd_list.clone());
+                declared_pd_list_gen = gen;
             }
             pds.insert(info.pd_id, pd);
         }
@@ -406,14 +438,17 @@ impl Pool {
 
         let mut pd_seq_to_id = BTreeMap::new();
         let mut pd_health = BTreeMap::new();
-        // Walk the declared pd_list. Live PDs go to Healthy + populate pds map;
-        // missing entries are Failed.
+        // Walk the declared pd_list. Live PDs go to Healthy unless the
+        // manifest says they were administratively failed; missing entries
+        // are Failed.
         for entry in &declared_pd_list {
             pd_seq_to_id.insert(entry.pd_seq, entry.pd_id);
-            if pds.contains_key(&entry.pd_id) {
-                pd_health.insert(entry.pd_id, PdHealth::Healthy);
-            } else {
+            if !pds.contains_key(&entry.pd_id)
+                || entry.flags & crate::superblock::pool_pd_flags::FAILED != 0
+            {
                 pd_health.insert(entry.pd_id, PdHealth::Failed);
+            } else {
+                pd_health.insert(entry.pd_id, PdHealth::Healthy);
             }
         }
 

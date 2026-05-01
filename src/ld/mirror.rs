@@ -53,6 +53,7 @@ use crate::ld::{
     StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
+use crate::pool::PdHealth;
 use crate::types::{LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
 
 const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
@@ -76,6 +77,15 @@ impl LdMirror {
     pub fn open(
         desc: LdDescriptor,
         pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+    ) -> ChunkletResult<Self> {
+        let pd_health = crate::ld::healthy_pd_map(pds);
+        Self::open_with_health(desc, pds, &pd_health)
+    }
+
+    pub(crate) fn open_with_health(
+        desc: LdDescriptor,
+        pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
     ) -> ChunkletResult<Self> {
         if desc.raid_level != RaidLevel::Mirror {
             return Err(ChunkletError::Invariant(format!(
@@ -107,7 +117,7 @@ impl LdMirror {
             )));
         }
         let usable_per_chunklet = (CHUNKLET_USER_BYTES / strip_bytes) * strip_bytes;
-        let members = resolve_members(pds, &desc)?;
+        let members = resolve_members(pds, pd_health, &desc)?;
         let capacity = (desc.row_size as u64) * (desc.num_rows as u64) * usable_per_chunklet;
         let n_sets = (desc.row_size as usize) * (desc.num_rows as usize);
         let read_cursors = (0..n_sets).map(|_| AtomicUsize::new(0)).collect();

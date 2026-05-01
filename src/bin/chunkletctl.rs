@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use onyx_chunklet::io::{AlignedBuf, RawDevice};
 use onyx_chunklet::metrics::{PdOperationalState, PoolMetrics};
-use onyx_chunklet::pool::{CpgSpec, LdSpec};
+use onyx_chunklet::pool::{AutoRecoverReport, CpgSpec, LdSpec, SpareRebalanceReport};
 use onyx_chunklet::superblock::{SuperblockSlot, SLOT_BYTES};
 use onyx_chunklet::types::{
     HaDomain, LdId, PdId, RaidLevel, PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET,
@@ -84,6 +84,39 @@ enum PoolOp {
         spare_pct: u8,
         /// New device to admit.
         device: PathBuf,
+    },
+    /// Persistently mark a PD failed so LDs route around it.
+    Fail {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// PD uuid to mark failed.
+        pd_id: String,
+    },
+    /// Clear a persisted PD failed mark after replacement/inspection.
+    ClearFail {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// PD uuid to mark healthy.
+        pd_id: String,
+    },
+    /// Resize per-PD reserved spare chunklets.
+    RebalanceSpares {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// Reserved spare percentage, 0-100.
+        #[arg(long)]
+        spare_pct: u8,
+    },
+    /// Scrub/rebuild every redundant LD that has failed or bad members.
+    AutoRecover {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// Allow opening a degraded pool with missing devices.
+        #[arg(long, default_value_t = false)]
+        allow_missing: bool,
+        /// Run scrub before rebuild so identifiable corrupt copies become Bad.
+        #[arg(long, default_value_t = false)]
+        scrub_first: bool,
     },
 }
 
@@ -357,6 +390,54 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             }
             Ok(())
         }
+        PoolOp::Fail { pool, pd_id } => {
+            let id = parse_pd_id(&pd_id)?;
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open_with_missing(raws)?;
+            pool.mark_pd_failed(id)?;
+            println!("marked PD {} failed", id);
+            print_pool_status(&pool.metrics()?);
+            Ok(())
+        }
+        PoolOp::ClearFail { pool, pd_id } => {
+            let id = parse_pd_id(&pd_id)?;
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open_with_missing(raws)?;
+            pool.clear_pd_failed(id)?;
+            println!("cleared failed mark on PD {}", id);
+            print_pool_status(&pool.metrics()?);
+            Ok(())
+        }
+        PoolOp::RebalanceSpares { pool, spare_pct } => {
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open_with_missing(raws)?;
+            let report = pool.rebalance_spares(spare_pct)?;
+            print_spare_rebalance(&report);
+            print_pool_status(&pool.metrics()?);
+            Ok(())
+        }
+        PoolOp::AutoRecover {
+            pool,
+            allow_missing,
+            scrub_first,
+        } => {
+            let raws = open_devices(&pool)?;
+            let pool = if allow_missing {
+                Pool::open_with_missing(raws)?
+            } else {
+                Pool::open(raws)?
+            };
+            let report = pool.auto_recover(scrub_first);
+            print_auto_recover(&report);
+            print_pool_status(&pool.metrics()?);
+            if report.failed > 0 {
+                return Err(onyx_chunklet::ChunkletError::Invariant(format!(
+                    "auto-recover failed on {} LDs",
+                    report.failed
+                )));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -607,6 +688,45 @@ fn print_ld_table(pool: &Pool) {
             d.row_size,
             d.num_rows,
             d.members.len()
+        );
+    }
+}
+
+fn parse_pd_id(s: &str) -> ChunkletResult<PdId> {
+    let parsed = uuid::Uuid::parse_str(s)
+        .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
+    Ok(PdId::from_bytes(*parsed.as_bytes()))
+}
+
+fn print_spare_rebalance(report: &SpareRebalanceReport) {
+    println!("spare rebalance: spare_pct={}", report.spare_pct);
+    for pd in &report.pds {
+        println!(
+            "  pd={} wanted={} spare {}->{} free {}->{}",
+            pd.pd_id,
+            pd.wanted_spares,
+            pd.spares_before,
+            pd.spares_after,
+            pd.free_before,
+            pd.free_after
+        );
+    }
+}
+
+fn print_auto_recover(report: &AutoRecoverReport) {
+    println!(
+        "auto-recover: attempted={} recovered={} failed={}",
+        report.attempted, report.recovered, report.failed
+    );
+    for ld in &report.lds {
+        println!(
+            "  ld={} scrub_mismatches={} marked_bad={} rebuilt={} skipped={} error={}",
+            ld.ld_id,
+            ld.scrub_mismatches,
+            ld.scrub_marked_bad,
+            ld.rebuilt_members,
+            ld.skipped_rebuild,
+            ld.error.as_deref().unwrap_or("-")
         );
     }
 }

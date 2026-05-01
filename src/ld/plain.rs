@@ -20,6 +20,7 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{resolve_members, LogicalDisk};
 use crate::pd::PhysicalDisk;
+use crate::pool::PdHealth;
 use crate::types::{
     ChunkletId, LdId, LdRole, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
 };
@@ -40,6 +41,15 @@ impl LdPlain {
         desc: LdDescriptor,
         pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
     ) -> ChunkletResult<Self> {
+        let pd_health = crate::ld::healthy_pd_map(pds);
+        Self::open_with_health(desc, pds, &pd_health)
+    }
+
+    pub(crate) fn open_with_health(
+        desc: LdDescriptor,
+        pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
+    ) -> ChunkletResult<Self> {
         if desc.raid_level != RaidLevel::Plain {
             return Err(ChunkletError::Invariant(format!(
                 "LdPlain::open with raid_level={:?}",
@@ -47,11 +57,9 @@ impl LdPlain {
             )));
         }
         if desc.members.is_empty() {
-            return Err(ChunkletError::Invariant(
-                "LdPlain has no members".into(),
-            ));
+            return Err(ChunkletError::Invariant("LdPlain has no members".into()));
         }
-        let members = resolve_members(pds, &desc)?;
+        let members = resolve_members(pds, pd_health, &desc)?;
         let capacity = (desc.members.len() as u64) * CHUNKLET_USER_BYTES;
         Ok(Self {
             desc,
@@ -95,7 +103,11 @@ impl LdPlain {
     /// Walk the IO range and call `op` for each (member_index, chunklet_offset, slice_len).
     fn for_each_segment<F>(&self, offset: u64, total_len: usize, mut op: F) -> ChunkletResult<()>
     where
-        F: FnMut(usize /* member_idx */, u64 /* offset_in_chunklet */, std::ops::Range<usize>) -> ChunkletResult<()>,
+        F: FnMut(
+            usize, /* member_idx */
+            u64,   /* offset_in_chunklet */
+            std::ops::Range<usize>,
+        ) -> ChunkletResult<()>,
     {
         let mut remaining = total_len;
         let mut cursor = offset;

@@ -65,7 +65,14 @@ impl Pool {
             .find_ld(ld_id)
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", ld_id)))?;
         let pd_health = self.state.read().pd_health.clone();
-        let pds_snapshot = self.state.read().pds.clone();
+        let pds_snapshot: BTreeMap<PdId, Arc<PhysicalDisk>> = self
+            .state
+            .read()
+            .pds
+            .iter()
+            .filter(|(pd_id, _)| pd_health.get(pd_id) != Some(&PdHealth::Failed))
+            .map(|(pd_id, pd)| (*pd_id, pd.clone()))
+            .collect();
         let draining = self.state.read().draining.clone();
 
         // A member needs rebuild when ANY of:
@@ -226,13 +233,13 @@ impl Pool {
         // it into the chunklet header so a crash mid-rebuild is detectable.
         match desc.raid_level {
             RaidLevel::Mirror => {
-                self.rebuild_mirror(&desc, &new_desc, &failed_per_set, &pds_snapshot)?
+                self.rebuild_mirror(&desc, &new_desc, &failed_per_set, &pds_snapshot, &pd_health)?
             }
             RaidLevel::Raid5 => {
-                self.rebuild_raid5(&desc, &new_desc, &failed_per_set, &pds_snapshot)?
+                self.rebuild_raid5(&desc, &new_desc, &failed_per_set, &pds_snapshot, &pd_health)?
             }
             RaidLevel::Raid6 => {
-                self.rebuild_raid6(&desc, &new_desc, &failed_per_set, &pds_snapshot)?
+                self.rebuild_raid6(&desc, &new_desc, &failed_per_set, &pds_snapshot, &pd_health)?
             }
             _ => unreachable!("validated earlier"),
         }
@@ -266,8 +273,9 @@ impl Pool {
         new_desc: &LdDescriptor,
         failed_per_set: &[Vec<usize>],
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
     ) -> ChunkletResult<()> {
-        let ld = LdMirror::open(desc.clone(), pds_snapshot)?;
+        let ld = LdMirror::open_with_health(desc.clone(), pds_snapshot, pd_health)?;
         let n_per_set = desc.set_size as usize;
         let mut buf = vec![0u8; REBUILD_BATCH_BYTES as usize];
         for (set_idx, failed) in failed_per_set.iter().enumerate() {
@@ -303,8 +311,9 @@ impl Pool {
         new_desc: &LdDescriptor,
         failed_per_set: &[Vec<usize>],
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
     ) -> ChunkletResult<()> {
-        let ld = LdRaid5::open(desc.clone(), pds_snapshot)?;
+        let ld = LdRaid5::open_with_health(desc.clone(), pds_snapshot, pd_health)?;
         let n_per_set = desc.set_size as usize;
         let mut buf = vec![0u8; REBUILD_BATCH_BYTES as usize];
         for (set_idx, failed) in failed_per_set.iter().enumerate() {
@@ -340,8 +349,9 @@ impl Pool {
         new_desc: &LdDescriptor,
         failed_per_set: &[Vec<usize>],
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+        pd_health: &BTreeMap<PdId, PdHealth>,
     ) -> ChunkletResult<()> {
-        let ld = LdRaid6::open(desc.clone(), pds_snapshot)?;
+        let ld = LdRaid6::open_with_health(desc.clone(), pds_snapshot, pd_health)?;
         let n_per_set = desc.set_size as usize;
         let mut buf = vec![0u8; REBUILD_BATCH_BYTES as usize];
         for (set_idx, failed) in failed_per_set.iter().enumerate() {
