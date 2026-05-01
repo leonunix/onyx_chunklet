@@ -57,7 +57,26 @@ impl Pool {
         let pd_health = self.state.read().pd_health.clone();
         let pds_snapshot = self.state.read().pds.clone();
 
-        // Identify failed member positions per set.
+        // A member needs rebuild when EITHER its PD is Failed OR its
+        // chunklet is bitmap-Bad on its (Healthy) PD.
+        let member_needs_rebuild = |m: &crate::types::LdMember| -> ChunkletResult<bool> {
+            match pd_health.get(&m.pd) {
+                Some(PdHealth::Failed) => Ok(true),
+                Some(PdHealth::Healthy) => {
+                    let pd = pds_snapshot.get(&m.pd).ok_or_else(|| {
+                        ChunkletError::Invariant(format!(
+                            "PD {} health=Healthy but missing from pds map",
+                            m.pd
+                        ))
+                    })?;
+                    let (_, bitmap, _) = pd.snapshot();
+                    Ok(matches!(bitmap.get(m.chunklet_index)?, ChunkletState::Bad))
+                }
+                None => Ok(true), // pd_id unknown to pool; treat as failed
+            }
+        };
+
+        // Identify members needing rebuild per set.
         let n_per_set = desc.set_size as usize;
         let n_sets = (desc.row_size as usize) * (desc.num_rows as usize);
         let mut failed_per_set: Vec<Vec<usize>> = vec![Vec::new(); n_sets];
@@ -66,7 +85,7 @@ impl Pool {
             let base = set_idx * n_per_set;
             for pos in 0..n_per_set {
                 let m = &desc.members[base + pos];
-                if matches!(pd_health.get(&m.pd), Some(PdHealth::Failed)) {
+                if member_needs_rebuild(m)? {
                     failed_per_set[set_idx].push(pos);
                     total_failed += 1;
                 }

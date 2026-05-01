@@ -167,6 +167,14 @@ enum LdOp {
         /// LD uuid.
         ld_id: String,
     },
+    /// Run a scrub pass: verify parity / mirror copies, mark culprit
+    /// chunklets Bad. Run `rebuild` afterwards to swap them onto fresh
+    /// chunklets.
+    Scrub {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        ld_id: String,
+    },
     /// Rebuild an LD's failed members onto live PDs. Open the pool with
     /// `--allow-missing` to enter degraded mode first.
     Rebuild {
@@ -351,6 +359,28 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             pool.drop_ld(id)?;
             println!("dropped LD {}", id);
             print_ld_table(&pool);
+            Ok(())
+        }
+        LdOp::Scrub { pool, ld_id } => {
+            let parsed = uuid::Uuid::parse_str(&ld_id)
+                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
+            let id = LdId::from_bytes(*parsed.as_bytes());
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let report = pool.scrub_ld(id)?;
+            println!(
+                "scrub of LD {}: {} batches checked, {} mismatches, {} chunklets marked Bad",
+                id,
+                report.batches_checked,
+                report.mismatches.len(),
+                report.marked_bad
+            );
+            for mm in &report.mismatches {
+                println!(
+                    "  set={} batch_off={} kind={:?}",
+                    mm.set_idx, mm.batch_offset, mm.kind
+                );
+            }
             Ok(())
         }
         LdOp::Rebuild {

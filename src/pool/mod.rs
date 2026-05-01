@@ -20,9 +20,11 @@
 
 mod ld_ops;
 mod rebuild;
+mod scrub;
 
 pub use ld_ops::LdSpec;
 pub use rebuild::RebuildReport;
+pub use scrub::{ScrubMismatch, ScrubMismatchKind, ScrubReport};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

@@ -60,21 +60,32 @@ pub trait LogicalDisk: Send + Sync {
 
 /// Look up the `Arc<PhysicalDisk>` for each member listed in a descriptor,
 /// returning a vector aligned with `desc.members`. A `None` entry means the
-/// member's PD is currently absent (Failed). LDs with redundancy
-/// (Mirror / Raid5 / Raid6) tolerate `None` entries via reconstruct paths;
-/// LDs without redundancy (Plain / Raid0) return an error on first IO.
-///
-/// Plain "PD not found" (e.g. corrupted descriptor pointing at an unknown
-/// pd_id) was previously an error; with degraded mode it's still an error
-/// only when **strict** is true (used by drop / rebuild paths). Pass
-/// `strict=false` to map missing PDs to `None`.
+/// member is unavailable — either the owning PD is missing (Failed) or the
+/// chunklet's bitmap state on its PD is `Bad` (quarantined by scrub).
+/// LDs with redundancy (Mirror / Raid5 / Raid6) tolerate `None` entries via
+/// reconstruct paths; LDs without redundancy (Plain / Raid0) return an error
+/// on first IO.
 pub(crate) fn resolve_members(
     pds: &std::collections::BTreeMap<crate::types::PdId, Arc<PhysicalDisk>>,
     desc: &LdDescriptor,
 ) -> ChunkletResult<Vec<Option<Arc<PhysicalDisk>>>> {
     let mut out = Vec::with_capacity(desc.members.len());
     for m in &desc.members {
-        out.push(pds.get(&m.pd).cloned());
+        match pds.get(&m.pd) {
+            None => out.push(None),
+            Some(pd) => {
+                let (_, bitmap, _) = pd.snapshot();
+                let bad = bitmap
+                    .get(m.chunklet_index)
+                    .map(|s| s == crate::types::ChunkletState::Bad)
+                    .unwrap_or(false);
+                if bad {
+                    out.push(None);
+                } else {
+                    out.push(Some(pd.clone()));
+                }
+            }
+        }
     }
     Ok(out)
 }
