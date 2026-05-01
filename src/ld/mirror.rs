@@ -34,9 +34,13 @@
 //!   segment pick one of N copies (round-robin per LD instance via an
 //!   atomic counter) and read.
 //! - `write_at`: walk the IO range, split at strip boundaries; for each
-//!   segment write to all N copies sequentially. Sequential writes give
-//!   us simple error semantics — first failed write surfaces immediately.
-//!   A future P5 enhancement may parallelize via a small thread pool.
+//!   segment fan out a parallel write to every live copy via
+//!   `parallel_strip_writes` (so K copies hit K disks simultaneously).
+//!   `parallel_strip_writes` returns the first error; on partial-failure
+//!   the LD is **torn** (some copies new, others old / partial) until the
+//!   admin re-runs the IO or scrub repairs divergence. 3+ way mirrors
+//!   self-heal via `Pool::scrub_ld` (majority vote); 2-way mirrors require
+//!   `Pool::mark_chunklet_bad` to identify the bad copy explicitly.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,7 +48,7 @@ use std::sync::Arc;
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
-use crate::ld::{resolve_members, LogicalDisk};
+use crate::ld::{parallel_strip_writes, resolve_members, LogicalDisk, StripWrite};
 use crate::pd::PhysicalDisk;
 use crate::types::{
     LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
@@ -255,24 +259,28 @@ impl LogicalDisk for LdMirror {
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
         self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
-            // Write to every live copy. Skip Failed members; if none are live,
-            // surface an error (data loss otherwise).
+            // Build a parallel fan-out across every live copy. Failed
+            // copies (PD missing or chunklet Bad) are skipped — caller has
+            // already errored on a fully-dead set during open.
             let copies = self.member_indices_for(row, set);
-            let mut any_live = false;
+            let mut ops: Vec<StripWrite> = Vec::with_capacity(copies.end - copies.start);
             for member_idx in copies.clone() {
                 if let Some(pd) = self.members[member_idx].as_ref() {
-                    let chunklet_idx = self.desc.members[member_idx].chunklet_index;
-                    pd.write_chunklet_user(chunklet_idx, off_in_c, &buf[range.clone()])?;
-                    any_live = true;
+                    ops.push(StripWrite {
+                        pd: pd.clone(),
+                        chunklet_index: self.desc.members[member_idx].chunklet_index,
+                        in_chunklet_off: off_in_c,
+                        data: &buf[range.clone()],
+                    });
                 }
             }
-            if !any_live {
+            if ops.is_empty() {
                 return Err(ChunkletError::Invariant(format!(
                     "Mirror set (row={}, set={}) write: no live copy",
                     row, set
                 )));
             }
-            Ok(())
+            parallel_strip_writes(ops)
         })
     }
 }

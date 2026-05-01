@@ -180,3 +180,40 @@ fn rejects_when_set_size_exceeds_distinct_pds() {
     let s = format!("{}", err);
     assert!(s.contains("distinct PDs") || s.contains("free"), "{}", s);
 }
+
+/// Pool::mark_chunklet_bad persists the Bad state across reopen and is
+/// honored by future LdMirror::open's `resolve_members` (so reads skip the
+/// bad copy and write_at fans out to the surviving copies only).
+#[test]
+fn mark_chunklet_bad_persists_and_excludes_member_from_reads() {
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, &["pd0", "pd1", "pd2"]);
+    let id = pool.create_ld(LdSpec::mirror(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let payload: Vec<u8> = (0..(48 << 10)).map(|i| (i % 211) as u8).collect();
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    // Mark copy 0 Bad via the new pool API.
+    let desc = pool.list_lds().into_iter().next().unwrap();
+    let bad = desc.members[0];
+    pool.mark_chunklet_bad(bad.pd, bad.chunklet_index).unwrap();
+    let pd = pool.pd(bad.pd).unwrap();
+    let (_, bm, _) = pd.snapshot();
+    assert_eq!(bm.get(bad.chunklet_index).unwrap(), ChunkletState::Bad);
+
+    drop(pool);
+
+    // Reopen + verify Bad state survived.
+    let pool2 = open_pool(&paths);
+    let pd2 = pool2.pd(bad.pd).unwrap();
+    let (_, bm2, _) = pd2.snapshot();
+    assert_eq!(bm2.get(bad.chunklet_index).unwrap(), ChunkletState::Bad);
+
+    // Reads still succeed via the other 2 copies; sibling copies match the
+    // original data (Bad copy is silently excluded by resolve_members).
+    let ld2 = pool2.open_ld(id).unwrap();
+    let mut readback = vec![0u8; payload.len()];
+    ld2.read_at(0, &mut readback).unwrap();
+    assert_eq!(readback, payload);
+}

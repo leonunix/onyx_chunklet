@@ -511,6 +511,29 @@ impl Pool {
     pub fn last_reconciliation_count(&self) -> usize {
         self.state.read().last_reconciliation_count
     }
+
+    /// Persistently mark a chunklet `Bad` on its owning PD. Future LD opens
+    /// will see this via `resolve_members` and route reads/writes around the
+    /// chunklet (mirror falls back to surviving copies; R5/R6 reconstructs).
+    /// Idempotent — already-Bad stays Bad.
+    ///
+    /// Used by scrub when it identifies a divergent / corrupt copy, and by
+    /// admin tooling when a chunklet is known-bad outside the scrub path.
+    /// Out-of-range `chunklet_index` returns `Invariant`.
+    pub fn mark_chunklet_bad(&self, pd_id: PdId, chunklet_index: u32) -> ChunkletResult<()> {
+        let _commit = self.manifest_lock.lock();
+        let pd = self
+            .state
+            .read()
+            .pds
+            .get(&pd_id)
+            .cloned()
+            .ok_or_else(|| ChunkletError::Invariant(format!("PD {} not in pool", pd_id)))?;
+        pd.commit_manifest(move |_body, bitmap| {
+            bitmap.set(chunklet_index, crate::types::ChunkletState::Bad)
+        })?;
+        Ok(())
+    }
 }
 
 /// Majority vote for pool_id across opened PDs. With our quorum policy
@@ -538,16 +561,19 @@ fn majority_pool_id(pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<PoolId> {
 /// but bitmap says Free. Untouched, the allocator could later hand X out
 /// to a different LD → double-allocation.
 ///
-/// This helper runs once at open, mutates only PDs needing fixes, and is
-/// idempotent (Used → Used is a no-op). It is FORWARD-only: bitmap entries
-/// claimed by no descriptor stay where they are. Cleaning those up (the
-/// `drop_ld` half-commit case) is left to a future `Pool::fsck` command.
+/// Only `Free` → `Used` is auto-corrected. `Bad` / `Spare` / `Migrating`
+/// states are deliberate signals (scrub flagged corruption, spare pool
+/// reservation, in-flight migration) and we WARN-log without overwriting.
+/// FORWARD-only: bitmap entries claimed by no descriptor stay where they
+/// are; cleaning those (the `drop_ld` half-commit case) is left to a
+/// future `Pool::fsck`.
 ///
-/// Returns the number of `(pd, chunklet_index)` pairs that needed fixing.
+/// Returns the number of `(pd, chunklet_index)` pairs flipped to Used.
 fn forward_reconcile_bitmaps(
     ld_list: &LdList,
     pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
 ) -> ChunkletResult<usize> {
+    use crate::types::ChunkletState;
     let mut fixes_by_pd: BTreeMap<PdId, Vec<u32>> = BTreeMap::new();
     for ld in &ld_list.lds {
         for member in &ld.members {
@@ -560,11 +586,26 @@ fn forward_reconcile_bitmaps(
                 Ok(s) => s,
                 Err(_) => continue, // out-of-range index; superblock corrupt? skip silently
             };
-            if state != crate::types::ChunkletState::Used {
-                fixes_by_pd
-                    .entry(member.pd)
-                    .or_default()
-                    .push(member.chunklet_index);
+            match state {
+                ChunkletState::Used => {} // already correct
+                ChunkletState::Free => {
+                    fixes_by_pd
+                        .entry(member.pd)
+                        .or_default()
+                        .push(member.chunklet_index);
+                }
+                other => {
+                    // Bad / Spare / Migrating — descriptor still references
+                    // this chunklet but operator/scrub flagged it. Don't
+                    // clobber, just warn so the operator notices.
+                    tracing::warn!(
+                        "forward reconcile: ld {} references PD {} chunklet {} but bitmap says {:?}; leaving as-is",
+                        ld.id,
+                        member.pd,
+                        member.chunklet_index,
+                        other
+                    );
+                }
             }
         }
     }
@@ -576,12 +617,12 @@ fn forward_reconcile_bitmaps(
         let captured = indices.clone();
         pd.commit_manifest(move |_body, bitmap| {
             for idx in &captured {
-                bitmap.set(*idx, crate::types::ChunkletState::Used)?;
+                bitmap.set(*idx, ChunkletState::Used)?;
             }
             Ok(())
         })?;
         tracing::warn!(
-            "forward reconcile fixed {} bitmap entries on PD {} (bumping to Used)",
+            "forward reconcile fixed {} Free->Used bitmap entries on PD {}",
             n,
             pd_id
         );
