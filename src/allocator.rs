@@ -20,7 +20,7 @@
 //! HA domain `Pd` is the only level wired in P1; `Numa` / `PcieSwitch`
 //! return `Unsupported`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::types::{HaDomain, LdMember, LdRole, PdId};
@@ -87,9 +87,11 @@ pub fn plan_alloc(
     request.validate()?;
 
     // Working state: per-PD free index list (mutable), index by PD.
-    let mut state: BTreeMap<PdId, Vec<u32>> = pd_views
+    // VecDeque so `pop_front` (lowest-index-first) is O(1); a Vec would
+    // have made it O(n) per allocation, scaling badly on large pools.
+    let mut state: BTreeMap<PdId, VecDeque<u32>> = pd_views
         .into_iter()
-        .map(|v| (v.pd, v.free_indices))
+        .map(|v| (v.pd, v.free_indices.into_iter().collect()))
         .collect();
 
     let total = request.total_members();
@@ -127,7 +129,7 @@ pub fn plan_alloc(
 /// Pick one set: `set_size` distinct PDs by descending free-count, lowest
 /// chunklet index from each.
 fn pick_set(
-    state: &mut BTreeMap<PdId, Vec<u32>>,
+    state: &mut BTreeMap<PdId, VecDeque<u32>>,
     set_size: usize,
     role_iter: &mut impl Iterator<Item = LdRole>,
 ) -> ChunkletResult<Vec<LdMember>> {
@@ -148,11 +150,11 @@ fn pick_set(
                 ))
             })?;
 
-        let chunklet_index = {
-            let free = state.get_mut(&chosen).unwrap();
-            // pop the lowest index (`free` is kept sorted ascending).
-            free.remove(0)
-        };
+        let chunklet_index = state
+            .get_mut(&chosen)
+            .unwrap()
+            .pop_front()
+            .expect("filter above guarantees at least one free index");
         let role = role_iter.next().ok_or_else(|| {
             ChunkletError::Invariant("role_assignments exhausted".into())
         })?;
