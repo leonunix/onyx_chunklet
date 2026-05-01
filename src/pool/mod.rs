@@ -19,8 +19,10 @@
 //!   logs a warning; explicit repair is a Phase 7 task.
 
 mod ld_ops;
+mod rebuild;
 
 pub use ld_ops::LdSpec;
+pub use rebuild::RebuildReport;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -53,12 +55,26 @@ pub struct Pool {
 }
 
 pub(crate) struct PoolState {
+    /// Live PDs (any PD that was successfully opened). Failed PDs (declared
+    /// in pd_list but not present in `Pool::open_with_missing`'s devices)
+    /// have no entry here.
     pub pds: BTreeMap<PdId, Arc<PhysicalDisk>>,
     pub pd_seq_to_id: BTreeMap<u32, PdId>,
+    /// Health status keyed by PdId. Every PD declared in pool's pd_list has
+    /// an entry. Set to `Healthy` if the PD is in `pds`, `Failed` otherwise.
+    pub pd_health: BTreeMap<PdId, PdHealth>,
     /// Authoritative LD list, mirrored on every PD's manifest. Pool::open picks
     /// the view from the PD with the highest manifest_gen and writes the same
     /// list to every PD on every LD-list mutation (create / drop).
     pub ld_list: LdList,
+}
+
+/// Per-PD health enum. Phase 5 only distinguishes Healthy / Failed (PD-level).
+/// Phase 6 will add per-chunklet Bad tracking via bitmap state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdHealth {
+    Healthy,
+    Failed,
 }
 
 impl Pool {
@@ -104,6 +120,7 @@ impl Pool {
         Ok(Arc::new(Self {
             pool_id,
             state: RwLock::new(PoolState {
+                pd_health: pds.keys().map(|id| (*id, PdHealth::Healthy)).collect(),
                 pds,
                 pd_seq_to_id,
                 ld_list: LdList::default(),
@@ -199,12 +216,134 @@ impl Pool {
         Ok(Arc::new(Self {
             pool_id,
             state: RwLock::new(PoolState {
+                pd_health: pds.keys().map(|id| (*id, PdHealth::Healthy)).collect(),
                 pds,
                 pd_seq_to_id,
                 ld_list,
             }),
             manifest_lock: Mutex::new(()),
         }))
+    }
+
+    /// Open an existing pool but tolerate missing PDs.
+    ///
+    /// Useful for degraded operation: pass in only the live device paths;
+    /// the pool will reconstruct the view via the manifests on those PDs
+    /// and mark the absent PDs as `Failed`. Reads to LD members on Failed
+    /// PDs are routed through the LD's reconstruct path (Mirror copies,
+    /// Raid5/6 parity); writes to those positions error until
+    /// `Pool::rebuild_ld` swaps the member onto a spare.
+    ///
+    /// At least one device must be provided. The pool_id is taken from the
+    /// majority of opened PDs; if the opened set is too small to form a
+    /// majority of the declared pool_pd_count, this returns
+    /// `PoolMismatch` (no quorum).
+    pub fn open_with_missing(devices: Vec<RawDevice>) -> ChunkletResult<Arc<Self>> {
+        if devices.is_empty() {
+            return Err(ChunkletError::Config("open_with_missing: no devices".into()));
+        }
+
+        let mut opened: Vec<Arc<PhysicalDisk>> = Vec::with_capacity(devices.len());
+        for raw in devices {
+            opened.push(PhysicalDisk::open(raw)?);
+        }
+
+        let pool_id = majority_pool_id(&opened)?;
+        let mut pds = BTreeMap::new();
+        let mut declared_count: Option<u32> = None;
+        let mut declared_pd_list: Option<Vec<PoolPdEntry>> = None;
+        let mut best_ld_view: Option<(u64, Vec<u8>)> = None;
+        let mut best_ld_view_gen: u64 = 0;
+
+        for pd in opened {
+            if pd.pool_id() != pool_id {
+                return Err(ChunkletError::PoolMismatch(format!(
+                    "PD {} declares pool {}, expected {}",
+                    pd.pd_id(),
+                    pd.pool_id(),
+                    pool_id
+                )));
+            }
+            let info = pd.info();
+            let (body, _, gen) = pd.snapshot();
+            match declared_count {
+                None => {
+                    declared_count = Some(body.pool_pd_count);
+                    declared_pd_list = Some(body.pd_list.clone());
+                }
+                Some(c) if c != body.pool_pd_count => {
+                    return Err(ChunkletError::PoolMismatch(format!(
+                        "PD {} reports pool_pd_count={}, expected {}",
+                        info.pd_id, body.pool_pd_count, c
+                    )));
+                }
+                _ => {}
+            }
+            if best_ld_view.is_none() || gen > best_ld_view_gen {
+                best_ld_view = Some((gen, body.ld_list_bytes.clone()));
+                best_ld_view_gen = gen;
+            }
+            pds.insert(info.pd_id, pd);
+        }
+
+        let declared_count = declared_count.expect("at least one PD opened");
+        let declared_pd_list = declared_pd_list.expect("at least one PD opened");
+
+        // Quorum for pool_id: opened set must be at least majority of declared.
+        let need_quorum = (declared_count as usize) / 2 + 1;
+        if pds.len() < need_quorum {
+            return Err(ChunkletError::PoolMismatch(format!(
+                "open_with_missing: opened {} of {} PDs, need {} for quorum",
+                pds.len(),
+                declared_count,
+                need_quorum
+            )));
+        }
+
+        let mut pd_seq_to_id = BTreeMap::new();
+        let mut pd_health = BTreeMap::new();
+        // Walk the declared pd_list. Live PDs go to Healthy + populate pds map;
+        // missing entries are Failed.
+        for entry in &declared_pd_list {
+            pd_seq_to_id.insert(entry.pd_seq, entry.pd_id);
+            if pds.contains_key(&entry.pd_id) {
+                pd_health.insert(entry.pd_id, PdHealth::Healthy);
+            } else {
+                pd_health.insert(entry.pd_id, PdHealth::Failed);
+            }
+        }
+
+        let ld_list = match best_ld_view {
+            Some((_, bytes)) => LdList::decode(&bytes)?,
+            None => LdList::default(),
+        };
+
+        Ok(Arc::new(Self {
+            pool_id,
+            state: RwLock::new(PoolState {
+                pds,
+                pd_seq_to_id,
+                pd_health,
+                ld_list,
+            }),
+            manifest_lock: Mutex::new(()),
+        }))
+    }
+
+    /// Public read accessor for PD health. Phase 5 only ever returns
+    /// `Healthy` or `Failed` — the latter only set by `open_with_missing`.
+    pub fn pd_health(&self, id: PdId) -> Option<PdHealth> {
+        self.state.read().pd_health.get(&id).copied()
+    }
+
+    /// Returns IDs of all PDs marked as Failed. Empty for a fully healthy pool.
+    pub fn failed_pds(&self) -> Vec<PdId> {
+        self.state
+            .read()
+            .pd_health
+            .iter()
+            .filter_map(|(id, h)| (*h == PdHealth::Failed).then_some(*id))
+            .collect()
     }
 
     /// Add a new blank PD to the pool. Initializes the PD with the current
@@ -268,6 +407,7 @@ impl Pool {
         let mut s = self.state.write();
         s.pds.insert(new_pd_id, new_pd);
         s.pd_seq_to_id.insert(new_pd_seq, new_pd_id);
+        s.pd_health.insert(new_pd_id, PdHealth::Healthy);
         Ok(new_pd_id)
     }
 

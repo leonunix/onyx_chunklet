@@ -167,6 +167,17 @@ enum LdOp {
         /// LD uuid.
         ld_id: String,
     },
+    /// Rebuild an LD's failed members onto live PDs. Open the pool with
+    /// `--allow-missing` to enter degraded mode first.
+    Rebuild {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// LD uuid to rebuild.
+        ld_id: String,
+        /// Allow opening the pool with missing devices (= degraded).
+        #[arg(long, default_value_t = false)]
+        allow_missing: bool,
+    },
 }
 
 fn main() {
@@ -339,6 +350,32 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             let pool = Pool::open(raws)?;
             pool.drop_ld(id)?;
             println!("dropped LD {}", id);
+            print_ld_table(&pool);
+            Ok(())
+        }
+        LdOp::Rebuild {
+            pool,
+            ld_id,
+            allow_missing,
+        } => {
+            let parsed = uuid::Uuid::parse_str(&ld_id)
+                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
+            let id = LdId::from_bytes(*parsed.as_bytes());
+            let raws = open_devices(&pool)?;
+            let pool = if allow_missing {
+                Pool::open_with_missing(raws)?
+            } else {
+                Pool::open(raws)?
+            };
+            let report = pool.rebuild_ld(id)?;
+            if report.skipped {
+                println!("LD {} has no failed members; rebuild skipped", id);
+            } else {
+                println!(
+                    "rebuilt {} failed members of LD {}",
+                    report.rebuilt_members, id
+                );
+            }
             print_ld_table(&pool);
             Ok(())
         }

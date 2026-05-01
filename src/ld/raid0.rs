@@ -46,7 +46,7 @@ const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
 
 pub struct LdRaid0 {
     desc: LdDescriptor,
-    members: Vec<Arc<PhysicalDisk>>,
+    members: Vec<Option<Arc<PhysicalDisk>>>,
     capacity: u64,
     strip_bytes: u64,
 }
@@ -176,18 +176,31 @@ impl LogicalDisk for LdRaid0 {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
         self.for_each_segment(offset, buf.len(), |member_idx, off, range| {
+            let pd = self.members[member_idx]
+                .as_ref()
+                .ok_or_else(|| degraded_error(&self.desc.members[member_idx].pd))?;
             let chunklet_idx = self.desc.members[member_idx].chunklet_index;
-            self.members[member_idx].read_chunklet_user(chunklet_idx, off, &mut buf[range])
+            pd.read_chunklet_user(chunklet_idx, off, &mut buf[range])
         })
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
         self.for_each_segment(offset, buf.len(), |member_idx, off, range| {
+            let pd = self.members[member_idx]
+                .as_ref()
+                .ok_or_else(|| degraded_error(&self.desc.members[member_idx].pd))?;
             let chunklet_idx = self.desc.members[member_idx].chunklet_index;
-            self.members[member_idx].write_chunklet_user(chunklet_idx, off, &buf[range])
+            pd.write_chunklet_user(chunklet_idx, off, &buf[range])
         })
     }
+}
+
+fn degraded_error(pd: &crate::types::PdId) -> ChunkletError {
+    ChunkletError::Invariant(format!(
+        "Raid0 LD member on failed PD {} — Raid0 has no redundancy, IO impossible",
+        pd
+    ))
 }
 
 fn compute_strip_bytes(strip_size_log2: u8) -> u64 {

@@ -54,7 +54,7 @@ const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
 
 pub struct LdMirror {
     desc: LdDescriptor,
-    members: Vec<Arc<PhysicalDisk>>,
+    members: Vec<Option<Arc<PhysicalDisk>>>,
     capacity: u64,
     strip_bytes: u64,
     /// Round-robin cursor for read-side copy selection.
@@ -175,6 +175,40 @@ impl LdMirror {
         let base = (row * k + set) * n;
         base..base + n
     }
+
+    pub fn strip_bytes(&self) -> u64 {
+        self.strip_bytes
+    }
+
+    pub fn stripes_per_chunklet(&self) -> u64 {
+        CHUNKLET_USER_BYTES / self.strip_bytes
+    }
+
+    /// Read the strip at `in_chunklet_off` for `failed_member_idx`'s position
+    /// from a live sibling copy in the same set. Used by rebuild.
+    pub fn reconstruct_member_strip(
+        &self,
+        failed_member_idx: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        let n = self.desc.set_size as usize;
+        let set_base = (failed_member_idx / n) * n;
+        for i in 0..n {
+            let m = set_base + i;
+            if m == failed_member_idx {
+                continue;
+            }
+            if let Some(pd) = self.members[m].as_ref() {
+                let chunklet_idx = self.desc.members[m].chunklet_index;
+                return pd.read_chunklet_user(chunklet_idx, in_chunklet_off, out);
+            }
+        }
+        Err(ChunkletError::Invariant(format!(
+            "Mirror set base={} has no live sibling for failed member {}",
+            set_base, failed_member_idx
+        )))
+    }
 }
 
 impl LogicalDisk for LdMirror {
@@ -197,29 +231,46 @@ impl LogicalDisk for LdMirror {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
         self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
-            // Round-robin copy selection. We only need any healthy copy in P2;
-            // P5 will add latency-aware / failover-aware policies.
+            // Round-robin pick a live copy. If the chosen one is Failed,
+            // fall through to the next. If all N are Failed, the set is
+            // dead — return an error.
             let copies = self.member_indices_for(row, set);
-            let n = copies.len();
-            let pick = self.read_cursor.fetch_add(1, Ordering::Relaxed) % n;
-            let member_idx = copies.start + pick;
-            let chunklet_idx = self.desc.members[member_idx].chunklet_index;
-            let pd = &self.members[member_idx];
-            pd.read_chunklet_user(chunklet_idx, off_in_c, &mut buf[range])
+            let n = copies.end - copies.start;
+            let start = self.read_cursor.fetch_add(1, Ordering::Relaxed) % n;
+            for offset_pick in 0..n {
+                let pick = (start + offset_pick) % n;
+                let member_idx = copies.start + pick;
+                if let Some(pd) = self.members[member_idx].as_ref() {
+                    let chunklet_idx = self.desc.members[member_idx].chunklet_index;
+                    return pd.read_chunklet_user(chunklet_idx, off_in_c, &mut buf[range]);
+                }
+            }
+            Err(ChunkletError::Invariant(format!(
+                "Mirror set (row={}, set={}) has no live copy",
+                row, set
+            )))
         })
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
         self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
-            // Write to all N copies. Sequential for now; the write cost is
-            // dominated by NVMe queue depth, so parallelism here pays back
-            // less than for read latency. P5 may revisit.
+            // Write to every live copy. Skip Failed members; if none are live,
+            // surface an error (data loss otherwise).
             let copies = self.member_indices_for(row, set);
-            for member_idx in copies {
-                let chunklet_idx = self.desc.members[member_idx].chunklet_index;
-                let pd = &self.members[member_idx];
-                pd.write_chunklet_user(chunklet_idx, off_in_c, &buf[range.clone()])?;
+            let mut any_live = false;
+            for member_idx in copies.clone() {
+                if let Some(pd) = self.members[member_idx].as_ref() {
+                    let chunklet_idx = self.desc.members[member_idx].chunklet_index;
+                    pd.write_chunklet_user(chunklet_idx, off_in_c, &buf[range.clone()])?;
+                    any_live = true;
+                }
+            }
+            if !any_live {
+                return Err(ChunkletError::Invariant(format!(
+                    "Mirror set (row={}, set={}) write: no live copy",
+                    row, set
+                )));
             }
             Ok(())
         })

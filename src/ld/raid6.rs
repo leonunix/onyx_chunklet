@@ -54,7 +54,7 @@ const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
 
 pub struct LdRaid6 {
     desc: LdDescriptor,
-    members: Vec<Arc<PhysicalDisk>>,
+    members: Vec<Option<Arc<PhysicalDisk>>>,
     capacity: u64,
     strip_bytes: u64,
     data_per_set: usize,
@@ -197,6 +197,15 @@ impl LdRaid6 {
         set_idx * (self.desc.set_size as usize) + self.data_per_set + 1
     }
 
+    fn member_pd(&self, idx: usize) -> ChunkletResult<&Arc<PhysicalDisk>> {
+        self.members[idx].as_ref().ok_or_else(|| {
+            ChunkletError::Invariant(format!(
+                "Raid6 member idx={} on failed PD {} — caller must rebuild before writing",
+                idx, self.desc.members[idx].pd
+            ))
+        })
+    }
+
     fn read_data_strip(
         &self,
         set_idx: usize,
@@ -205,8 +214,9 @@ impl LdRaid6 {
         bytes: &mut [u8],
     ) -> ChunkletResult<()> {
         let m = self.member_idx_data(set_idx, data_pos);
+        let pd = self.member_pd(m)?;
         let chunklet_idx = self.desc.members[m].chunklet_index;
-        self.members[m].read_chunklet_user(chunklet_idx, in_chunklet_off, bytes)
+        pd.read_chunklet_user(chunklet_idx, in_chunklet_off, bytes)
     }
 
     fn write_data_strip(
@@ -217,32 +227,129 @@ impl LdRaid6 {
         bytes: &[u8],
     ) -> ChunkletResult<()> {
         let m = self.member_idx_data(set_idx, data_pos);
+        let pd = self.member_pd(m)?;
         let chunklet_idx = self.desc.members[m].chunklet_index;
-        self.members[m].write_chunklet_user(chunklet_idx, in_chunklet_off, bytes)
+        pd.write_chunklet_user(chunklet_idx, in_chunklet_off, bytes)
     }
 
     fn read_p(&self, set_idx: usize, off: u64, bytes: &mut [u8]) -> ChunkletResult<()> {
         let m = self.member_idx_p(set_idx);
+        let pd = self.member_pd(m)?;
         let chunklet_idx = self.desc.members[m].chunklet_index;
-        self.members[m].read_chunklet_user(chunklet_idx, off, bytes)
+        pd.read_chunklet_user(chunklet_idx, off, bytes)
     }
 
     fn read_q(&self, set_idx: usize, off: u64, bytes: &mut [u8]) -> ChunkletResult<()> {
         let m = self.member_idx_q(set_idx);
+        let pd = self.member_pd(m)?;
         let chunklet_idx = self.desc.members[m].chunklet_index;
-        self.members[m].read_chunklet_user(chunklet_idx, off, bytes)
+        pd.read_chunklet_user(chunklet_idx, off, bytes)
     }
 
     fn write_p(&self, set_idx: usize, off: u64, bytes: &[u8]) -> ChunkletResult<()> {
         let m = self.member_idx_p(set_idx);
+        let pd = self.member_pd(m)?;
         let chunklet_idx = self.desc.members[m].chunklet_index;
-        self.members[m].write_chunklet_user(chunklet_idx, off, bytes)
+        pd.write_chunklet_user(chunklet_idx, off, bytes)
     }
 
     fn write_q(&self, set_idx: usize, off: u64, bytes: &[u8]) -> ChunkletResult<()> {
         let m = self.member_idx_q(set_idx);
+        let pd = self.member_pd(m)?;
         let chunklet_idx = self.desc.members[m].chunklet_index;
-        self.members[m].write_chunklet_user(chunklet_idx, off, bytes)
+        pd.write_chunklet_user(chunklet_idx, off, bytes)
+    }
+
+    /// Indices of failed data positions in the given set (subset of 0..K).
+    fn failed_data_positions(&self, set_idx: usize) -> Vec<usize> {
+        (0..self.data_per_set)
+            .filter(|&pos| self.members[self.member_idx_data(set_idx, pos)].is_none())
+            .collect()
+    }
+
+    /// Encode P from all K data strips at `in_chunklet_off`.
+    pub fn encode_p_strip(
+        &self,
+        set_idx: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        out.fill(0);
+        let mut tmp = vec![0u8; out.len()];
+        for pos in 0..self.data_per_set {
+            self.read_data_strip(set_idx, pos, in_chunklet_off, &mut tmp)?;
+            gf256::xor_into(out, &tmp);
+        }
+        Ok(())
+    }
+
+    /// Encode Q from all K data strips at `in_chunklet_off`.
+    pub fn encode_q_strip(
+        &self,
+        set_idx: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        out.fill(0);
+        let mut tmp = vec![0u8; out.len()];
+        for pos in 0..self.data_per_set {
+            self.read_data_strip(set_idx, pos, in_chunklet_off, &mut tmp)?;
+            gf256::mul_xor_into(out, &tmp, gf256::g_pow(pos));
+        }
+        Ok(())
+    }
+
+    pub fn stripes_per_chunklet(&self) -> u64 {
+        CHUNKLET_USER_BYTES / self.strip_bytes
+    }
+
+    pub fn strip_bytes(&self) -> u64 {
+        self.strip_bytes
+    }
+
+    pub fn data_per_set(&self) -> usize {
+        self.data_per_set
+    }
+
+    /// Generic per-member rebuild helper: dispatches to the right reconstruct
+    /// path based on member role + how many failures share this set.
+    pub fn reconstruct_member_strip(
+        &self,
+        failed_member_idx: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        let n = self.desc.set_size as usize;
+        let set_idx = failed_member_idx / n;
+        let pos = failed_member_idx % n;
+        if pos == self.data_per_set {
+            self.encode_p_strip(set_idx, in_chunklet_off, out)
+        } else if pos == self.data_per_set + 1 {
+            self.encode_q_strip(set_idx, in_chunklet_off, out)
+        } else {
+            // Data position. Check how many data positions in this set are
+            // failed: 1 → use P; 2 → use PQ-solve and pick the right output.
+            let failed = self.failed_data_positions(set_idx);
+            if failed.len() == 1 && failed[0] == pos {
+                self.reconstruct_one_data(set_idx, pos, in_chunklet_off, out)
+            } else if failed.len() == 2 && failed.contains(&pos) {
+                let (x, y) = (failed[0], failed[1]);
+                let (dx, dy) =
+                    self.reconstruct_two_data(set_idx, x, y, in_chunklet_off, out.len())?;
+                if pos == x {
+                    out.copy_from_slice(&dx);
+                } else {
+                    out.copy_from_slice(&dy);
+                }
+                Ok(())
+            } else {
+                Err(ChunkletError::Invariant(format!(
+                    "Raid6 set {} has {} failed data positions (need <= 2 with this position included)",
+                    set_idx,
+                    failed.len()
+                )))
+            }
+        }
     }
 
     /// Reconstruct one missing data position via P (XOR of surviving data
@@ -366,12 +473,46 @@ impl LogicalDisk for LdRaid6 {
             let addr = self.locate(cursor);
             let strip_remain = self.strip_bytes - addr.in_strip_off;
             let take = std::cmp::min(remaining as u64, strip_remain) as usize;
-            self.read_data_strip(
-                addr.set_idx,
-                addr.data_pos,
-                addr.in_chunklet_off,
-                &mut buf[buf_start..buf_start + take],
-            )?;
+            // Are we reading a failed data position? If so, dispatch to the
+            // 1- or 2-failure reconstruct path.
+            let failed = self.failed_data_positions(addr.set_idx);
+            if failed.contains(&addr.data_pos) {
+                let strip_len = self.strip_bytes as usize;
+                let strip_base = addr.in_chunklet_off - addr.in_strip_off;
+                if failed.len() == 1 {
+                    let mut tmp = vec![0u8; strip_len];
+                    self.reconstruct_one_data(
+                        addr.set_idx,
+                        addr.data_pos,
+                        strip_base,
+                        &mut tmp,
+                    )?;
+                    buf[buf_start..buf_start + take].copy_from_slice(
+                        &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
+                    );
+                } else if failed.len() == 2 {
+                    let (x, y) = (failed[0], failed[1]);
+                    let (dx, dy) =
+                        self.reconstruct_two_data(addr.set_idx, x, y, strip_base, strip_len)?;
+                    let want = if addr.data_pos == x { dx } else { dy };
+                    buf[buf_start..buf_start + take].copy_from_slice(
+                        &want[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
+                    );
+                } else {
+                    return Err(ChunkletError::Invariant(format!(
+                        "Raid6 set {} has {} failed data positions (>2), unrecoverable",
+                        addr.set_idx,
+                        failed.len()
+                    )));
+                }
+            } else {
+                self.read_data_strip(
+                    addr.set_idx,
+                    addr.data_pos,
+                    addr.in_chunklet_off,
+                    &mut buf[buf_start..buf_start + take],
+                )?;
+            }
             buf_start += take;
             cursor += take as u64;
             remaining -= take;

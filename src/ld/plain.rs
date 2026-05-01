@@ -28,7 +28,7 @@ const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
 
 pub struct LdPlain {
     desc: LdDescriptor,
-    members: Vec<Arc<PhysicalDisk>>,
+    members: Vec<Option<Arc<PhysicalDisk>>>,
     capacity: u64,
 }
 
@@ -141,9 +141,10 @@ impl LogicalDisk for LdPlain {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
         self.for_each_segment(offset, buf.len(), |member_idx, off_in_c, range| {
-            // Only Data members in Plain. Defensive check; alloc enforces it.
             debug_assert_eq!(self.desc.members[member_idx].role, LdRole::Data);
-            let pd = &self.members[member_idx];
+            let pd = self.members[member_idx]
+                .as_ref()
+                .ok_or_else(|| degraded_error(&self.desc.members[member_idx].pd))?;
             let chunklet_idx = self.desc.members[member_idx].chunklet_index;
             pd.read_chunklet_user(chunklet_idx, off_in_c, &mut buf[range])
         })
@@ -153,9 +154,18 @@ impl LogicalDisk for LdPlain {
         self.ensure_aligned(offset, buf.len())?;
         self.for_each_segment(offset, buf.len(), |member_idx, off_in_c, range| {
             debug_assert_eq!(self.desc.members[member_idx].role, LdRole::Data);
-            let pd = &self.members[member_idx];
+            let pd = self.members[member_idx]
+                .as_ref()
+                .ok_or_else(|| degraded_error(&self.desc.members[member_idx].pd))?;
             let chunklet_idx = self.desc.members[member_idx].chunklet_index;
             pd.write_chunklet_user(chunklet_idx, off_in_c, &buf[range])
         })
     }
+}
+
+fn degraded_error(pd: &crate::types::PdId) -> ChunkletError {
+    ChunkletError::Invariant(format!(
+        "Plain LD member on failed PD {} — Plain has no redundancy, IO impossible",
+        pd
+    ))
 }

@@ -59,22 +59,22 @@ pub trait LogicalDisk: Send + Sync {
 }
 
 /// Look up the `Arc<PhysicalDisk>` for each member listed in a descriptor,
-/// returning a vector aligned with `desc.members`.
+/// returning a vector aligned with `desc.members`. A `None` entry means the
+/// member's PD is currently absent (Failed). LDs with redundancy
+/// (Mirror / Raid5 / Raid6) tolerate `None` entries via reconstruct paths;
+/// LDs without redundancy (Plain / Raid0) return an error on first IO.
 ///
-/// Returns an error if any member's PD is missing from `pds`.
+/// Plain "PD not found" (e.g. corrupted descriptor pointing at an unknown
+/// pd_id) was previously an error; with degraded mode it's still an error
+/// only when **strict** is true (used by drop / rebuild paths). Pass
+/// `strict=false` to map missing PDs to `None`.
 pub(crate) fn resolve_members(
     pds: &std::collections::BTreeMap<crate::types::PdId, Arc<PhysicalDisk>>,
     desc: &LdDescriptor,
-) -> ChunkletResult<Vec<Arc<PhysicalDisk>>> {
+) -> ChunkletResult<Vec<Option<Arc<PhysicalDisk>>>> {
     let mut out = Vec::with_capacity(desc.members.len());
     for m in &desc.members {
-        let pd = pds.get(&m.pd).cloned().ok_or_else(|| {
-            crate::ChunkletError::Invariant(format!(
-                "LD {} member references unknown PD {}",
-                desc.id, m.pd
-            ))
-        })?;
-        out.push(pd);
+        out.push(pds.get(&m.pd).cloned());
     }
     Ok(out)
 }

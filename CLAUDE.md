@@ -13,10 +13,16 @@
 cargo build
 cargo test                    # unit + integration
 cargo build --release
+cargo test --release          # 推荐：rebuild 测试在 debug 下要 3 分钟，release 18s
 cargo test -- --ignored       # fault injection / 长跑，发布前必跑
 ```
 
 测试覆盖率目标 90%+。`--ignored` 用例不是可选，是 phase gate。
+
+**Rebuild 测试在 sparse file 上慢的原因**：每次 rebuild 整个 chunklet（1 GiB）需要
+~1024 次 1 MiB pwrite/pread 系统调用，加上 tmpfs/overlayfs 的稀疏文件页分配开销，
+debug build 单个 rebuild 测试要 ~40s。release build 快得多。真盘 NVMe 上不存在这
+个问题（fsync + DMA 比 tmpfs 快得多）。
 
 ## 架构脉络
 
