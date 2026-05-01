@@ -1,5 +1,6 @@
-//! `chunklet-perf` - focused performance harness for one LD.
+//! `chunklet-perf` - fio-ish performance harness for chunklet LDs.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,19 +13,24 @@ use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{LdId, BLOCK_SIZE};
 use onyx_chunklet::{ChunkletResult, Pool, PoolConfig};
 use rand::rngs::StdRng;
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
+use serde::Deserialize;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "chunklet-perf",
-    about = "Run a focused chunklet LD performance workload"
+    about = "Run fio-ish chunklet LD performance workloads"
 )]
 struct Cli {
+    /// TOML job file. CLI still supplies defaults for omitted fields.
+    #[arg(long)]
+    job_file: Option<PathBuf>,
+
     /// Pool device paths. Comma-separated.
     #[arg(long, value_delimiter = ',')]
     devices: Vec<PathBuf>,
 
-    /// Initialize a fresh pool and create one LD before running.
+    /// Initialize a fresh pool and create LDs for jobs without ld_id.
     #[arg(long, default_value_t = false)]
     init: bool,
 
@@ -68,9 +74,13 @@ struct Cli {
     #[arg(long, default_value_t = 70)]
     read_pct: u8,
 
-    /// Worker threads.
+    /// Worker groups per job.
     #[arg(long, default_value_t = 4)]
     workers: usize,
+
+    /// Outstanding sync lanes per worker. Total threads per job = workers * iodepth.
+    #[arg(long, default_value_t = 1)]
+    iodepth: usize,
 
     /// IO size in 4 KiB blocks.
     #[arg(long, default_value_t = 1)]
@@ -92,12 +102,33 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     working_set_bytes: u64,
 
+    /// Start offset within the LD.
+    #[arg(long, default_value_t = 0)]
+    offset_bytes: u64,
+
+    /// Random offset distribution.
+    #[arg(long, value_enum, default_value_t = RandomDist::Uniform)]
+    random_dist: RandomDist,
+
+    /// Percent of random IOs sent to the hot region when random-dist=hotspot.
+    #[arg(long, default_value_t = 80)]
+    hot_pct: u8,
+
+    /// Percent of working set that is hot when random-dist=hotspot.
+    #[arg(long, default_value_t = 20)]
+    hotset_pct: u8,
+
+    /// Verify reads and write-after-readback with deterministic offset pattern.
+    #[arg(long, default_value_t = false)]
+    verify: bool,
+
     /// Seed for deterministic random workloads.
     #[arg(long, default_value_t = 0xc0ffee)]
     seed: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 enum PerfRaid {
     Plain,
     Mirror,
@@ -106,13 +137,15 @@ enum PerfRaid {
     Raid6,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 enum PerfBackend {
     Sync,
     Uring,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 enum WorkloadKind {
     Read,
     Write,
@@ -122,8 +155,79 @@ enum WorkloadKind {
     Seqrw,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum RandomDist {
+    Uniform,
+    Hotspot,
+    Zipf,
+}
+
+#[derive(Debug, Deserialize)]
+struct PerfFile {
+    #[serde(default)]
+    global: FileGlobal,
+    #[serde(default, rename = "job")]
+    jobs: Vec<FileJob>,
+}
+
+#[derive(Default, Debug, Deserialize)]
+struct FileGlobal {
+    devices: Option<Vec<PathBuf>>,
+    init: Option<bool>,
+    backend: Option<PerfBackend>,
+    runtime_secs: Option<u64>,
+    warmup_secs: Option<u64>,
+    report_secs: Option<u64>,
+    sparse_size_bytes: Option<u64>,
+    spare_pct: Option<u8>,
+    seed: Option<u64>,
+}
+
+#[derive(Default, Debug, Deserialize)]
+struct FileJob {
+    name: Option<String>,
+    ld_id: Option<String>,
+    raid: Option<PerfRaid>,
+    width: Option<u16>,
+    rows: Option<u16>,
+    strip_log2: Option<u8>,
+    workload: Option<WorkloadKind>,
+    read_pct: Option<u8>,
+    workers: Option<usize>,
+    iodepth: Option<usize>,
+    io_blocks: Option<usize>,
+    working_set_bytes: Option<u64>,
+    offset_bytes: Option<u64>,
+    random_dist: Option<RandomDist>,
+    hot_pct: Option<u8>,
+    hotset_pct: Option<u8>,
+    verify: Option<bool>,
+    seed: Option<u64>,
+}
+
+#[derive(Clone)]
+struct BenchJob {
+    name: String,
+    ld_id: LdId,
+    ld: Arc<dyn LogicalDisk>,
+    workload: WorkloadKind,
+    read_pct: u8,
+    workers: usize,
+    iodepth: usize,
+    io_len: usize,
+    offset_bytes: u64,
+    work_bytes: u64,
+    random_dist: RandomDist,
+    hot_pct: u8,
+    hotset_pct: u8,
+    verify: bool,
+    seed: u64,
+}
+
 #[derive(Default)]
 struct WorkerStats {
+    job: String,
     ops: u64,
     read_ops: u64,
     write_ops: u64,
@@ -169,163 +273,297 @@ fn main() {
 }
 
 fn run(cli: Cli) -> ChunkletResult<()> {
-    validate_cli(&cli)?;
-    let raws = open_or_create_devices(&cli.devices, cli.sparse_size_bytes)?;
-    let backend = match cli.backend {
+    let perf_file = load_job_file(&cli)?;
+    validate_global(&cli, perf_file.as_ref())?;
+
+    let global = perf_file.as_ref().map(|f| &f.global);
+    let devices = merged_devices(&cli, global)?;
+    let init = global.and_then(|g| g.init).unwrap_or(cli.init);
+    let backend = global.and_then(|g| g.backend).unwrap_or(cli.backend);
+    let sparse_size = global
+        .and_then(|g| g.sparse_size_bytes)
+        .unwrap_or(cli.sparse_size_bytes);
+    let spare_pct = global.and_then(|g| g.spare_pct).unwrap_or(cli.spare_pct);
+    let runtime_secs = global
+        .and_then(|g| g.runtime_secs)
+        .unwrap_or(cli.runtime_secs);
+    let warmup_secs = global
+        .and_then(|g| g.warmup_secs)
+        .unwrap_or(cli.warmup_secs);
+    let report_secs = global
+        .and_then(|g| g.report_secs)
+        .unwrap_or(cli.report_secs);
+    let seed = global.and_then(|g| g.seed).unwrap_or(cli.seed);
+
+    let raws = open_or_create_devices(&devices, sparse_size)?;
+    let backend_kind = match backend {
         PerfBackend::Sync => IoBackendKind::Sync,
         PerfBackend::Uring => IoBackendKind::Uring,
     };
-    let pool = if cli.init {
-        let pool = Pool::create(
+    let pool = if init {
+        Pool::create(
             raws,
             PoolConfig {
-                spare_pct: cli.spare_pct,
-                io_backend: backend,
+                spare_pct,
+                io_backend: backend_kind,
             },
-        )?;
-        let ld_id = pool.create_ld(ld_spec(cli.raid, cli.width, cli.rows, cli.strip_log2)?)?;
-        eprintln!(
-            "created pool {} and {:?} LD {} (rows={} width={})",
-            pool.id(),
-            cli.raid,
-            ld_id,
-            cli.rows,
-            cli.width
-        );
-        pool
+        )?
     } else {
         let pool = Pool::open(raws)?;
-        pool.set_io_backend(backend);
+        pool.set_io_backend(backend_kind);
         pool
     };
 
-    let ld_id = match &cli.ld_id {
-        Some(s) => parse_ld_id(s)?,
-        None => pool
-            .list_lds()
-            .first()
-            .map(|d| d.id)
-            .ok_or_else(|| onyx_chunklet::ChunkletError::Config("pool has no LDs".into()))?,
-    };
-    let ld = pool.open_ld(ld_id)?;
-    let io_len = cli.io_blocks * BLOCK_SIZE as usize;
-    let work_bytes = effective_working_set(ld.capacity_bytes(), cli.working_set_bytes, io_len)?;
+    let file_jobs = perf_file.as_ref().map(|f| f.jobs.as_slice()).unwrap_or(&[]);
+    let jobs = build_jobs(
+        &cli,
+        file_jobs,
+        init,
+        seed,
+        runtime_secs,
+        warmup_secs,
+        &pool,
+    )?;
 
     eprintln!(
-        "perf target: pool={} ld={} cap={} work={} io={} workers={} workload={:?} read_pct={} backend={:?}",
+        "perf target: pool={} jobs={} backend={:?} runtime={}s warmup={}s",
         pool.id(),
-        ld_id,
-        ld.capacity_bytes(),
-        work_bytes,
-        io_len,
-        cli.workers,
-        cli.workload,
-        cli.read_pct,
-        cli.backend
+        jobs.len(),
+        backend,
+        runtime_secs,
+        warmup_secs
     );
-
-    if cli.warmup_secs > 0 {
-        eprintln!("warmup: {}s", cli.warmup_secs);
-        run_phase(&cli, ld.clone(), work_bytes, io_len, cli.warmup_secs, false)?;
+    for job in &jobs {
+        eprintln!(
+            "  job={} ld={} work={} offset={} io={} workers={} iodepth={} workload={:?} read_pct={} dist={:?} verify={}",
+            job.name,
+            job.ld_id,
+            job.work_bytes,
+            job.offset_bytes,
+            job.io_len,
+            job.workers,
+            job.iodepth,
+            job.workload,
+            job.read_pct,
+            job.random_dist,
+            job.verify
+        );
     }
 
-    eprintln!("measure: {}s", cli.runtime_secs);
-    let stats = run_phase(&cli, ld, work_bytes, io_len, cli.runtime_secs, true)?;
-    print_summary(&stats, cli.runtime_secs, io_len);
-    if stats.errors > 0 {
+    if jobs.iter().any(|j| j.verify) {
+        prefill_verify_jobs(&jobs)?;
+    }
+    if warmup_secs > 0 {
+        eprintln!("warmup: {}s", warmup_secs);
+        run_phase(&jobs, warmup_secs, report_secs, false)?;
+    }
+
+    eprintln!("measure: {}s", runtime_secs);
+    let stats = run_phase(&jobs, runtime_secs, report_secs, true)?;
+    print_summary(&stats, runtime_secs);
+    if stats.iter().any(|s| s.errors > 0) {
+        let errors: u64 = stats.iter().map(|s| s.errors).sum();
         return Err(onyx_chunklet::ChunkletError::Invariant(format!(
             "perf completed with {} IO errors",
-            stats.errors
+            errors
         )));
     }
     Ok(())
 }
 
-fn run_phase(
+fn build_jobs(
     cli: &Cli,
-    ld: Arc<dyn LogicalDisk>,
-    work_bytes: u64,
-    io_len: usize,
+    file_jobs: &[FileJob],
+    init: bool,
+    global_seed: u64,
     runtime_secs: u64,
+    warmup_secs: u64,
+    pool: &Arc<Pool>,
+) -> ChunkletResult<Vec<BenchJob>> {
+    if runtime_secs == 0 {
+        return Err(onyx_chunklet::ChunkletError::Config(
+            "runtime_secs must be > 0".into(),
+        ));
+    }
+    let synthetic;
+    let job_defs = if file_jobs.is_empty() {
+        synthetic = vec![FileJob {
+            name: Some("job0".into()),
+            ld_id: cli.ld_id.clone(),
+            raid: Some(cli.raid),
+            width: Some(cli.width),
+            rows: Some(cli.rows),
+            strip_log2: Some(cli.strip_log2),
+            workload: Some(cli.workload),
+            read_pct: Some(cli.read_pct),
+            workers: Some(cli.workers),
+            iodepth: Some(cli.iodepth),
+            io_blocks: Some(cli.io_blocks),
+            working_set_bytes: Some(cli.working_set_bytes),
+            offset_bytes: Some(cli.offset_bytes),
+            random_dist: Some(cli.random_dist),
+            hot_pct: Some(cli.hot_pct),
+            hotset_pct: Some(cli.hotset_pct),
+            verify: Some(cli.verify),
+            seed: Some(cli.seed),
+        }];
+        synthetic.as_slice()
+    } else {
+        file_jobs
+    };
+
+    let mut out = Vec::with_capacity(job_defs.len());
+    for (idx, job) in job_defs.iter().enumerate() {
+        let name = job.name.clone().unwrap_or_else(|| format!("job{}", idx));
+        let raid = job.raid.unwrap_or(cli.raid);
+        let width = job.width.unwrap_or(cli.width);
+        let rows = job.rows.unwrap_or(cli.rows);
+        let strip_log2 = job.strip_log2.unwrap_or(cli.strip_log2);
+        let ld_id =
+            match &job.ld_id {
+                Some(s) => parse_ld_id(s)?,
+                None if init => pool.create_ld(ld_spec(raid, width, rows, strip_log2)?)?,
+                None => pool.list_lds().first().map(|d| d.id).ok_or_else(|| {
+                    onyx_chunklet::ChunkletError::Config("pool has no LDs".into())
+                })?,
+            };
+        let ld = pool.open_ld(ld_id)?;
+        let io_blocks = job.io_blocks.unwrap_or(cli.io_blocks);
+        let io_len = io_blocks * BLOCK_SIZE as usize;
+        let offset_bytes = job.offset_bytes.unwrap_or(cli.offset_bytes);
+        let requested_work = job.working_set_bytes.unwrap_or(cli.working_set_bytes);
+        let work_bytes =
+            effective_working_set(ld.capacity_bytes(), offset_bytes, requested_work, io_len)?;
+        let read_pct = job.read_pct.unwrap_or(cli.read_pct);
+        let workers = job.workers.unwrap_or(cli.workers);
+        let iodepth = job.iodepth.unwrap_or(cli.iodepth);
+        let hot_pct = job.hot_pct.unwrap_or(cli.hot_pct);
+        let hotset_pct = job.hotset_pct.unwrap_or(cli.hotset_pct);
+        let seed = job
+            .seed
+            .unwrap_or(global_seed.wrapping_add((idx as u64) << 32));
+        let bench = BenchJob {
+            name,
+            ld_id,
+            ld,
+            workload: job.workload.unwrap_or(cli.workload),
+            read_pct,
+            workers,
+            iodepth,
+            io_len,
+            offset_bytes,
+            work_bytes,
+            random_dist: job.random_dist.unwrap_or(cli.random_dist),
+            hot_pct,
+            hotset_pct,
+            verify: job.verify.unwrap_or(cli.verify),
+            seed,
+        };
+        validate_job(&bench, warmup_secs)?;
+        out.push(bench);
+    }
+    Ok(out)
+}
+
+fn run_phase(
+    jobs: &[BenchJob],
+    runtime_secs: u64,
+    report_secs: u64,
     measured: bool,
-) -> ChunkletResult<WorkerStats> {
+) -> ChunkletResult<Vec<WorkerStats>> {
     let stop = Arc::new(AtomicBool::new(false));
     let counters = SharedCounters::new();
     let start = Instant::now();
     let deadline = start + Duration::from_secs(runtime_secs);
-    let mut handles = Vec::with_capacity(cli.workers);
+    let mut handles = Vec::new();
 
-    for worker in 0..cli.workers {
-        let stop = stop.clone();
-        let counters = counters.clone();
-        let ld = ld.clone();
-        let workload = cli.workload;
-        let read_pct = cli.read_pct;
-        let seed = cli.seed.wrapping_add(worker as u64);
-        handles.push(std::thread::spawn(move || {
-            worker_loop(
-                worker, ld, stop, counters, workload, read_pct, seed, work_bytes, io_len,
-            )
-        }));
+    for job in jobs {
+        let lanes = job.workers * job.iodepth;
+        for lane in 0..lanes {
+            let stop = stop.clone();
+            let counters = counters.clone();
+            let job = job.clone();
+            handles.push(std::thread::spawn(move || {
+                worker_loop(job, lane, stop, counters)
+            }));
+        }
     }
 
-    let mut next_report = start + Duration::from_secs(cli.report_secs.max(1));
+    let mut next_report = start + Duration::from_secs(report_secs.max(1));
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
         let now = Instant::now();
         if measured && now >= next_report {
             print_live(start.elapsed(), &counters);
-            next_report = now + Duration::from_secs(cli.report_secs.max(1));
+            next_report = now + Duration::from_secs(report_secs.max(1));
         }
     }
     stop.store(true, Ordering::Relaxed);
 
-    let mut stats = WorkerStats::default();
+    let mut stats = Vec::with_capacity(handles.len());
     for handle in handles {
-        let worker = handle
-            .join()
-            .map_err(|_| onyx_chunklet::ChunkletError::Invariant("perf worker panicked".into()))?;
-        stats.ops += worker.ops;
-        stats.read_ops += worker.read_ops;
-        stats.write_ops += worker.write_ops;
-        stats.bytes += worker.bytes;
-        stats.errors += worker.errors;
-        stats.latency_us.extend(worker.latency_us);
+        stats.push(
+            handle.join().map_err(|_| {
+                onyx_chunklet::ChunkletError::Invariant("perf worker panicked".into())
+            })?,
+        );
     }
     Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn worker_loop(
-    worker: usize,
-    ld: Arc<dyn LogicalDisk>,
+    job: BenchJob,
+    lane: usize,
     stop: Arc<AtomicBool>,
     counters: SharedCounters,
-    workload: WorkloadKind,
-    read_pct: u8,
-    seed: u64,
-    work_bytes: u64,
-    io_len: usize,
 ) -> WorkerStats {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut read_buf = vec![0u8; io_len];
-    let mut write_buf = vec![0u8; io_len];
-    rng.fill_bytes(&mut write_buf);
-    let mut seq = (worker as u64 * io_len as u64) % work_bytes;
-    let mut stats = WorkerStats::default();
+    let mut rng = StdRng::seed_from_u64(job.seed.wrapping_add(lane as u64));
+    let mut read_buf = vec![0u8; job.io_len];
+    let mut write_buf = vec![0u8; job.io_len];
+    let mut verify_buf = vec![0u8; job.io_len];
+    let mut seq = job.offset_bytes + ((lane as u64 * job.io_len as u64) % job.work_bytes);
+    let mut stats = WorkerStats {
+        job: job.name.clone(),
+        ..Default::default()
+    };
 
     while !stop.load(Ordering::Relaxed) {
-        let is_read = choose_read(workload, read_pct, &mut rng);
-        let offset = choose_offset(workload, &mut rng, &mut seq, work_bytes, io_len as u64);
+        let is_read = choose_read(job.workload, job.read_pct, &mut rng);
+        let offset = choose_offset(&job, &mut rng, &mut seq);
         if !is_read {
-            stamp_buffer(&mut write_buf, stats.ops);
+            fill_verify_pattern(&mut write_buf, offset);
         }
 
         let t0 = Instant::now();
         let result = if is_read {
-            ld.read_at(offset, &mut read_buf)
+            let result = job.ld.read_at(offset, &mut read_buf);
+            if result.is_ok() && job.verify {
+                fill_verify_pattern(&mut verify_buf, offset);
+                if read_buf != verify_buf {
+                    Err(onyx_chunklet::ChunkletError::Invariant(format!(
+                        "verify mismatch job={} offset={}",
+                        job.name, offset
+                    )))
+                } else {
+                    Ok(())
+                }
+            } else {
+                result
+            }
         } else {
-            ld.write_at(offset, &write_buf)
+            let result = job.ld.write_at(offset, &write_buf);
+            if result.is_ok() && job.verify {
+                match job.ld.read_at(offset, &mut verify_buf) {
+                    Ok(()) if verify_buf == write_buf => Ok(()),
+                    Ok(()) => Err(onyx_chunklet::ChunkletError::Invariant(format!(
+                        "write verify mismatch job={} offset={}",
+                        job.name, offset
+                    ))),
+                    Err(e) => Err(e),
+                }
+            } else {
+                result
+            }
         };
         let latency = t0.elapsed().as_micros() as u64;
         stats.latency_us.push(latency);
@@ -333,14 +571,16 @@ fn worker_loop(
         match result {
             Ok(()) => {
                 stats.ops += 1;
-                stats.bytes += io_len as u64;
+                stats.bytes += job.io_len as u64;
                 if is_read {
                     stats.read_ops += 1;
                 } else {
                     stats.write_ops += 1;
                 }
                 counters.ops.fetch_add(1, Ordering::Relaxed);
-                counters.bytes.fetch_add(io_len as u64, Ordering::Relaxed);
+                counters
+                    .bytes
+                    .fetch_add(job.io_len as u64, Ordering::Relaxed);
                 if is_read {
                     counters.read_ops.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -350,7 +590,10 @@ fn worker_loop(
             Err(e) => {
                 stats.errors += 1;
                 counters.errors.fetch_add(1, Ordering::Relaxed);
-                eprintln!("worker {} IO error at offset {}: {}", worker, offset, e);
+                eprintln!(
+                    "job={} lane={} IO error offset={}: {}",
+                    job.name, lane, offset, e
+                );
             }
         }
     }
@@ -365,27 +608,84 @@ fn choose_read(workload: WorkloadKind, read_pct: u8, rng: &mut StdRng) -> bool {
     }
 }
 
-fn choose_offset(
-    workload: WorkloadKind,
-    rng: &mut StdRng,
-    seq: &mut u64,
-    work_bytes: u64,
-    io_len: u64,
-) -> u64 {
-    match workload {
+fn choose_offset(job: &BenchJob, rng: &mut StdRng, seq: &mut u64) -> u64 {
+    match job.workload {
         WorkloadKind::Read | WorkloadKind::Write | WorkloadKind::Randrw => {
-            let max_block = (work_bytes - io_len) / BLOCK_SIZE;
-            rng.gen_range(0..=max_block) * BLOCK_SIZE
+            let rel = choose_random_rel(job, rng);
+            job.offset_bytes + rel
         }
         WorkloadKind::Seqread | WorkloadKind::Seqwrite | WorkloadKind::Seqrw => {
             let out = *seq;
-            *seq += io_len;
-            if *seq + io_len > work_bytes {
-                *seq = 0;
+            *seq += job.io_len as u64;
+            if *seq + job.io_len as u64 > job.offset_bytes + job.work_bytes {
+                *seq = job.offset_bytes;
             }
             out
         }
     }
+}
+
+fn choose_random_rel(job: &BenchJob, rng: &mut StdRng) -> u64 {
+    let blocks = ((job.work_bytes - job.io_len as u64) / BLOCK_SIZE) + 1;
+    let block = match job.random_dist {
+        RandomDist::Uniform => rng.gen_range(0..blocks),
+        RandomDist::Hotspot => {
+            let hot_blocks = ((blocks * job.hotset_pct.max(1) as u64) / 100).max(1);
+            if rng.gen_range(0..100) < job.hot_pct {
+                rng.gen_range(0..hot_blocks)
+            } else if hot_blocks >= blocks {
+                rng.gen_range(0..blocks)
+            } else {
+                rng.gen_range(hot_blocks..blocks)
+            }
+        }
+        RandomDist::Zipf => {
+            let u: f64 = rng.gen_range(0.0..1.0);
+            ((u * u * blocks as f64).floor() as u64).min(blocks - 1)
+        }
+    };
+    block * BLOCK_SIZE
+}
+
+fn prefill_verify_jobs(jobs: &[BenchJob]) -> ChunkletResult<()> {
+    let mut ranges = Vec::new();
+    for job in jobs.iter().filter(|j| j.verify) {
+        ranges.push((job.ld_id, job.ld.clone(), job.offset_bytes, job.work_bytes));
+    }
+    ranges.sort_by_key(|(ld, _, start, len)| (*ld, *start, *len));
+    ranges.dedup_by_key(|(ld, _, start, len)| (*ld, *start, *len));
+
+    let chunk = 1usize << 20;
+    let mut buf = vec![0u8; chunk];
+    for (ld_id, ld, start, len) in ranges {
+        eprintln!(
+            "verify prefill: ld={} offset={} bytes={}",
+            ld_id, start, len
+        );
+        let mut done = 0u64;
+        while done < len {
+            let take = std::cmp::min(chunk as u64, len - done) as usize;
+            let offset = start + done;
+            fill_verify_pattern(&mut buf[..take], offset);
+            ld.write_at(offset, &buf[..take])?;
+            done += take as u64;
+        }
+    }
+    Ok(())
+}
+
+fn fill_verify_pattern(buf: &mut [u8], base_offset: u64) {
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = mix_byte(base_offset + i as u64);
+    }
+}
+
+fn mix_byte(abs: u64) -> u8 {
+    let mut x = abs.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    (x >> 56) as u8
 }
 
 fn print_live(elapsed: Duration, counters: &SharedCounters) {
@@ -407,31 +707,65 @@ fn print_live(elapsed: Duration, counters: &SharedCounters) {
     );
 }
 
-fn print_summary(stats: &WorkerStats, runtime_secs: u64, io_len: usize) {
+fn print_summary(stats: &[WorkerStats], runtime_secs: u64) {
     let secs = runtime_secs.max(1) as f64;
+    let total = aggregate(stats);
+    print_one_summary("total", &total, secs);
+
+    let mut by_job: BTreeMap<String, WorkerStats> = BTreeMap::new();
+    for stat in stats {
+        merge_stats(by_job.entry(stat.job.clone()).or_default(), stat);
+    }
+    for (job, stat) in by_job {
+        print_one_summary(&format!("job.{}", sanitize_key(&job)), &stat, secs);
+    }
+}
+
+fn aggregate(stats: &[WorkerStats]) -> WorkerStats {
+    let mut out = WorkerStats::default();
+    for stat in stats {
+        merge_stats(&mut out, stat);
+    }
+    out
+}
+
+fn merge_stats(dst: &mut WorkerStats, src: &WorkerStats) {
+    dst.ops += src.ops;
+    dst.read_ops += src.read_ops;
+    dst.write_ops += src.write_ops;
+    dst.bytes += src.bytes;
+    dst.errors += src.errors;
+    dst.latency_us.extend_from_slice(&src.latency_us);
+}
+
+fn print_one_summary(prefix: &str, stats: &WorkerStats, secs: f64) {
     let mut lat = stats.latency_us.clone();
     lat.sort_unstable();
-    let avg_us = if stats.ops == 0 {
+    let avg_us = if lat.is_empty() {
         0.0
     } else {
-        lat.iter().sum::<u64>() as f64 / lat.len().max(1) as f64
+        lat.iter().sum::<u64>() as f64 / lat.len() as f64
     };
-    println!("ops={}", stats.ops);
-    println!("read_ops={}", stats.read_ops);
-    println!("write_ops={}", stats.write_ops);
-    println!("bytes={}", stats.bytes);
-    println!("io_bytes={}", io_len);
-    println!("iops={:.2}", stats.ops as f64 / secs);
+    println!("{}.ops={}", prefix, stats.ops);
+    println!("{}.read_ops={}", prefix, stats.read_ops);
+    println!("{}.write_ops={}", prefix, stats.write_ops);
+    println!("{}.bytes={}", prefix, stats.bytes);
+    println!("{}.iops={:.2}", prefix, stats.ops as f64 / secs);
     println!(
-        "throughput_mib_s={:.2}",
+        "{}.throughput_mib_s={:.2}",
+        prefix,
         stats.bytes as f64 / secs / (1u64 << 20) as f64
     );
-    println!("avg_latency_us={:.2}", avg_us);
-    println!("p50_latency_us={}", percentile(&lat, 50.0));
-    println!("p95_latency_us={}", percentile(&lat, 95.0));
-    println!("p99_latency_us={}", percentile(&lat, 99.0));
-    println!("max_latency_us={}", lat.last().copied().unwrap_or(0));
-    println!("errors={}", stats.errors);
+    println!("{}.avg_latency_us={:.2}", prefix, avg_us);
+    println!("{}.p50_latency_us={}", prefix, percentile(&lat, 50.0));
+    println!("{}.p95_latency_us={}", prefix, percentile(&lat, 95.0));
+    println!("{}.p99_latency_us={}", prefix, percentile(&lat, 99.0));
+    println!(
+        "{}.max_latency_us={}",
+        prefix,
+        lat.last().copied().unwrap_or(0)
+    );
+    println!("{}.errors={}", prefix, stats.errors);
 }
 
 fn percentile(sorted: &[u64], pct: f64) -> u64 {
@@ -442,39 +776,81 @@ fn percentile(sorted: &[u64], pct: f64) -> u64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-fn validate_cli(cli: &Cli) -> ChunkletResult<()> {
-    if cli.devices.is_empty() {
+fn sanitize_key(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn load_job_file(cli: &Cli) -> ChunkletResult<Option<PerfFile>> {
+    let Some(path) = &cli.job_file else {
+        return Ok(None);
+    };
+    let s = std::fs::read_to_string(path).map_err(|e| {
+        onyx_chunklet::ChunkletError::Config(format!("read {}: {}", path.display(), e))
+    })?;
+    let parsed = toml::from_str(&s).map_err(|e| {
+        onyx_chunklet::ChunkletError::Config(format!("parse {}: {}", path.display(), e))
+    })?;
+    Ok(Some(parsed))
+}
+
+fn validate_global(cli: &Cli, file: Option<&PerfFile>) -> ChunkletResult<()> {
+    if cli.devices.is_empty()
+        && file
+            .and_then(|f| f.global.devices.as_ref())
+            .map(|d| d.is_empty())
+            .unwrap_or(true)
+    {
         return Err(onyx_chunklet::ChunkletError::Config(
-            "--devices required".into(),
+            "--devices or [global].devices required".into(),
         ));
     }
-    if cli.workers == 0 {
-        return Err(onyx_chunklet::ChunkletError::Config(
-            "--workers must be > 0".into(),
-        ));
-    }
-    if cli.io_blocks == 0 {
-        return Err(onyx_chunklet::ChunkletError::Config(
-            "--io-blocks must be > 0".into(),
-        ));
-    }
-    if cli.read_pct > 100 {
-        return Err(onyx_chunklet::ChunkletError::Config(
-            "--read-pct must be <= 100".into(),
-        ));
-    }
-    if cli.runtime_secs == 0 {
-        return Err(onyx_chunklet::ChunkletError::Config(
-            "--runtime-secs must be > 0".into(),
-        ));
+    if let Some(file) = file {
+        if file.jobs.is_empty() {
+            return Err(onyx_chunklet::ChunkletError::Config(
+                "job file must contain at least one [[job]]".into(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn validate_job(job: &BenchJob, _warmup_secs: u64) -> ChunkletResult<()> {
+    if job.workers == 0 || job.iodepth == 0 {
+        return Err(onyx_chunklet::ChunkletError::Config(format!(
+            "job {} workers and iodepth must be > 0",
+            job.name
+        )));
+    }
+    if job.io_len == 0 {
+        return Err(onyx_chunklet::ChunkletError::Config(format!(
+            "job {} io size must be > 0",
+            job.name
+        )));
+    }
+    if job.read_pct > 100 || job.hot_pct > 100 || job.hotset_pct > 100 {
+        return Err(onyx_chunklet::ChunkletError::Config(format!(
+            "job {} percentages must be <= 100",
+            job.name
+        )));
+    }
+    Ok(())
+}
+
+fn merged_devices(cli: &Cli, global: Option<&FileGlobal>) -> ChunkletResult<Vec<PathBuf>> {
+    if !cli.devices.is_empty() {
+        return Ok(cli.devices.clone());
+    }
+    global
+        .and_then(|g| g.devices.clone())
+        .ok_or_else(|| onyx_chunklet::ChunkletError::Config("devices required".into()))
 }
 
 fn ld_spec(raid: PerfRaid, width: u16, rows: u16, strip_log2: u8) -> ChunkletResult<LdSpec> {
     if width == 0 || rows == 0 {
         return Err(onyx_chunklet::ChunkletError::Config(
-            "--width and --rows must be > 0".into(),
+            "width and rows must be > 0".into(),
         ));
     }
     let spec = match raid {
@@ -493,11 +869,23 @@ fn parse_ld_id(s: &str) -> ChunkletResult<LdId> {
     Ok(LdId::from_bytes(*parsed.as_bytes()))
 }
 
-fn effective_working_set(capacity: u64, requested: u64, io_len: usize) -> ChunkletResult<u64> {
+fn effective_working_set(
+    capacity: u64,
+    offset: u64,
+    requested: u64,
+    io_len: usize,
+) -> ChunkletResult<u64> {
+    if offset >= capacity {
+        return Err(onyx_chunklet::ChunkletError::Config(format!(
+            "offset {} >= capacity {}",
+            offset, capacity
+        )));
+    }
+    let available = capacity - offset;
     let work = if requested == 0 {
-        capacity
+        available
     } else {
-        requested.min(capacity)
+        requested.min(available)
     };
     if work < io_len as u64 {
         return Err(onyx_chunklet::ChunkletError::Config(format!(
@@ -506,12 +894,6 @@ fn effective_working_set(capacity: u64, requested: u64, io_len: usize) -> Chunkl
         )));
     }
     Ok((work / BLOCK_SIZE) * BLOCK_SIZE)
-}
-
-fn stamp_buffer(buf: &mut [u8], seq: u64) {
-    let bytes = seq.to_le_bytes();
-    let n = bytes.len().min(buf.len());
-    buf[..n].copy_from_slice(&bytes[..n]);
 }
 
 fn open_or_create_devices(paths: &[PathBuf], sparse_size: u64) -> ChunkletResult<Vec<RawDevice>> {
