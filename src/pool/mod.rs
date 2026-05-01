@@ -11,12 +11,16 @@
 //!
 //! # Invariants
 //!
-//! - All PDs in the pool share the same `pool_id`.
+//! - All PDs in the pool share the same `pool_id` (simple-majority vote
+//!   across opened PDs; mismatch returns `PoolMismatch`).
 //! - `pd_seq_in_pool` is a stable, dense ordinal in `[0, pd_count)`. Phase 7
 //!   may add `is_drained` etc; today a PD's seq never changes after admit.
 //! - Every PD's `pd_list` describes the full set of PDs in the pool. They
-//!   should be identical at rest. Pool::open accepts a quorum mismatch and
-//!   logs a warning; explicit repair is a Phase 7 task.
+//!   should be identical at rest. `Pool::open` REJECTS any drift in
+//!   `pool_pd_count` or duplicate `pd_seq` with `PoolMismatch`;
+//!   `Pool::open_with_missing` tolerates `< quorum` missing PDs and takes
+//!   the highest-gen LD/CPG view as authoritative. Explicit Phase-7
+//!   quorum repair is still TBD.
 
 mod cpg;
 mod drain;
@@ -536,8 +540,14 @@ impl Pool {
     }
 }
 
-/// Majority vote for pool_id across opened PDs. With our quorum policy
-/// (no minority partitions allowed), unanimous agreement is required.
+/// Simple-majority vote for pool_id across the opened PDs. Threshold is
+/// `floor(N/2) + 1` of the SET WE OPENED (not of the declared pool size —
+/// that quorum is enforced separately by `Pool::open_with_missing` against
+/// `body.pool_pd_count`). For `Pool::open` the opened set must equal the
+/// declared count anyway, so the two checks coincide.
+///
+/// Returns `PoolMismatch` if no pool_id reaches the threshold (e.g.
+/// devices from two different pools accidentally mixed).
 fn majority_pool_id(pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<PoolId> {
     let mut counts: BTreeMap<PoolId, usize> = BTreeMap::new();
     for pd in pds {
