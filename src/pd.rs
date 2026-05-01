@@ -29,7 +29,8 @@ use parking_lot::RwLock;
 
 use crate::bitmap::Bitmap;
 use crate::error::{ChunkletError, ChunkletResult};
-use crate::io::{AlignedBuf, RawDevice};
+use crate::io::sync_backend::SyncBackend;
+use crate::io::{AlignedBuf, IoBackend, RawDevice};
 use crate::superblock::{SuperblockBody, SuperblockSlot, SLOT_BYTES};
 use crate::types::{
     BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_B_OFFSET, BITMAP_SLOT_BYTES, BLOCK_SIZE, CHUNKLET_HEADER_BYTES,
@@ -40,6 +41,10 @@ use crate::types::{
 pub struct PhysicalDisk {
     raw: RawDevice,
     state: RwLock<PdState>,
+    /// Pool-wide backend for fan-out writes. Set at PD construction
+    /// (Pool::create / open / open_with_missing / admit) and cloned by
+    /// `parallel_strip_writes` from any PD in the batch.
+    backend: parking_lot::RwLock<std::sync::Arc<dyn crate::io::IoBackend>>,
 }
 
 struct PdState {
@@ -128,6 +133,7 @@ impl PhysicalDisk {
         let pd = Arc::new(Self {
             raw,
             state: RwLock::new(state),
+            backend: parking_lot::RwLock::new(default_backend()),
         });
         // Write initial state to slot A (head + tail).
         pd.write_initial()?;
@@ -180,7 +186,28 @@ impl PhysicalDisk {
         Ok(Arc::new(Self {
             raw,
             state: RwLock::new(state),
+            backend: parking_lot::RwLock::new(default_backend()),
         }))
+    }
+
+    /// Replace the IO backend in use by this PD. Pool calls this on every
+    /// PD it owns right after open/init, so all PDs in a pool share one
+    /// backend Arc.
+    pub fn set_backend(&self, b: std::sync::Arc<dyn crate::io::IoBackend>) {
+        *self.backend.write() = b;
+    }
+
+    /// Current IO backend (cheap clone — `Arc<dyn IoBackend>`).
+    pub fn backend(&self) -> std::sync::Arc<dyn crate::io::IoBackend> {
+        self.backend.read().clone()
+    }
+
+    /// Raw fd of the underlying device. Exposed for the `UringBackend`
+    /// SQE plumbing; bypasses the `RawDevice` `read_at`/`write_at` loops
+    /// so the caller is responsible for alignment + bounds checking.
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.raw.as_raw_fd()
     }
 
     pub fn pool_id(&self) -> PoolId {
@@ -390,7 +417,11 @@ impl PhysicalDisk {
         self.raw.sync()
     }
 
-    fn chunklet_user_abs_offset(
+    /// Resolve a (chunklet, in-chunklet offset, length) into an absolute
+    /// device offset, validating bounds. `pub(crate)` because the
+    /// `UringBackend` SQE plumbing needs it to bypass `RawDevice` and
+    /// post `IORING_OP_WRITE` directly against the raw fd.
+    pub(crate) fn chunklet_user_abs_offset(
         &self,
         chunklet_index: u32,
         offset: u64,
@@ -416,6 +447,13 @@ impl PhysicalDisk {
 }
 
 /// Compute total chunklets that fit on a PD given its raw size.
+/// Default backend used when a PD is opened without a Pool (test
+/// helpers, `PhysicalDisk::open`/`init` standalone). `Pool::create` and
+/// `Pool::open*` overwrite via `pd.set_backend(...)` immediately after.
+fn default_backend() -> Arc<dyn IoBackend> {
+    Arc::new(SyncBackend)
+}
+
 fn compute_total_chunklets(pd_size: u64) -> ChunkletResult<u32> {
     if pd_size < 4 * PD_RESERVED_BYTES {
         return Err(ChunkletError::Config(format!(

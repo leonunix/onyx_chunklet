@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -105,6 +105,15 @@ impl RawDevice {
     pub fn is_direct_io(&self) -> bool {
         self.direct_io
     }
+}
+
+impl AsRawFd for RawDevice {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+impl RawDevice {
 
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> ChunkletResult<()> {
         self.bounds_check(offset, buf.len() as u64)?;

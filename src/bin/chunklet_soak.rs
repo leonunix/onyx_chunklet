@@ -117,6 +117,7 @@ fn run(cli: Cli) -> ChunkletResult<()> {
             raws,
             PoolConfig {
                 spare_pct: cli.spare_pct,
+                ..Default::default()
             },
         )?
     } else if cli.allow_missing {

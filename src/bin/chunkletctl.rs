@@ -280,7 +280,7 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
                 ));
             }
             let raws = open_or_create_devices(&devices)?;
-            let pool = Pool::create(raws, PoolConfig { spare_pct })?;
+            let pool = Pool::create(raws, PoolConfig { spare_pct, ..Default::default() })?;
             println!("created pool: {}", pool.id());
             println!("PDs:");
             for info in pool.list_pds() {
@@ -320,7 +320,7 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             let raws = open_devices(&pool_paths)?;
             let pool = Pool::open(raws)?;
             let new_raw = open_or_create_one(&device)?;
-            let new_id = pool.admit(new_raw, PoolConfig { spare_pct })?;
+            let new_id = pool.admit(new_raw, PoolConfig { spare_pct, ..Default::default() })?;
             println!("admitted {} into pool {}", new_id, pool.id());
             for info in pool.list_pds() {
                 print_pd_line(&info);

@@ -32,6 +32,9 @@ uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

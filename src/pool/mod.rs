@@ -46,11 +46,19 @@ use crate::types::{PdId, PoolId};
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
     pub spare_pct: u8,
+    /// Cross-PD batched-write backend stamped onto every PD this pool
+    /// owns. Defaults to `Sync` (`std::thread::scope` fan-out). Set to
+    /// `Uring` to drive writes through a thread-local `io_uring`
+    /// instance on Linux; non-Linux silently falls back to `Sync`.
+    pub io_backend: crate::io::IoBackendKind,
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self { spare_pct: 5 }
+        Self {
+            spare_pct: 5,
+            io_backend: crate::io::IoBackendKind::Sync,
+        }
     }
 }
 
@@ -108,6 +116,7 @@ impl Pool {
             })
             .collect();
 
+        let backend = crate::io::make_backend(cfg.io_backend);
         let mut pds = BTreeMap::new();
         let mut pd_seq_to_id = BTreeMap::new();
         for (i, raw) in devices.into_iter().enumerate() {
@@ -123,6 +132,7 @@ impl Pool {
                 vec![], // fresh pool: empty LD list
                 vec![], // fresh pool: empty CPG list
             )?;
+            pd.set_backend(backend.clone());
             pds.insert(pd_id, pd);
             pd_seq_to_id.insert(i as u32, pd_id);
         }
@@ -417,6 +427,11 @@ impl Pool {
             current_ld_bytes,
             current_cpg_bytes,
         )?;
+        // Inherit the backend from any existing PD so the new member
+        // matches the rest of the pool's IO discipline.
+        if let Some(existing_pd) = self.state.read().pds.values().next() {
+            new_pd.set_backend(existing_pd.backend());
+        }
 
         let existing: Vec<Arc<PhysicalDisk>> = {
             let s = self.state.read();
@@ -442,6 +457,17 @@ impl Pool {
 
     pub fn id(&self) -> PoolId {
         self.pool_id
+    }
+
+    /// Swap the IO backend used by every PD in the pool. Useful for tests
+    /// + for `chunkletctl`-style runtime backend selection (e.g. open a
+    /// pool the default Sync way, then upgrade to Uring before doing IO).
+    pub fn set_io_backend(&self, kind: crate::io::IoBackendKind) {
+        let backend = crate::io::make_backend(kind);
+        let s = self.state.read();
+        for pd in s.pds.values() {
+            pd.set_backend(backend.clone());
+        }
     }
 
     pub fn pd_count(&self) -> usize {
