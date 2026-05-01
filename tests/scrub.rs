@@ -267,3 +267,37 @@ fn raid5_scrub_clean_set_does_not_skip() {
     assert_eq!(report.sets_skipped_degraded, 0);
     assert!(report.mismatches.is_empty());
 }
+
+/// Scrub now releases manifest_lock during its read-only batch IO and only
+/// re-acquires it for commit_bad_marks at the end. This smoke test runs
+/// scrub + a concurrent admin op (mark_chunklet_bad on a different LD's
+/// member) and verifies both complete without deadlock or error.
+#[test]
+fn scrub_and_concurrent_admin_op_both_succeed() {
+    use std::thread;
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 8);
+    let scrub_id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+    let other_id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(scrub_id).unwrap();
+    ld.write_at(0, &vec![0x99_u8; 12 * 4096]).unwrap();
+    drop(ld);
+
+    let other_target = pool.find_ld(other_id).unwrap().members[0];
+    let pool_a = Arc::clone(&pool);
+    let pool_b = Arc::clone(&pool);
+    let h1 = thread::spawn(move || pool_a.scrub_ld(scrub_id));
+    let h2 = thread::spawn(move || {
+        pool_b.mark_chunklet_bad(other_target.pd, other_target.chunklet_index)
+    });
+    let r1 = h1.join().unwrap().unwrap();
+    let r2 = h2.join().unwrap();
+    assert!(r1.mismatches.is_empty());
+    r2.unwrap();
+    let pd = pool.pd(other_target.pd).unwrap();
+    let (_, bm, _) = pd.snapshot();
+    assert_eq!(
+        bm.get(other_target.chunklet_index).unwrap(),
+        ChunkletState::Bad
+    );
+}

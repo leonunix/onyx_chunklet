@@ -74,9 +74,15 @@ impl Pool {
     ///
     /// Scrub does NOT rebuild — the caller follows up with
     /// `Pool::rebuild_ld(ld_id)` to restore redundancy onto fresh chunklets.
+    ///
+    /// Lock policy: snapshots `ld_list` + `pds` under `state.read()` only,
+    /// then performs all read-only batch IO with NO pool lock held (each
+    /// PD's `Arc<PhysicalDisk>` lives on its own; concurrent admin ops can
+    /// proceed). `manifest_lock` is taken only at the end inside
+    /// `commit_bad_marks` to persist any Bad marks. For a multi-GiB LD
+    /// this changes scrub from "blocks every other admin op for the full
+    /// duration" to "blocks them only during the final bad-mark commit".
     pub fn scrub_ld(&self, ld_id: LdId) -> ChunkletResult<ScrubReport> {
-        let _commit = self.manifest_lock.lock();
-
         let desc = self
             .find_ld(ld_id)
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", ld_id)))?;
@@ -395,6 +401,12 @@ impl Pool {
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
         bad_marks: &BTreeMap<PdId, BTreeSet<u32>>,
     ) -> ChunkletResult<usize> {
+        if bad_marks.is_empty() {
+            return Ok(0);
+        }
+        // Acquire manifest_lock only when there's actual mutation work to
+        // do; the long read-only scrub IO above ran without it.
+        let _commit = self.manifest_lock.lock();
         let mut total = 0;
         for (pd_id, idxs) in bad_marks {
             let pd = pds_snapshot.get(pd_id).ok_or_else(|| {
