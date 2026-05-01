@@ -21,6 +21,7 @@ pub mod chunklet;
 pub mod error;
 pub mod io;
 pub mod ld;
+pub mod metrics;
 pub mod pd;
 pub mod pool;
 pub mod superblock;
@@ -28,8 +29,7 @@ pub mod types;
 
 pub use error::{ChunkletError, ChunkletResult};
 pub use ld::{LdDescriptor, LdList, LdMirror, LdPlain, LdRaid0, LdRaid5, LdRaid6, LogicalDisk};
+pub use metrics::{LdMetrics, PdMetrics, PdOperationalState, PoolMetrics};
 pub use pd::PhysicalDisk;
 pub use pool::{Pool, PoolConfig};
-pub use types::{
-    ChunkletId, CpgId, HaDomain, LdId, LdMember, LdRole, PdId, PoolId, RaidLevel,
-};
+pub use types::{ChunkletId, CpgId, HaDomain, LdId, LdMember, LdRole, PdId, PoolId, RaidLevel};

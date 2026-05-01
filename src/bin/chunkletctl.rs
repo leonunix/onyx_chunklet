@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use onyx_chunklet::io::{AlignedBuf, RawDevice};
+use onyx_chunklet::metrics::{PdOperationalState, PoolMetrics};
 use onyx_chunklet::pool::{CpgSpec, LdSpec};
 use onyx_chunklet::superblock::{SuperblockSlot, SLOT_BYTES};
 use onyx_chunklet::types::{
@@ -59,6 +60,13 @@ enum PoolOp {
     Open { devices: Vec<PathBuf> },
     /// Alias for `open`.
     List { devices: Vec<PathBuf> },
+    /// Print capacity, health, LD, and PD metrics.
+    Status {
+        /// Allow opening a degraded pool with missing devices.
+        #[arg(long, default_value_t = false)]
+        allow_missing: bool,
+        devices: Vec<PathBuf>,
+    },
     /// Drain a PD (migrate all LD members onto other PDs, then mark DRAINED).
     Drain {
         #[arg(long, required = true, value_delimiter = ',')]
@@ -270,17 +278,20 @@ fn run(cli: Cli) -> ChunkletResult<()> {
 
 fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
     match cmd.op {
-        PoolOp::Init {
-            spare_pct,
-            devices,
-        } => {
+        PoolOp::Init { spare_pct, devices } => {
             if devices.is_empty() {
                 return Err(onyx_chunklet::ChunkletError::Config(
                     "init requires at least one device".into(),
                 ));
             }
             let raws = open_or_create_devices(&devices)?;
-            let pool = Pool::create(raws, PoolConfig { spare_pct, ..Default::default() })?;
+            let pool = Pool::create(
+                raws,
+                PoolConfig {
+                    spare_pct,
+                    ..Default::default()
+                },
+            )?;
             println!("created pool: {}", pool.id());
             println!("PDs:");
             for info in pool.list_pds() {
@@ -295,6 +306,19 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             for info in pool.list_pds() {
                 print_pd_line(&info);
             }
+            Ok(())
+        }
+        PoolOp::Status {
+            allow_missing,
+            devices,
+        } => {
+            let raws = open_devices(&devices)?;
+            let pool = if allow_missing {
+                Pool::open_with_missing(raws)?
+            } else {
+                Pool::open(raws)?
+            };
+            print_pool_status(&pool.metrics()?);
             Ok(())
         }
         PoolOp::Drain { pool, pd_id } => {
@@ -320,7 +344,13 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             let raws = open_devices(&pool_paths)?;
             let pool = Pool::open(raws)?;
             let new_raw = open_or_create_one(&device)?;
-            let new_id = pool.admit(new_raw, PoolConfig { spare_pct, ..Default::default() })?;
+            let new_id = pool.admit(
+                new_raw,
+                PoolConfig {
+                    spare_pct,
+                    ..Default::default()
+                },
+            )?;
             println!("admitted {} into pool {}", new_id, pool.id());
             for info in pool.list_pds() {
                 print_pd_line(&info);
@@ -547,11 +577,7 @@ fn run_cpg(cmd: CpgCmd) -> ChunkletResult<()> {
             println!("dropped CPG {}", id);
             Ok(())
         }
-        CpgOp::CreateLd {
-            pool,
-            cpg_id,
-            rows,
-        } => {
+        CpgOp::CreateLd { pool, cpg_id, rows } => {
             let parsed = uuid::Uuid::parse_str(&cpg_id)
                 .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
             let id = CpgId::from_bytes(*parsed.as_bytes());
@@ -582,6 +608,112 @@ fn print_ld_table(pool: &Pool) {
             d.num_rows,
             d.members.len()
         );
+    }
+}
+
+fn print_pool_status(m: &PoolMetrics) {
+    println!(
+        "pool: {}  pds={} healthy={} failed={} draining={} drained={} lds={} cpgs={}",
+        m.pool_id,
+        m.pd_count,
+        m.healthy_pds,
+        m.failed_pds,
+        m.draining_pds,
+        m.drained_pds,
+        m.ld_count,
+        m.cpg_count
+    );
+    println!(
+        "capacity: raw={} user={} allocatable={} used={} spare={} bad={} migrating={}",
+        format_bytes(m.raw_bytes),
+        format_bytes(m.user_bytes),
+        format_bytes(m.allocatable_bytes),
+        format_bytes(m.used_bytes),
+        format_bytes(m.spare_bytes),
+        format_bytes(m.bad_bytes),
+        format_bytes(m.migrating_bytes)
+    );
+    println!(
+        "chunklets: total={} free={} used={} spare={} bad={} migrating={} reconcile_fixes={}",
+        m.total_chunklets,
+        m.free_chunklets,
+        m.used_chunklets,
+        m.spare_chunklets,
+        m.bad_chunklets,
+        m.migrating_chunklets,
+        m.last_reconciliation_count
+    );
+
+    println!("PDs:");
+    for pd in &m.pds {
+        println!(
+            "  seq={:>3} state={:<8} pd={} gen={} backend={} free={}/{} used={} spare={} bad={} alloc={} path={}",
+            pd.pd_seq,
+            pd_state_label(pd.state),
+            pd.pd_id,
+            pd.manifest_gen
+                .map(|gen| gen.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            pd.backend.unwrap_or("-"),
+            pd.free_chunklets,
+            pd.total_chunklets,
+            pd.used_chunklets,
+            pd.spare_chunklets,
+            pd.bad_chunklets,
+            format_bytes(pd.allocatable_bytes),
+            pd.path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+
+    if m.lds.is_empty() {
+        println!("LDs: none");
+    } else {
+        println!("LDs:");
+        for ld in &m.lds {
+            println!(
+                "  id={} raid={:?} cap={} strip={} set={} row={} rows={} members={} unavailable={} failed={} bad={} draining={} drained={}",
+                ld.ld_id,
+                ld.raid_level,
+                format_bytes(ld.capacity_bytes),
+                format_bytes(ld.strip_size_bytes),
+                ld.set_size,
+                ld.row_size,
+                ld.num_rows,
+                ld.member_count,
+                ld.unavailable_members,
+                ld.failed_members,
+                ld.bad_members,
+                ld.draining_members,
+                ld.drained_members
+            );
+        }
+    }
+}
+
+fn pd_state_label(state: PdOperationalState) -> &'static str {
+    match state {
+        PdOperationalState::Healthy => "healthy",
+        PdOperationalState::Failed => "failed",
+        PdOperationalState::Draining => "draining",
+        PdOperationalState::Drained => "drained",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{:.2} {}", value, UNITS[unit])
     }
 }
 

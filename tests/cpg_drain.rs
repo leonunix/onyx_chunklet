@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use onyx_chunklet::io::RawDevice;
+use onyx_chunklet::metrics::PdOperationalState;
 use onyx_chunklet::pool::{CpgSpec, LdSpec};
 use onyx_chunklet::types::{ChunkletState, HaDomain, RaidLevel};
 use onyx_chunklet::{Pool, PoolConfig};
@@ -19,7 +20,14 @@ fn make_pool(dir: &TempDir, n: usize) -> (Arc<Pool>, Vec<PathBuf>) {
         raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
         paths.push(p);
     }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0, ..Default::default() }).unwrap();
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (pool, paths)
 }
 
@@ -112,6 +120,56 @@ fn create_ld_in_cpg_uses_cpg_policy() {
     assert_eq!(desc.members.len(), 4);
 }
 
+#[test]
+fn pool_metrics_report_capacity_and_ld_health() {
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+    let metrics = pool.metrics().unwrap();
+
+    assert_eq!(metrics.pd_count, 4);
+    assert_eq!(metrics.healthy_pds, 4);
+    assert_eq!(metrics.failed_pds, 0);
+    assert_eq!(metrics.ld_count, 1);
+    assert_eq!(metrics.total_chunklets, 12);
+    assert_eq!(metrics.used_chunklets, 4);
+    assert_eq!(metrics.free_chunklets, 8);
+    assert_eq!(
+        metrics.used_bytes,
+        4 * (onyx_chunklet::types::CHUNKLET_SIZE - onyx_chunklet::types::CHUNKLET_HEADER_BYTES)
+    );
+
+    let ld = metrics.lds.iter().find(|ld| ld.ld_id == id).unwrap();
+    assert_eq!(ld.raid_level, RaidLevel::Raid5);
+    assert_eq!(
+        ld.capacity_bytes,
+        3 * onyx_chunklet::types::CHUNKLET_SIZE - 3 * 4096
+    );
+    assert_eq!(ld.member_count, 4);
+    assert_eq!(ld.unavailable_members, 0);
+
+    drop(pool);
+
+    let degraded_raws = paths
+        .iter()
+        .take(3)
+        .map(|path| RawDevice::open(path).unwrap())
+        .collect();
+    let degraded = Pool::open_with_missing(degraded_raws).unwrap();
+    let degraded_metrics = degraded.metrics().unwrap();
+    assert_eq!(degraded_metrics.pd_count, 4);
+    assert_eq!(degraded_metrics.healthy_pds, 3);
+    assert_eq!(degraded_metrics.failed_pds, 1);
+
+    let degraded_ld = degraded_metrics
+        .lds
+        .iter()
+        .find(|ld| ld.ld_id == id)
+        .unwrap();
+    assert_eq!(degraded_ld.failed_members, 1);
+    assert_eq!(degraded_ld.unavailable_members, 1);
+}
+
 // ---- Drain ----------------------------------------------------------------
 
 #[test]
@@ -168,8 +226,21 @@ fn drained_flag_persists_across_reopen() {
     // (We don't have a public flag accessor yet; check via PD's body.)
     let pd = pool2.pd(drain_target).unwrap();
     let (body, _, _) = pd.snapshot();
-    let entry = body.pd_list.iter().find(|e| e.pd_id == drain_target).unwrap();
+    let entry = body
+        .pd_list
+        .iter()
+        .find(|e| e.pd_id == drain_target)
+        .unwrap();
     assert!(entry.flags & onyx_chunklet::superblock::pool_pd_flags::DRAINED != 0);
+
+    let metrics = pool2.metrics().unwrap();
+    let drained = metrics
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == drain_target)
+        .unwrap();
+    assert_eq!(drained.state, PdOperationalState::Drained);
+    assert_eq!(metrics.drained_pds, 1);
 }
 
 #[test]
@@ -216,7 +287,10 @@ fn create_cpg_rejects_unsupported_ha_domain() {
     };
     let err = pool.create_cpg(spec).err().unwrap();
     assert!(format!("{}", err).contains("HaDomain") || format!("{}", err).contains("Numa"));
-    assert!(pool.list_cpgs().is_empty(), "CPG must not persist on rejection");
+    assert!(
+        pool.list_cpgs().is_empty(),
+        "CPG must not persist on rejection"
+    );
 }
 
 /// Regression: rebuild used to leave the OLD chunklet on a drained
