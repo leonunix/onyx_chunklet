@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 
 use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::ld::LogicalDisk;
@@ -95,6 +96,39 @@ fn raid10_round_trip_with_strip_alignment() {
     let mut readback = vec![0u8; payload.len()];
     ld.read_at(0, &mut readback).unwrap();
     assert_eq!(readback, payload);
+}
+
+#[test]
+fn mirror_concurrent_disjoint_strip_writes() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, &["pd0", "pd1", "pd2", "pd3"]);
+    let id = pool.create_ld(LdSpec::mirror(2, 2, 1, 0)).unwrap();
+    let strip = BLOCK_SIZE as usize;
+
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let ld = pool.open_ld(id).unwrap();
+            thread::spawn(move || {
+                let offset = (i * strip) as u64;
+                for round in 0..64 {
+                    let fill = (0x71 + i as u8).wrapping_add(round as u8);
+                    let payload = vec![fill; strip];
+                    ld.write_at(offset, &payload).unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let ld = pool.open_ld(id).unwrap();
+    for i in 0..8 {
+        let fill = (0x71 + i as u8).wrapping_add(63);
+        let mut readback = vec![0u8; strip];
+        ld.read_at((i * strip) as u64, &mut readback).unwrap();
+        assert!(readback.iter().all(|&b| b == fill), "strip {}", i);
+    }
 }
 
 #[test]

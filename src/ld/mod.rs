@@ -30,9 +30,13 @@ pub use raid6::LdRaid6;
 
 use std::sync::Arc;
 
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::pd::PhysicalDisk;
 use crate::types::{LdId, BLOCK_SIZE};
+
+const STRIPE_LOCK_BUCKETS: usize = 1024;
 
 // `StripWrite` and the cross-PD batched-write submission helper live in
 // `src/io/backend.rs` now (selectable between SyncBackend and
@@ -62,6 +66,47 @@ pub trait LogicalDisk: Send + Sync {
 
     /// Write exactly `buf.len()` bytes at `offset`. Same alignment rules.
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()>;
+}
+
+pub(crate) struct StripeLockTable {
+    buckets: Vec<RwLock<()>>,
+}
+
+impl StripeLockTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            buckets: (0..STRIPE_LOCK_BUCKETS).map(|_| RwLock::new(())).collect(),
+        }
+    }
+
+    pub(crate) fn write_key(&self, key: u64) -> RwLockWriteGuard<'_, ()> {
+        self.buckets[lock_bucket(key)].write()
+    }
+
+    pub(crate) fn read_key_range(&self, first: u64, last: u64) -> Vec<RwLockReadGuard<'_, ()>> {
+        let mut buckets: Vec<usize> = (first..=last).map(lock_bucket).collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        buckets
+            .into_iter()
+            .map(|bucket| self.buckets[bucket].read())
+            .collect()
+    }
+
+    pub(crate) fn write_key_range(&self, first: u64, last: u64) -> Vec<RwLockWriteGuard<'_, ()>> {
+        let mut buckets: Vec<usize> = (first..=last).map(lock_bucket).collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        buckets
+            .into_iter()
+            .map(|bucket| self.buckets[bucket].write())
+            .collect()
+    }
+}
+
+fn lock_bucket(key: u64) -> usize {
+    let mixed = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (key >> 32);
+    (mixed as usize) & (STRIPE_LOCK_BUCKETS - 1)
 }
 
 /// Convert the descriptor's strip-size encoding into bytes.

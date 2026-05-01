@@ -46,12 +46,11 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{
     compute_strip_bytes, parallel_strip_writes, resolve_members, LogicalDisk, StripWrite,
+    StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::types::{LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
@@ -68,9 +67,9 @@ pub struct LdMirror {
     /// different sets don't all converge on the same copy of one set.
     /// Indexed as `row * row_size + set_in_row`.
     read_cursors: Vec<AtomicUsize>,
-    /// Conservative write serialization. This prevents overlapping mirror
-    /// writes from leaving copies with different write orders.
-    write_lock: Mutex<()>,
+    /// Per-stripe serialization. Overlapping mirror writes must not leave
+    /// copies with different write orders, but unrelated stripes can proceed.
+    stripe_locks: StripeLockTable,
 }
 
 impl LdMirror {
@@ -118,7 +117,7 @@ impl LdMirror {
             capacity,
             strip_bytes,
             read_cursors,
-            write_lock: Mutex::new(()),
+            stripe_locks: StripeLockTable::new(),
         })
     }
 
@@ -198,6 +197,12 @@ impl LdMirror {
         let k = self.desc.row_size as usize;
         let base = (row * k + set) * n;
         base..base + n
+    }
+
+    fn stripe_key(&self, row: usize, set: usize, in_chunklet_off: u64) -> u64 {
+        let row_size = self.desc.row_size as u64;
+        let strip_in_chunklet = in_chunklet_off / self.strip_bytes;
+        ((row as u64 * row_size + set as u64) << 32) | strip_in_chunklet
     }
 
     pub fn strip_bytes(&self) -> u64 {
@@ -282,8 +287,10 @@ impl LogicalDisk for LdMirror {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
-        let _write_guard = self.write_lock.lock();
         self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
+            let _stripe = self
+                .stripe_locks
+                .write_key(self.stripe_key(row, set, off_in_c));
             // Build a parallel fan-out across every live copy. Failed
             // copies (PD missing or chunklet Bad) are skipped — caller has
             // already errored on a fully-dead set during open.

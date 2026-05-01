@@ -72,13 +72,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256::xor_into;
 use crate::ld::{
     compute_strip_bytes, parallel_strip_writes, resolve_members, LogicalDisk, StripWrite,
+    StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::types::{
@@ -96,9 +95,9 @@ pub struct LdRaid5 {
     data_per_set: usize,
     /// K * strip_bytes; the per-set full-stripe size.
     full_stripe_bytes: u64,
-    /// Conservative write serialization. RAID RMW/RW updates parity based on
-    /// old stripe state, so concurrent writes to one LD must not interleave.
-    write_lock: Mutex<()>,
+    /// Per-full-stripe serialization. RMW/RW updates parity from old stripe
+    /// state, so overlapping writes to one stripe must not interleave.
+    stripe_locks: StripeLockTable,
 }
 
 impl LdRaid5 {
@@ -173,7 +172,7 @@ impl LdRaid5 {
             strip_bytes,
             data_per_set,
             full_stripe_bytes,
-            write_lock: Mutex::new(()),
+            stripe_locks: StripeLockTable::new(),
         })
     }
 
@@ -230,6 +229,10 @@ impl LdRaid5 {
 
     fn member_idx_parity(&self, set_idx: usize) -> usize {
         set_idx * (self.desc.set_size as usize) + self.data_per_set
+    }
+
+    fn stripe_key(&self, set_idx: usize, strip_base: u64) -> u64 {
+        ((set_idx as u64) << 32) | (strip_base / self.strip_bytes)
     }
 
     fn member_pd(&self, idx: usize) -> ChunkletResult<&Arc<PhysicalDisk>> {
@@ -436,7 +439,6 @@ impl LogicalDisk for LdRaid5 {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
-        let _write_guard = self.write_lock.lock();
         // Group the IO into per-(set, set_stripe_n) units, then for each
         // unit pick the full-stripe fast path or partial RMW.
         let mut remaining = buf.len();
@@ -502,6 +504,9 @@ impl LdRaid5 {
         // `start.in_chunklet_off` (which embeds `start.in_strip_off`) directly
         // — that only matches pos[0] and corrupts pos[1+] / parity.
         let strip_base = start.in_chunklet_off - start.in_strip_off;
+        let _stripe = self
+            .stripe_locks
+            .write_key(self.stripe_key(start.set_idx, strip_base));
 
         // Full-stripe = every data position covered, each spans the entire strip.
         let is_full_stripe = positions.len() == k

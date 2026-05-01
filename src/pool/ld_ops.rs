@@ -36,6 +36,12 @@ impl RuntimeLogicalDisk {
             opened_epoch,
         }
     }
+
+    fn range_keys(&self, offset: u64, len: usize) -> (u64, u64) {
+        let unit = std::cmp::max(self.strip_size() as u64, self.block_size() as u64);
+        let end = offset.saturating_add(len as u64).saturating_sub(1);
+        (offset / unit, end / unit)
+    }
 }
 
 impl LogicalDisk for RuntimeLogicalDisk {
@@ -57,14 +63,18 @@ impl LogicalDisk for RuntimeLogicalDisk {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
         self.runtime.check_open(self.id(), self.opened_epoch)?;
-        let _guard = self.runtime.io_lock.read();
+        let _lifecycle = self.runtime.io_lock.read();
+        let (first, last) = self.range_keys(offset, buf.len());
+        let _range = self.runtime.range_locks.read_key_range(first, last);
         self.runtime.check_open(self.id(), self.opened_epoch)?;
         self.inner.read_at(offset, buf)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.runtime.check_open(self.id(), self.opened_epoch)?;
-        let _guard = self.runtime.io_lock.write();
+        let _lifecycle = self.runtime.io_lock.read();
+        let (first, last) = self.range_keys(offset, buf.len());
+        let _range = self.runtime.range_locks.write_key_range(first, last);
         self.runtime.check_open(self.id(), self.opened_epoch)?;
         self.inner.write_at(offset, buf)
     }

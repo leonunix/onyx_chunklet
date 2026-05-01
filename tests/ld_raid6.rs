@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 
 use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::ld::raid6::LdRaid6;
@@ -69,6 +70,39 @@ fn raid6_full_stripe_round_trip() {
     let mut readback = vec![0u8; payload.len()];
     ld.read_at(0, &mut readback).unwrap();
     assert_eq!(readback, payload);
+}
+
+#[test]
+fn raid6_concurrent_disjoint_full_stripe_writes() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+    let stripe = 3 * BLOCK_SIZE as usize;
+
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let ld = pool.open_ld(id).unwrap();
+            thread::spawn(move || {
+                let offset = (i * stripe) as u64;
+                for round in 0..64 {
+                    let fill = (0x51 + i as u8).wrapping_add(round as u8);
+                    let payload = vec![fill; stripe];
+                    ld.write_at(offset, &payload).unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let ld = pool.open_ld(id).unwrap();
+    for i in 0..4 {
+        let fill = (0x51 + i as u8).wrapping_add(63);
+        let mut readback = vec![0u8; stripe];
+        ld.read_at((i * stripe) as u64, &mut readback).unwrap();
+        assert!(readback.iter().all(|&b| b == fill), "stripe {}", i);
+    }
 }
 
 #[test]

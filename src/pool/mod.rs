@@ -44,6 +44,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::RawDevice;
 use crate::ld::descriptor::LdList;
+use crate::ld::StripeLockTable;
 use crate::pd::{PdInfo, PhysicalDisk};
 use crate::superblock::PoolPdEntry;
 use crate::types::{LdId, PdId, PoolId};
@@ -100,6 +101,7 @@ pub(crate) struct PoolState {
 
 pub(crate) struct LdRuntime {
     pub io_lock: RwLock<()>,
+    pub range_locks: StripeLockTable,
     epoch: AtomicU64,
     dropped: AtomicBool,
 }
@@ -108,6 +110,7 @@ impl LdRuntime {
     pub fn new() -> Self {
         Self {
             io_lock: RwLock::new(()),
+            range_locks: StripeLockTable::new(),
             epoch: AtomicU64::new(0),
             dropped: AtomicBool::new(false),
         }
