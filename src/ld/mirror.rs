@@ -61,8 +61,11 @@ pub struct LdMirror {
     members: Vec<Option<Arc<PhysicalDisk>>>,
     capacity: u64,
     strip_bytes: u64,
-    /// Round-robin cursor for read-side copy selection.
-    read_cursor: AtomicUsize,
+    /// Per-set round-robin cursor for read-side copy selection. One
+    /// counter per (row, set) so concurrent readers spreading across
+    /// different sets don't all converge on the same copy of one set.
+    /// Indexed as `row * row_size + set_in_row`.
+    read_cursors: Vec<AtomicUsize>,
 }
 
 impl LdMirror {
@@ -103,12 +106,14 @@ impl LdMirror {
         let usable_per_chunklet = (CHUNKLET_USER_BYTES / strip_bytes) * strip_bytes;
         let members = resolve_members(pds, &desc)?;
         let capacity = (desc.row_size as u64) * (desc.num_rows as u64) * usable_per_chunklet;
+        let n_sets = (desc.row_size as usize) * (desc.num_rows as usize);
+        let read_cursors = (0..n_sets).map(|_| AtomicUsize::new(0)).collect();
         Ok(Self {
             desc,
             members,
             capacity,
             strip_bytes,
-            read_cursor: AtomicUsize::new(0),
+            read_cursors,
         })
     }
 
@@ -234,13 +239,18 @@ impl LogicalDisk for LdMirror {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
+        let row_size = self.desc.row_size as usize;
         self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
-            // Round-robin pick a live copy. If the chosen one is Failed,
-            // fall through to the next. If all N are Failed, the set is
-            // dead — return an error.
+            // Round-robin pick a live copy using THIS set's cursor (so
+            // concurrent reads on different sets don't share a counter
+            // and converge on the same copy). If the chosen copy is
+            // Failed, walk through the rest of the ring; all-N-Failed
+            // returns an error.
             let copies = self.member_indices_for(row, set);
             let n = copies.end - copies.start;
-            let start = self.read_cursor.fetch_add(1, Ordering::Relaxed) % n;
+            let cursor_idx = row * row_size + set;
+            let start =
+                self.read_cursors[cursor_idx].fetch_add(1, Ordering::Relaxed) % n;
             for offset_pick in 0..n {
                 let pick = (start + offset_pick) % n;
                 let member_idx = copies.start + pick;
