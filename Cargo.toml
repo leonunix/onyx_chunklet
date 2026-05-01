@@ -1,0 +1,39 @@
+[package]
+name = "onyx-chunklet"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "用户态 RAID/块编排引擎，借鉴 HPE 3PAR chunklet 抽象"
+
+[lib]
+name = "onyx_chunklet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chunkletctl"
+path = "src/bin/chunkletctl.rs"
+
+[dependencies]
+crc32c = "0.6"
+crossbeam-channel = "0.5"
+libc = "0.2"
+nix = { version = "0.29", features = ["mman"] }
+parking_lot = "0.12"
+rand = "0.8"
+thiserror = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
