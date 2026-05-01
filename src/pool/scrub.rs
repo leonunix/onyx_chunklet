@@ -54,8 +54,13 @@ pub struct ScrubMismatch {
 pub enum ScrubMismatchKind {
     /// Mirror copies disagree. `divergent_count` says how many copies don't
     /// match the most-frequent value at this offset.
-    MirrorDivergence { divergent_count: usize, total_copies: usize },
-    /// RAID-5 parity didn't equal XOR of data. Marked the parity chunklet Bad.
+    MirrorDivergence {
+        divergent_count: usize,
+        total_copies: usize,
+    },
+    /// RAID-5 parity didn't equal XOR of data. Ambiguous: either parity or one
+    /// data member may be corrupt, so scrub logs only and leaves quarantine to
+    /// an operator or a stronger checksum layer.
     Raid5ParityMismatch,
     /// RAID-6: P didn't match (Q did). Marked the P chunklet Bad.
     Raid6P,
@@ -154,7 +159,10 @@ impl Pool {
                     let m = &desc.members[base + pos];
                     if let Some(pd) = pds_snapshot.get(&m.pd) {
                         let mut buf = vec![0u8; take];
-                        if pd.read_chunklet_user(m.chunklet_index, off, &mut buf).is_ok() {
+                        if pd
+                            .read_chunklet_user(m.chunklet_index, off, &mut buf)
+                            .is_ok()
+                        {
                             copies.push(buf);
                             alive_idx.push(pos);
                         }
@@ -197,9 +205,9 @@ impl Pool {
                     batch_offset: off,
                     kind,
                 });
-                // For N >= 3, mark divergent copies Bad. For N = 2 we cannot
-                // tell which is right, so we log only.
-                if n >= 3 && copies.len() - divergent.len() >= 2 {
+                // Mark only when one byte pattern has a strict majority. A
+                // 2-vs-2 split in a 4-way mirror is ambiguous, just like N=2.
+                if max > copies.len() / 2 {
                     for &local_idx in &divergent {
                         let global_pos = alive_idx[local_idx];
                         let m = &desc.members[base + global_pos];
@@ -223,8 +231,6 @@ impl Pool {
         let k = ld.data_per_set();
         let n_sets = (desc.row_size as usize) * (desc.num_rows as usize);
         let batches = batches_per_chunklet();
-        let mut bad_marks: BTreeMap<PdId, BTreeSet<u32>> = BTreeMap::new();
-
         for set_idx in 0..n_sets {
             let base = set_idx * n;
             // Need parity + all data alive to do the comparison. If anything's
@@ -278,17 +284,14 @@ impl Pool {
                         batch_offset: off,
                         kind: ScrubMismatchKind::Raid5ParityMismatch,
                     });
-                    bad_marks
-                        .entry(parity_member.pd)
-                        .or_default()
-                        .insert(parity_member.chunklet_index);
-                    // Mark + skip remaining batches for this set; whole parity
-                    // chunklet will be rebuilt.
+                    // RAID-5 cannot identify the bad member from parity
+                    // mismatch alone. Skip the rest of this set after logging
+                    // the first mismatch, but do not mark anything Bad.
                     break;
                 }
             }
         }
-        report.marked_bad = self.commit_bad_marks(pds_snapshot, &bad_marks)?;
+        report.marked_bad = 0;
         Ok(())
     }
 
@@ -309,8 +312,7 @@ impl Pool {
             let base = set_idx * n;
             let p_member = &desc.members[base + k];
             let q_member = &desc.members[base + k + 1];
-            if pds_snapshot.get(&p_member.pd).is_none()
-                || pds_snapshot.get(&q_member.pd).is_none()
+            if pds_snapshot.get(&p_member.pd).is_none() || pds_snapshot.get(&q_member.pd).is_none()
             {
                 report.sets_skipped_degraded += 1;
                 continue;
@@ -409,9 +411,9 @@ impl Pool {
         let _commit = self.manifest_lock.lock();
         let mut total = 0;
         for (pd_id, idxs) in bad_marks {
-            let pd = pds_snapshot.get(pd_id).ok_or_else(|| {
-                ChunkletError::Invariant(format!("scrub: unknown PD {}", pd_id))
-            })?;
+            let pd = pds_snapshot
+                .get(pd_id)
+                .ok_or_else(|| ChunkletError::Invariant(format!("scrub: unknown PD {}", pd_id)))?;
             let idxs = idxs.clone();
             let count = idxs.len();
             pd.commit_manifest(move |_body, bitmap| {

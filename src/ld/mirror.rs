@@ -46,13 +46,13 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{parallel_strip_writes, resolve_members, LogicalDisk, StripWrite};
 use crate::pd::PhysicalDisk;
-use crate::types::{
-    LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
-};
+use crate::types::{LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
 
 const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
 
@@ -66,6 +66,9 @@ pub struct LdMirror {
     /// different sets don't all converge on the same copy of one set.
     /// Indexed as `row * row_size + set_in_row`.
     read_cursors: Vec<AtomicUsize>,
+    /// Conservative write serialization. This prevents overlapping mirror
+    /// writes from leaving copies with different write orders.
+    write_lock: Mutex<()>,
 }
 
 impl LdMirror {
@@ -85,9 +88,8 @@ impl LdMirror {
                 desc.set_size
             )));
         }
-        let expected = (desc.set_size as usize)
-            * (desc.row_size as usize)
-            * (desc.num_rows as usize);
+        let expected =
+            (desc.set_size as usize) * (desc.row_size as usize) * (desc.num_rows as usize);
         if desc.members.len() != expected {
             return Err(ChunkletError::Invariant(format!(
                 "Mirror member count {} != set_size*row_size*num_rows ({})",
@@ -114,6 +116,7 @@ impl LdMirror {
             capacity,
             strip_bytes,
             read_cursors,
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -129,9 +132,9 @@ impl LdMirror {
                 offset, len, bs
             )));
         }
-        let end = offset.checked_add(len as u64).ok_or_else(|| {
-            ChunkletError::Invariant("Mirror IO offset overflow".into())
-        })?;
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| ChunkletError::Invariant("Mirror IO offset overflow".into()))?;
         if end > self.capacity {
             return Err(ChunkletError::Invariant(format!(
                 "Mirror IO out of range: offset={} len={} capacity={}",
@@ -147,7 +150,12 @@ impl LdMirror {
     /// chunklet-relative IO per copy.
     fn for_each_segment<F>(&self, offset: u64, total_len: usize, mut op: F) -> ChunkletResult<()>
     where
-        F: FnMut(usize /* row */, usize /* set */, u64 /* in_chunklet_off */, std::ops::Range<usize>) -> ChunkletResult<()>,
+        F: FnMut(
+            usize, /* row */
+            usize, /* set */
+            u64,   /* in_chunklet_off */
+            std::ops::Range<usize>,
+        ) -> ChunkletResult<()>,
     {
         let usable_per_chunklet = (CHUNKLET_USER_BYTES / self.strip_bytes) * self.strip_bytes;
         let row_bytes = (self.desc.row_size as u64) * usable_per_chunklet;
@@ -170,7 +178,12 @@ impl LdMirror {
             let strip_remain = strip_bytes - in_strip_off;
             let take = std::cmp::min(remaining as u64, strip_remain) as usize;
 
-            op(row_n, set_in_row, in_chunklet_off, buf_start..buf_start + take)?;
+            op(
+                row_n,
+                set_in_row,
+                in_chunklet_off,
+                buf_start..buf_start + take,
+            )?;
             buf_start += take;
             cursor += take as u64;
             remaining -= take;
@@ -249,8 +262,7 @@ impl LogicalDisk for LdMirror {
             let copies = self.member_indices_for(row, set);
             let n = copies.end - copies.start;
             let cursor_idx = row * row_size + set;
-            let start =
-                self.read_cursors[cursor_idx].fetch_add(1, Ordering::Relaxed) % n;
+            let start = self.read_cursors[cursor_idx].fetch_add(1, Ordering::Relaxed) % n;
             for offset_pick in 0..n {
                 let pick = (start + offset_pick) % n;
                 let member_idx = copies.start + pick;
@@ -268,6 +280,7 @@ impl LogicalDisk for LdMirror {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
+        let _write_guard = self.write_lock.lock();
         self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
             // Build a parallel fan-out across every live copy. Failed
             // copies (PD missing or chunklet Bad) are skipped — caller has

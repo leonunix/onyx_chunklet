@@ -33,8 +33,8 @@ use crate::io::backend::make_backend;
 use crate::io::{AlignedBuf, IoBackend, IoBackendKind, RawDevice};
 use crate::superblock::{SuperblockBody, SuperblockSlot, SLOT_BYTES};
 use crate::types::{
-    BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_B_OFFSET, BITMAP_SLOT_BYTES, BLOCK_SIZE, CHUNKLET_HEADER_BYTES,
-    CHUNKLET_SIZE, MAX_CHUNKLETS_PER_PD, PD_RESERVED_BYTES, PdId, PoolId,
+    PdId, PoolId, BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_BYTES, BITMAP_SLOT_B_OFFSET, BLOCK_SIZE,
+    CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE, MAX_CHUNKLETS_PER_PD, PD_RESERVED_BYTES,
     SUPERBLOCK_SLOT_A_OFFSET, SUPERBLOCK_SLOT_B_OFFSET,
 };
 
@@ -272,21 +272,25 @@ impl PhysicalDisk {
         let new_bitmap_slot = 1 - s.active_bitmap_slot;
         let new_gen = s.manifest_gen + 1;
 
-        // Apply caller-supplied mutation in-place. Split the deref so the
-        // borrow checker sees `body` and `bitmap` as disjoint borrows.
-        let s_mut = &mut *s;
-        mutate(&mut s_mut.body, &mut s_mut.bitmap)?;
+        // Apply caller-supplied mutation to clones first. If any IO below
+        // fails, the in-memory state remains aligned with the active on-disk
+        // generation instead of reflecting an uncommitted future manifest.
+        let mut new_body = s.body.clone();
+        let mut new_bitmap = s.bitmap.clone();
+        mutate(&mut new_body, &mut new_bitmap)?;
 
         // Update body to reflect the new bitmap slot + crc.
-        s.body.bitmap_slot_id = new_bitmap_slot;
-        s.body.bitmap_crc32c = s.bitmap.crc32c();
+        new_body.bitmap_slot_id = new_bitmap_slot;
+        new_body.bitmap_crc32c = new_bitmap.crc32c();
 
         // Step 1: write the new bitmap to head + tail (inactive slot).
-        let bitmap_bytes = s.bitmap.encode();
+        let bitmap_bytes = new_bitmap.encode();
         let bitmap_offset = bitmap_slot_offset(new_bitmap_slot);
         let layout = slot_offsets(self.raw.size());
-        self.raw.write_at(&bitmap_bytes, layout.head_base + bitmap_offset)?;
-        self.raw.write_at(&bitmap_bytes, layout.tail_base + bitmap_offset)?;
+        self.raw
+            .write_at(&bitmap_bytes, layout.head_base + bitmap_offset)?;
+        self.raw
+            .write_at(&bitmap_bytes, layout.tail_base + bitmap_offset)?;
         self.raw.sync()?;
 
         // Step 2: encode + write the new superblock to head + tail.
@@ -294,7 +298,7 @@ impl PhysicalDisk {
             pool_id: s.pool_id,
             pd_id: s.pd_id,
             manifest_gen: new_gen,
-            body: s.body.clone(),
+            body: new_body.clone(),
         };
         let sb_bytes = slot.encode()?;
         let sb_offset = superblock_slot_offset(new_sb_slot);
@@ -303,6 +307,8 @@ impl PhysicalDisk {
         self.raw.sync()?;
 
         // Step 3: bump in-memory pointers. Only after both fsyncs succeed.
+        s.body = new_body;
+        s.bitmap = new_bitmap;
         s.manifest_gen = new_gen;
         s.active_sb_slot = new_sb_slot;
         s.active_bitmap_slot = new_bitmap_slot;
@@ -319,22 +325,14 @@ impl PhysicalDisk {
 
         let bitmap_bytes = s.bitmap.encode();
         // Both bitmap slots get the same content at init.
-        self.raw.write_at(
-            &bitmap_bytes,
-            layout.head_base + bitmap_slot_offset(0),
-        )?;
-        self.raw.write_at(
-            &bitmap_bytes,
-            layout.head_base + bitmap_slot_offset(1),
-        )?;
-        self.raw.write_at(
-            &bitmap_bytes,
-            layout.tail_base + bitmap_slot_offset(0),
-        )?;
-        self.raw.write_at(
-            &bitmap_bytes,
-            layout.tail_base + bitmap_slot_offset(1),
-        )?;
+        self.raw
+            .write_at(&bitmap_bytes, layout.head_base + bitmap_slot_offset(0))?;
+        self.raw
+            .write_at(&bitmap_bytes, layout.head_base + bitmap_slot_offset(1))?;
+        self.raw
+            .write_at(&bitmap_bytes, layout.tail_base + bitmap_slot_offset(0))?;
+        self.raw
+            .write_at(&bitmap_bytes, layout.tail_base + bitmap_slot_offset(1))?;
         self.raw.sync()?;
 
         let slot = SuperblockSlot {
@@ -437,7 +435,10 @@ impl PhysicalDisk {
             )));
         }
         let user_capacity = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
-        if offset.checked_add(len).map_or(true, |end| end > user_capacity) {
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > user_capacity)
+        {
             return Err(ChunkletError::Invariant(format!(
                 "user IO out of chunklet bounds: offset={} len={} cap={}",
                 offset, len, user_capacity
@@ -535,7 +536,10 @@ fn read_bitmap(raw: &RawDevice, body: &SuperblockBody) -> ChunkletResult<Bitmap>
     // Try head first, then tail.
     for &base in &[layout.head_base, layout.tail_base] {
         let mut buf = AlignedBuf::new(BITMAP_SLOT_BYTES as usize)?;
-        if raw.read_at(buf.as_mut_slice(), base + bitmap_offset).is_err() {
+        if raw
+            .read_at(buf.as_mut_slice(), base + bitmap_offset)
+            .is_err()
+        {
             continue;
         }
         let computed = crc32c::crc32c(buf.as_slice());

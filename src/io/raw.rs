@@ -81,14 +81,17 @@ impl RawDevice {
         // Block device: ask the kernel for capacity via BLKGETSIZE64.
         let mut size: u64 = 0;
         // SAFETY: BLKGETSIZE64 takes *mut u64 and our fd is valid.
-        let ret = unsafe { libc::ioctl(file.as_raw_fd(), 0x8008_1272 /* BLKGETSIZE64 */, &mut size) };
+        let ret = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                0x8008_1272, /* BLKGETSIZE64 */
+                &mut size,
+            )
+        };
         if ret != 0 {
             return Err(ChunkletError::Device {
                 path: path.to_path_buf(),
-                reason: format!(
-                    "BLKGETSIZE64 failed: {}",
-                    std::io::Error::last_os_error()
-                ),
+                reason: format!("BLKGETSIZE64 failed: {}", std::io::Error::last_os_error()),
             });
         }
         Ok(size)
@@ -107,22 +110,33 @@ impl RawDevice {
     }
 
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> ChunkletResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         self.bounds_check(offset, buf.len() as u64)?;
         if self.direct_io && self.unaligned(offset, buf.len(), buf.as_ptr() as usize) {
-            // Bounce through an aligned buffer.
-            let mut aligned = AlignedBuf::new(buf.len())?;
-            self.read_loop(aligned.as_mut_slice(), offset)?;
-            buf.copy_from_slice(&aligned.as_slice()[..buf.len()]);
+            let (aligned_offset, delta, aligned_len) = aligned_io_window(offset, buf.len() as u64)?;
+            self.bounds_check(aligned_offset, aligned_len as u64)?;
+            let mut aligned = AlignedBuf::new(aligned_len)?;
+            self.read_loop(aligned.as_mut_slice(), aligned_offset)?;
+            buf.copy_from_slice(&aligned.as_slice()[delta..delta + buf.len()]);
             return Ok(());
         }
         self.read_loop(buf, offset)
     }
 
     pub fn write_at(&self, buf: &[u8], offset: u64) -> ChunkletResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         self.bounds_check(offset, buf.len() as u64)?;
         if self.direct_io && self.unaligned(offset, buf.len(), buf.as_ptr() as usize) {
-            let aligned = AlignedBuf::from_slice(buf)?;
-            return self.write_loop(aligned.as_slice(), offset);
+            let (aligned_offset, delta, aligned_len) = aligned_io_window(offset, buf.len() as u64)?;
+            self.bounds_check(aligned_offset, aligned_len as u64)?;
+            let mut aligned = AlignedBuf::new(aligned_len)?;
+            self.read_loop(aligned.as_mut_slice(), aligned_offset)?;
+            aligned.as_mut_slice()[delta..delta + buf.len()].copy_from_slice(buf);
+            return self.write_loop(aligned.as_slice(), aligned_offset);
         }
         self.write_loop(buf, offset)
     }
@@ -137,10 +151,7 @@ impl RawDevice {
     fn read_loop(&self, buf: &mut [u8], offset: u64) -> ChunkletResult<()> {
         let mut done = 0;
         while done < buf.len() {
-            match self
-                .file
-                .read_at(&mut buf[done..], offset + done as u64)
-            {
+            match self.file.read_at(&mut buf[done..], offset + done as u64) {
                 Ok(0) => {
                     return Err(ChunkletError::Device {
                         path: self.path.clone(),
@@ -194,10 +205,12 @@ impl RawDevice {
     }
 
     fn bounds_check(&self, offset: u64, len: u64) -> ChunkletResult<()> {
-        let end = offset.checked_add(len).ok_or_else(|| ChunkletError::Device {
-            path: self.path.clone(),
-            reason: format!("offset overflow: offset={} len={}", offset, len),
-        })?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| ChunkletError::Device {
+                path: self.path.clone(),
+                reason: format!("offset overflow: offset={} len={}", offset, len),
+            })?;
         if end > self.size_bytes {
             return Err(ChunkletError::Device {
                 path: self.path.clone(),
@@ -214,6 +227,24 @@ impl RawDevice {
         let bs = BLOCK_SIZE as usize;
         offset % BLOCK_SIZE != 0 || len % bs != 0 || ptr_addr % bs != 0
     }
+}
+
+fn aligned_io_window(offset: u64, len: u64) -> ChunkletResult<(u64, usize, usize)> {
+    let bs = BLOCK_SIZE;
+    let aligned_offset = offset / bs * bs;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| ChunkletError::Io(std::io::Error::other("aligned IO offset overflow")))?;
+    let aligned_end = end
+        .checked_add(bs - 1)
+        .ok_or_else(|| ChunkletError::Io(std::io::Error::other("aligned IO end overflow")))?
+        / bs
+        * bs;
+    let aligned_len = usize::try_from(aligned_end - aligned_offset)
+        .map_err(|_| ChunkletError::Io(std::io::Error::other("aligned IO length overflow")))?;
+    let delta = usize::try_from(offset - aligned_offset)
+        .map_err(|_| ChunkletError::Io(std::io::Error::other("aligned IO delta overflow")))?;
+    Ok((aligned_offset, delta, aligned_len))
 }
 
 impl AsRawFd for RawDevice {

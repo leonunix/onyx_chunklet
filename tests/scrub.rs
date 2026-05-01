@@ -30,7 +30,14 @@ fn make_pool(dir: &TempDir, n: usize) -> (Arc<Pool>, Vec<PathBuf>) {
         raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
         paths.push(p);
     }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0, ..Default::default() }).unwrap();
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (pool, paths)
 }
 
@@ -76,17 +83,17 @@ fn raid5_scrub_detects_corrupt_parity() {
         report.mismatches[0].kind,
         ScrubMismatchKind::Raid5ParityMismatch
     ));
-    assert_eq!(report.marked_bad, 1);
+    assert_eq!(report.marked_bad, 0);
     let pd = pool.pd(parity_member.pd).unwrap();
     let (_, bitmap, _) = pd.snapshot();
     assert_eq!(
         bitmap.get(parity_member.chunklet_index).unwrap(),
-        ChunkletState::Bad
+        ChunkletState::Used
     );
 }
 
 #[test]
-fn raid5_scrub_then_rebuild_restores_parity() {
+fn raid5_scrub_reports_ambiguous_mismatch_without_rebuild() {
     let dir = TempDir::new().unwrap();
     let (pool, _) = make_pool(&dir, 5); // extra PD as rebuild target
     let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
@@ -98,18 +105,11 @@ fn raid5_scrub_then_rebuild_restores_parity() {
     let parity_member = desc.members[3];
     corrupt_chunklet_user_byte0(&pool, parity_member.pd, parity_member.chunklet_index);
     let scrub_report = pool.scrub_ld(id).unwrap();
-    assert_eq!(scrub_report.marked_bad, 1);
+    assert_eq!(scrub_report.mismatches.len(), 1);
+    assert_eq!(scrub_report.marked_bad, 0);
 
-    pool.rebuild_ld(id).unwrap();
     let new_desc = pool.find_ld(id).unwrap();
-    // Parity member should now point to a different (chunklet, pd) pair.
-    let new_parity = new_desc.members[3];
-    assert!(new_parity.pd != parity_member.pd
-        || new_parity.chunklet_index != parity_member.chunklet_index);
-
-    // After rebuild, scrub should be clean.
-    let scrub2 = pool.scrub_ld(id).unwrap();
-    assert!(scrub2.mismatches.is_empty(), "{:?}", scrub2.mismatches);
+    assert_eq!(new_desc.members[3], parity_member);
 }
 
 #[test]

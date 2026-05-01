@@ -191,9 +191,8 @@ impl Pool {
         let _commit = self.manifest_lock.lock();
 
         let pd_views = self.snapshot_free_views()?;
-        let total_members = (spec.set_size as usize)
-            * (spec.row_size as usize)
-            * (spec.num_rows as usize);
+        let total_members =
+            (spec.set_size as usize) * (spec.row_size as usize) * (spec.num_rows as usize);
         // Build per-set role pattern, then repeat for every set in the LD.
         let role_per_set: Vec<LdRole> = match spec.raid_level {
             RaidLevel::Plain | RaidLevel::Mirror | RaidLevel::Raid0 => {
@@ -275,13 +274,18 @@ impl Pool {
     /// Drop an LD: free all its chunklets and remove from the pool's LD list.
     pub fn drop_ld(&self, id: LdId) -> ChunkletResult<()> {
         let _commit = self.manifest_lock.lock();
-        let removed = {
-            let mut s = self.state.write();
-            s.ld_list.remove(id)
-        }
-        .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", id)))?;
+        let (removed, new_ld_bytes) = {
+            let s = self.state.read();
+            let removed = s
+                .ld_list
+                .find(id)
+                .cloned()
+                .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", id)))?;
+            let mut next = s.ld_list.clone();
+            next.remove(id);
+            (removed, next.encode()?)
+        };
 
-        let new_ld_bytes = self.state.read().ld_list.encode()?;
         let mut by_pd: BTreeMap<PdId, Vec<u32>> = BTreeMap::new();
         for m in &removed.members {
             by_pd.entry(m.pd).or_default().push(m.chunklet_index);
@@ -313,6 +317,7 @@ impl Pool {
                 Ok(())
             })?;
         }
+        self.state.write().ld_list.remove(id);
         Ok(())
     }
 

@@ -213,11 +213,7 @@ impl Pool {
             match &best_view {
                 Some((best_gen, _, _)) if *best_gen >= gen => {}
                 _ => {
-                    best_view = Some((
-                        gen,
-                        body.ld_list_bytes.clone(),
-                        body.cpg_list_bytes.clone(),
-                    ))
+                    best_view = Some((gen, body.ld_list_bytes.clone(), body.cpg_list_bytes.clone()))
                 }
             }
             pd_seq_to_id.insert(info.pd_seq_in_pool, info.pd_id);
@@ -243,9 +239,10 @@ impl Pool {
         }
 
         let (ld_list, cpg_list) = match best_view {
-            Some((_, ld_bytes, cpg_bytes)) => {
-                (LdList::decode(&ld_bytes)?, cpg::CpgList::decode(&cpg_bytes)?)
-            }
+            Some((_, ld_bytes, cpg_bytes)) => (
+                LdList::decode(&ld_bytes)?,
+                cpg::CpgList::decode(&cpg_bytes)?,
+            ),
             None => (LdList::default(), cpg::CpgList::default()),
         };
 
@@ -281,7 +278,9 @@ impl Pool {
     /// `PoolMismatch` (no quorum).
     pub fn open_with_missing(devices: Vec<RawDevice>) -> ChunkletResult<Arc<Self>> {
         if devices.is_empty() {
-            return Err(ChunkletError::Config("open_with_missing: no devices".into()));
+            return Err(ChunkletError::Config(
+                "open_with_missing: no devices".into(),
+            ));
         }
 
         let mut opened: Vec<Arc<PhysicalDisk>> = Vec::with_capacity(devices.len());
@@ -321,11 +320,7 @@ impl Pool {
                 _ => {}
             }
             if best_view.is_none() || gen > best_view_gen {
-                best_view = Some((
-                    gen,
-                    body.ld_list_bytes.clone(),
-                    body.cpg_list_bytes.clone(),
-                ));
+                best_view = Some((gen, body.ld_list_bytes.clone(), body.cpg_list_bytes.clone()));
                 best_view_gen = gen;
             }
             pds.insert(info.pd_id, pd);
@@ -359,9 +354,10 @@ impl Pool {
         }
 
         let (ld_list, cpg_list) = match best_view {
-            Some((_, ld_bytes, cpg_bytes)) => {
-                (LdList::decode(&ld_bytes)?, cpg::CpgList::decode(&cpg_bytes)?)
-            }
+            Some((_, ld_bytes, cpg_bytes)) => (
+                LdList::decode(&ld_bytes)?,
+                cpg::CpgList::decode(&cpg_bytes)?,
+            ),
             None => (LdList::default(), cpg::CpgList::default()),
         };
 
@@ -413,7 +409,11 @@ impl Pool {
             new_pd_list = (0..new_pd_seq)
                 .map(|seq| {
                     let id = s.pd_seq_to_id[&seq];
-                    PoolPdEntry { pd_id: id, pd_seq: seq, flags: 0 }
+                    PoolPdEntry {
+                        pd_id: id,
+                        pd_seq: seq,
+                        flags: 0,
+                    }
                 })
                 .chain(std::iter::once(PoolPdEntry {
                     pd_id: new_pd_id,
@@ -490,10 +490,7 @@ impl Pool {
 
     pub fn list_pds(&self) -> Vec<PdInfo> {
         let s = self.state.read();
-        s.pd_seq_to_id
-            .values()
-            .map(|id| s.pds[id].info())
-            .collect()
+        s.pd_seq_to_id.values().map(|id| s.pds[id].info()).collect()
     }
 
     pub fn pd(&self, id: PdId) -> Option<Arc<PhysicalDisk>> {
@@ -550,15 +547,24 @@ pub(crate) fn collect_free_indices_per_pd(
     pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
     include_spare: bool,
 ) -> ChunkletResult<BTreeMap<PdId, Vec<u32>>> {
+    use crate::superblock::pool_pd_flags;
     use crate::types::ChunkletState;
     let mut out = BTreeMap::new();
     for (pd_id, pd) in pds {
-        let (_, bitmap, _) = pd.snapshot();
+        let (body, bitmap, _) = pd.snapshot();
+        let is_drained = body
+            .pd_list
+            .iter()
+            .find(|entry| entry.pd_id == *pd_id)
+            .map(|entry| entry.flags & pool_pd_flags::DRAINED != 0)
+            .unwrap_or(false);
+        if is_drained {
+            continue;
+        }
         let mut indices = Vec::new();
         for i in 0..bitmap.len() {
             let st = bitmap.get(i)?;
-            let want = st == ChunkletState::Free
-                || (include_spare && st == ChunkletState::Spare);
+            let want = st == ChunkletState::Free || (include_spare && st == ChunkletState::Spare);
             if want {
                 indices.push(i);
             }
@@ -698,7 +704,11 @@ mod tests {
     fn create_then_open_round_trip() {
         let dir = TempDir::new().unwrap();
         let pool = Pool::create(
-            vec![sparse(&dir, "pd0"), sparse(&dir, "pd1"), sparse(&dir, "pd2")],
+            vec![
+                sparse(&dir, "pd0"),
+                sparse(&dir, "pd1"),
+                sparse(&dir, "pd2"),
+            ],
             PoolConfig::default(),
         )
         .unwrap();
@@ -776,7 +786,11 @@ mod tests {
     fn rejects_missing_pd_seq() {
         let dir = TempDir::new().unwrap();
         let pool = Pool::create(
-            vec![sparse(&dir, "pd0"), sparse(&dir, "pd1"), sparse(&dir, "pd2")],
+            vec![
+                sparse(&dir, "pd0"),
+                sparse(&dir, "pd1"),
+                sparse(&dir, "pd2"),
+            ],
             PoolConfig::default(),
         )
         .unwrap();

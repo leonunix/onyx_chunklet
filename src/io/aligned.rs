@@ -29,6 +29,7 @@ impl AlignedBuf {
     pub fn from_slice(src: &[u8]) -> ChunkletResult<Self> {
         let mut buf = Self::alloc(src.len(), /* zeroed */ false)?;
         buf.as_mut_slice()[..src.len()].copy_from_slice(src);
+        buf.as_mut_slice()[src.len()..].fill(0);
         Ok(buf)
     }
 

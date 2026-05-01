@@ -72,6 +72,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256::xor_into;
@@ -92,6 +94,9 @@ pub struct LdRaid5 {
     data_per_set: usize,
     /// K * strip_bytes; the per-set full-stripe size.
     full_stripe_bytes: u64,
+    /// Conservative write serialization. RAID RMW/RW updates parity based on
+    /// old stripe state, so concurrent writes to one LD must not interleave.
+    write_lock: Mutex<()>,
 }
 
 impl LdRaid5 {
@@ -111,9 +116,8 @@ impl LdRaid5 {
                 desc.set_size
             )));
         }
-        let expected = (desc.set_size as usize)
-            * (desc.row_size as usize)
-            * (desc.num_rows as usize);
+        let expected =
+            (desc.set_size as usize) * (desc.row_size as usize) * (desc.num_rows as usize);
         if desc.members.len() != expected {
             return Err(ChunkletError::Invariant(format!(
                 "Raid5 member count {} != expected {}",
@@ -139,14 +143,17 @@ impl LdRaid5 {
                 if desc.members[base + i].role != LdRole::Data {
                     return Err(ChunkletError::Invariant(format!(
                         "Raid5 set {} member {} is not Data role: {:?}",
-                        set_n, i, desc.members[base + i].role
+                        set_n,
+                        i,
+                        desc.members[base + i].role
                     )));
                 }
             }
             if desc.members[base + n - 1].role != LdRole::ParityP {
                 return Err(ChunkletError::Invariant(format!(
                     "Raid5 set {} last member is not ParityP: {:?}",
-                    set_n, desc.members[base + n - 1].role
+                    set_n,
+                    desc.members[base + n - 1].role
                 )));
             }
         }
@@ -164,6 +171,7 @@ impl LdRaid5 {
             strip_bytes,
             data_per_set,
             full_stripe_bytes,
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -179,9 +187,9 @@ impl LdRaid5 {
                 offset, len
             )));
         }
-        let end = offset.checked_add(len as u64).ok_or_else(|| {
-            ChunkletError::Invariant("Raid5 IO offset overflow".into())
-        })?;
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| ChunkletError::Invariant("Raid5 IO offset overflow".into()))?;
         if end > self.capacity {
             return Err(ChunkletError::Invariant(format!(
                 "Raid5 IO out of range: offset={} len={} capacity={}",
@@ -195,9 +203,8 @@ impl LdRaid5 {
     /// the data position within the stripe.
     fn locate(&self, ld_offset: u64) -> StripeAddr {
         let usable_per_chunklet = (CHUNKLET_USER_BYTES / self.strip_bytes) * self.strip_bytes;
-        let row_user = (self.desc.row_size as u64)
-            * (self.data_per_set as u64)
-            * usable_per_chunklet;
+        let row_user =
+            (self.desc.row_size as u64) * (self.data_per_set as u64) * usable_per_chunklet;
         let row_n = (ld_offset / row_user) as usize;
         let in_row = ld_offset % row_user;
         let global_fs_in_row = in_row / self.full_stripe_bytes;
@@ -427,6 +434,7 @@ impl LogicalDisk for LdRaid5 {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
+        let _write_guard = self.write_lock.lock();
         // Group the IO into per-(set, set_stripe_n) units, then for each
         // unit pick the full-stripe fast path or partial RMW.
         let mut remaining = buf.len();
@@ -438,10 +446,7 @@ impl LogicalDisk for LdRaid5 {
             let stripe_remain = self.full_stripe_bytes
                 - (addr.data_pos as u64 * self.strip_bytes + addr.in_strip_off);
             let take = std::cmp::min(remaining as u64, stripe_remain) as usize;
-            self.write_one_stripe_segment(
-                addr,
-                &buf[buf_start..buf_start + take],
-            )?;
+            self.write_one_stripe_segment(addr, &buf[buf_start..buf_start + take])?;
             buf_start += take;
             cursor += take as u64;
             remaining -= take;
@@ -456,11 +461,7 @@ impl LdRaid5 {
     ///
     /// The segment may cover anywhere from one byte of one data position up
     /// to the full stripe across all K data positions.
-    fn write_one_stripe_segment(
-        &self,
-        start: StripeAddr,
-        buf: &[u8],
-    ) -> ChunkletResult<()> {
+    fn write_one_stripe_segment(&self, start: StripeAddr, buf: &[u8]) -> ChunkletResult<()> {
         // Compute failure pattern once and reuse for the F-budget check
         // and the path dispatch below.
         let f_data = self.failed_data_positions(start.set_idx).len();
@@ -479,15 +480,13 @@ impl LdRaid5 {
         let k = self.data_per_set;
 
         // Decompose the segment into (data_pos, in_strip_off, len) chunks.
-        let mut positions: Vec<(usize, u64, std::ops::Range<usize>)> =
-            Vec::with_capacity(k);
+        let mut positions: Vec<(usize, u64, std::ops::Range<usize>)> = Vec::with_capacity(k);
         let mut consumed = 0usize;
         let mut cur_pos = start.data_pos;
         let mut cur_off = start.in_strip_off;
         while consumed < buf.len() {
             let strip_remain = strip - cur_off;
-            let take =
-                std::cmp::min((buf.len() - consumed) as u64, strip_remain) as usize;
+            let take = std::cmp::min((buf.len() - consumed) as u64, strip_remain) as usize;
             positions.push((cur_pos, cur_off, consumed..consumed + take));
             consumed += take;
             cur_pos += 1;
@@ -504,9 +503,9 @@ impl LdRaid5 {
 
         // Full-stripe = every data position covered, each spans the entire strip.
         let is_full_stripe = positions.len() == k
-            && positions.iter().all(|(_pos, off, range)| {
-                *off == 0 && (range.end - range.start) as u64 == strip
-            });
+            && positions
+                .iter()
+                .all(|(_pos, off, range)| *off == 0 && (range.end - range.start) as u64 == strip);
         if is_full_stripe {
             return self.write_full_stripe(start.set_idx, strip_base, &positions, buf);
         }
@@ -521,9 +520,9 @@ impl LdRaid5 {
             // RW only beats RMW when modifications are full-strip; sub-strip
             // modifications add gap-fill reads to RW that wipe out the win.
             let m = positions.len();
-            let all_full_strip = positions.iter().all(|(_p, off, range)| {
-                *off == 0 && (range.end - range.start) as u64 == strip
-            });
+            let all_full_strip = positions
+                .iter()
+                .all(|(_p, off, range)| *off == 0 && (range.end - range.start) as u64 == strip);
             if all_full_strip && (k - m) < (m + 1) {
                 self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
             } else {
@@ -703,38 +702,18 @@ impl LdRaid5 {
                         new_strips[pos].copy_from_slice(new_data);
                     } else {
                         if pd_failed {
-                            self.reconstruct_data(
-                                set_idx,
-                                pos,
-                                strip_base,
-                                &mut new_strips[pos],
-                            )?;
+                            self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
                         } else {
-                            self.read_data_strip(
-                                set_idx,
-                                pos,
-                                strip_base,
-                                &mut new_strips[pos],
-                            )?;
+                            self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos])?;
                         }
                         new_strips[pos][off..off + len].copy_from_slice(new_data);
                     }
                 }
                 None => {
                     if pd_failed {
-                        self.reconstruct_data(
-                            set_idx,
-                            pos,
-                            strip_base,
-                            &mut new_strips[pos],
-                        )?;
+                        self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
                     } else {
-                        self.read_data_strip(
-                            set_idx,
-                            pos,
-                            strip_base,
-                            &mut new_strips[pos],
-                        )?;
+                        self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos])?;
                     }
                 }
             }
@@ -758,9 +737,9 @@ impl LdRaid5 {
             }
         }
         let pm = self.member_idx_parity(set_idx);
-        let pd = self.members[pm]
-            .as_ref()
-            .expect("RW path called with parity failed; caller should have routed to write_data_only");
+        let pd = self.members[pm].as_ref().expect(
+            "RW path called with parity failed; caller should have routed to write_data_only",
+        );
         ops.push(StripWrite {
             pd: pd.clone(),
             chunklet_index: self.desc.members[pm].chunklet_index,

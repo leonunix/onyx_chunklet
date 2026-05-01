@@ -65,6 +65,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256;
@@ -83,6 +85,9 @@ pub struct LdRaid6 {
     strip_bytes: u64,
     data_per_set: usize,
     full_stripe_bytes: u64,
+    /// Conservative write serialization. RAID RMW/RW updates parity based on
+    /// old stripe state, so concurrent writes to one LD must not interleave.
+    write_lock: Mutex<()>,
 }
 
 impl LdRaid6 {
@@ -102,9 +107,8 @@ impl LdRaid6 {
                 desc.set_size
             )));
         }
-        let expected = (desc.set_size as usize)
-            * (desc.row_size as usize)
-            * (desc.num_rows as usize);
+        let expected =
+            (desc.set_size as usize) * (desc.row_size as usize) * (desc.num_rows as usize);
         if desc.members.len() != expected {
             return Err(ChunkletError::Invariant(format!(
                 "Raid6 member count {} != expected {}",
@@ -129,20 +133,24 @@ impl LdRaid6 {
                 if desc.members[base + i].role != LdRole::Data {
                     return Err(ChunkletError::Invariant(format!(
                         "Raid6 set {} member {} must be Data role: {:?}",
-                        set_n, i, desc.members[base + i].role
+                        set_n,
+                        i,
+                        desc.members[base + i].role
                     )));
                 }
             }
             if desc.members[base + n - 2].role != LdRole::ParityP {
                 return Err(ChunkletError::Invariant(format!(
                     "Raid6 set {} P slot is not ParityP: {:?}",
-                    set_n, desc.members[base + n - 2].role
+                    set_n,
+                    desc.members[base + n - 2].role
                 )));
             }
             if desc.members[base + n - 1].role != LdRole::ParityQ {
                 return Err(ChunkletError::Invariant(format!(
                     "Raid6 set {} Q slot is not ParityQ: {:?}",
-                    set_n, desc.members[base + n - 1].role
+                    set_n,
+                    desc.members[base + n - 1].role
                 )));
             }
         }
@@ -160,6 +168,7 @@ impl LdRaid6 {
             strip_bytes,
             data_per_set,
             full_stripe_bytes,
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -175,9 +184,9 @@ impl LdRaid6 {
                 offset, len
             )));
         }
-        let end = offset.checked_add(len as u64).ok_or_else(|| {
-            ChunkletError::Invariant("Raid6 IO offset overflow".into())
-        })?;
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| ChunkletError::Invariant("Raid6 IO offset overflow".into()))?;
         if end > self.capacity {
             return Err(ChunkletError::Invariant(format!(
                 "Raid6 IO out of range: offset={} len={} capacity={}",
@@ -189,9 +198,8 @@ impl LdRaid6 {
 
     fn locate(&self, ld_offset: u64) -> StripeAddr {
         let usable_per_chunklet = (CHUNKLET_USER_BYTES / self.strip_bytes) * self.strip_bytes;
-        let row_user = (self.desc.row_size as u64)
-            * (self.data_per_set as u64)
-            * usable_per_chunklet;
+        let row_user =
+            (self.desc.row_size as u64) * (self.data_per_set as u64) * usable_per_chunklet;
         let row_n = (ld_offset / row_user) as usize;
         let in_row = ld_offset % row_user;
         let global_fs_in_row = in_row / self.full_stripe_bytes;
@@ -521,7 +529,7 @@ impl LdRaid6 {
             dx[i] = gf256::mul(qbyte, denom_inv);
         }
         let mut dy = pd; // re-use
-        // dy currently = Pd; we want dy = D_x ⊕ Pd. So XOR dx into dy.
+                         // dy currently = Pd; we want dy = D_x ⊕ Pd. So XOR dx into dy.
         gf256::xor_into(&mut dy, &dx);
 
         Ok((dx, dy))
@@ -597,6 +605,7 @@ impl LogicalDisk for LdRaid6 {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
+        let _write_guard = self.write_lock.lock();
         let mut remaining = buf.len();
         let mut cursor = offset;
         let mut buf_start = 0usize;
@@ -615,11 +624,7 @@ impl LogicalDisk for LdRaid6 {
 }
 
 impl LdRaid6 {
-    fn write_one_stripe_segment(
-        &self,
-        start: StripeAddr,
-        buf: &[u8],
-    ) -> ChunkletResult<()> {
+    fn write_one_stripe_segment(&self, start: StripeAddr, buf: &[u8]) -> ChunkletResult<()> {
         // Compute failure pattern once and reuse for the F-budget check
         // and the path dispatch below.
         let f_data = self.failed_data_positions(start.set_idx).len();
@@ -655,9 +660,9 @@ impl LdRaid6 {
         let strip_base = start.in_chunklet_off - start.in_strip_off;
 
         let is_full_stripe = positions.len() == k
-            && positions.iter().all(|(_p, off, range)| {
-                *off == 0 && (range.end - range.start) as u64 == strip
-            });
+            && positions
+                .iter()
+                .all(|(_p, off, range)| *off == 0 && (range.end - range.start) as u64 == strip);
         if is_full_stripe {
             return self.write_full_stripe(start.set_idx, strip_base, &positions, buf);
         }
@@ -673,9 +678,9 @@ impl LdRaid6 {
             // modifications are full-strip; sub-strip mods make RW pay
             // for gap-fill reads that wipe out the win).
             let m = positions.len();
-            let all_full_strip = positions.iter().all(|(_p, off, range)| {
-                *off == 0 && (range.end - range.start) as u64 == strip
-            });
+            let all_full_strip = positions
+                .iter()
+                .all(|(_p, off, range)| *off == 0 && (range.end - range.start) as u64 == strip);
             if all_full_strip && (k - m) < (m + 2) {
                 self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
             } else {
@@ -887,12 +892,7 @@ impl LdRaid6 {
                                 &mut new_strips[pos],
                             )?;
                         } else {
-                            self.read_data_strip(
-                                set_idx,
-                                pos,
-                                strip_base,
-                                &mut new_strips[pos],
-                            )?;
+                            self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos])?;
                         }
                         new_strips[pos][off..off + len].copy_from_slice(new_data);
                     }
@@ -906,12 +906,7 @@ impl LdRaid6 {
                             &mut new_strips[pos],
                         )?;
                     } else {
-                        self.read_data_strip(
-                            set_idx,
-                            pos,
-                            strip_base,
-                            &mut new_strips[pos],
-                        )?;
+                        self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos])?;
                     }
                 }
             }
