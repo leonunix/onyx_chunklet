@@ -14,7 +14,7 @@ use crate::allocator::{plan_alloc, AllocRequest, PdFreeView};
 use crate::chunklet::ChunkletHeader;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
-use crate::ld::{LdMirror, LdPlain, LogicalDisk};
+use crate::ld::{LdMirror, LdPlain, LdRaid5, LogicalDisk};
 use crate::pd::PhysicalDisk;
 use crate::pool::Pool;
 use crate::types::{ChunkletState, HaDomain, LdId, LdRole, PdId, RaidLevel};
@@ -59,6 +59,22 @@ impl LdSpec {
             ha_domain: HaDomain::Pd,
         }
     }
+
+    /// RAID-5 spec. `data_per_set` = K (data chunklets per set; total set
+    /// size will be K + 1). `row_size` and `num_rows` control how many
+    /// independent RAID-5 sets are striped together / chained.
+    ///
+    /// `strip_size_log2 = 0` defaults the strip to one block (4 KiB).
+    pub fn raid5(data_per_set: u8, row_size: u16, num_rows: u16, strip_size_log2: u8) -> Self {
+        Self {
+            raid_level: RaidLevel::Raid5,
+            set_size: data_per_set + 1,
+            row_size,
+            num_rows,
+            strip_size_log2,
+            ha_domain: HaDomain::Pd,
+        }
+    }
 }
 
 impl Pool {
@@ -97,6 +113,19 @@ impl Pool {
                     ));
                 }
             }
+            RaidLevel::Raid5 => {
+                if spec.set_size < 3 {
+                    return Err(ChunkletError::Invariant(format!(
+                        "Raid5 LD requires set_size >= 3 (>= 2+1), got {}",
+                        spec.set_size
+                    )));
+                }
+                if spec.row_size == 0 || spec.num_rows == 0 {
+                    return Err(ChunkletError::Invariant(
+                        "Raid5 LD requires row_size >= 1 and num_rows >= 1".into(),
+                    ));
+                }
+            }
             other => {
                 return Err(ChunkletError::Unsupported(format!(
                     "raid_level {:?} not yet implemented",
@@ -111,8 +140,28 @@ impl Pool {
         let total_members = (spec.set_size as usize)
             * (spec.row_size as usize)
             * (spec.num_rows as usize);
-        // Mirror copies are all data role; Plain too. Parity roles arrive in P3+.
-        let role_assignments = vec![LdRole::Data; total_members];
+        // Build per-set role pattern, then repeat for every set in the LD.
+        let role_per_set: Vec<LdRole> = match spec.raid_level {
+            RaidLevel::Plain | RaidLevel::Mirror => {
+                vec![LdRole::Data; spec.set_size as usize]
+            }
+            RaidLevel::Raid5 => {
+                let mut v = vec![LdRole::Data; (spec.set_size - 1) as usize];
+                v.push(LdRole::ParityP);
+                v
+            }
+            RaidLevel::Raid6 => {
+                let mut v = vec![LdRole::Data; (spec.set_size - 2) as usize];
+                v.push(LdRole::ParityP);
+                v.push(LdRole::ParityQ);
+                v
+            }
+        };
+        let mut role_assignments = Vec::with_capacity(total_members);
+        for _ in 0..((spec.row_size as usize) * (spec.num_rows as usize)) {
+            role_assignments.extend_from_slice(&role_per_set);
+        }
+        debug_assert_eq!(role_assignments.len(), total_members);
         let req = AllocRequest {
             set_size: spec.set_size,
             row_size: spec.row_size,
@@ -153,6 +202,10 @@ impl Pool {
             RaidLevel::Mirror => {
                 let mirror = LdMirror::open(desc, &s.pds)?;
                 Ok(Arc::new(mirror))
+            }
+            RaidLevel::Raid5 => {
+                let raid5 = LdRaid5::open(desc, &s.pds)?;
+                Ok(Arc::new(raid5))
             }
             other => Err(ChunkletError::Unsupported(format!(
                 "raid_level {:?} not implemented yet",

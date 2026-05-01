@@ -16,10 +16,12 @@
 pub mod descriptor;
 pub mod mirror;
 pub mod plain;
+pub mod raid5;
 
 pub use descriptor::{LdDescriptor, LdList};
 pub use mirror::LdMirror;
 pub use plain::LdPlain;
+pub use raid5::LdRaid5;
 
 use std::sync::Arc;
 

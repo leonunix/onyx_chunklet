@@ -98,6 +98,20 @@ enum LdOp {
         #[arg(long)]
         chunklets: u16,
     },
+    /// Create a RAID-5 LD (data chunklets per set + 1 parity).
+    CreateRaid5 {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// Data chunklets per set (K). Set size will be K + 1.
+        #[arg(long)]
+        data_per_set: u8,
+        #[arg(long, default_value_t = 1)]
+        row_size: u16,
+        #[arg(long, default_value_t = 1)]
+        rows: u16,
+        #[arg(long, default_value_t = 0)]
+        strip_log2: u8,
+    },
     /// Create a Mirror LD (RAID-1 with copies=N, row=1; RAID-10 with row>1).
     CreateMirror {
         #[arg(long, required = true, value_delimiter = ',')]
@@ -215,6 +229,23 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             let pool = Pool::open(raws)?;
             let id = pool.create_ld(LdSpec::plain(chunklets))?;
             println!("created LD {} (Plain, {} chunklets)", id, chunklets);
+            print_ld_table(&pool);
+            Ok(())
+        }
+        LdOp::CreateRaid5 {
+            pool,
+            data_per_set,
+            row_size,
+            rows,
+            strip_log2,
+        } => {
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let id = pool.create_ld(LdSpec::raid5(data_per_set, row_size, rows, strip_log2))?;
+            println!(
+                "created LD {} (Raid5, K={} +1 parity, row_size={} rows={} strip_log2={})",
+                id, data_per_set, row_size, rows, strip_log2
+            );
             print_ld_table(&pool);
             Ok(())
         }
