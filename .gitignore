@@ -2,3 +2,6 @@
 Cargo.lock
 *.swp
 .DS_Store
+# soak test sparse files (created in cwd by chunklet-soak with relative paths)
+/pd*
+

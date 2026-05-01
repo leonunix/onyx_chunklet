@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "chunkletctl"
 path = "src/bin/chunkletctl.rs"
 
+[[bin]]
+name = "chunklet-soak"
+path = "src/bin/chunklet_soak.rs"
+
 [dependencies]
 crc32c = "0.6"
 crossbeam-channel = "0.5"
