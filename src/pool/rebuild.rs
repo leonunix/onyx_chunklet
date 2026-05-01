@@ -30,8 +30,8 @@ use crate::types::{
 /// (K+1) MiB per active rebuild.
 const REBUILD_BATCH_BYTES: u64 = 1024 * 1024;
 const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
-const REBUILD_BATCHES_PER_CHUNKLET: u64 = (CHUNKLET_USER_BYTES + REBUILD_BATCH_BYTES - 1)
-    / REBUILD_BATCH_BYTES;
+const REBUILD_BATCHES_PER_CHUNKLET: u64 =
+    (CHUNKLET_USER_BYTES + REBUILD_BATCH_BYTES - 1) / REBUILD_BATCH_BYTES;
 
 #[derive(Clone, Debug)]
 pub struct RebuildReport {
@@ -52,6 +52,14 @@ impl Pool {
     /// update — their on-disk state is unreachable until they come back.
     pub fn rebuild_ld(&self, ld_id: LdId) -> ChunkletResult<RebuildReport> {
         let _commit = self.manifest_lock.lock();
+        let runtime = self
+            .state
+            .read()
+            .ld_runtime
+            .get(&ld_id)
+            .cloned()
+            .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", ld_id)))?;
+        let _io = runtime.io_lock.write();
 
         let desc = self
             .find_ld(ld_id)
@@ -187,15 +195,8 @@ impl Pool {
                 // A crash mid-rebuild then leaves a header gen != descriptor
                 // gen, which forward_reconcile_bitmaps logs at next open.
                 let new_gen = old_member.generation.wrapping_add(1);
-                let target_pd = pick_replacement_pd(
-                    &working_free,
-                    &pds_snapshot,
-                    &used_pds,
-                )?;
-                let chunklet_idx = working_free
-                    .get_mut(&target_pd)
-                    .unwrap()
-                    .remove(0);
+                let target_pd = pick_replacement_pd(&working_free, &pds_snapshot, &used_pds)?;
+                let chunklet_idx = working_free.get_mut(&target_pd).unwrap().remove(0);
                 used_pds.push(target_pd);
                 new_alloc_by_pd
                     .entry(target_pd)
@@ -224,15 +225,22 @@ impl Pool {
         // new_desc carries the bumped per-member generation; helpers stamp
         // it into the chunklet header so a crash mid-rebuild is detectable.
         match desc.raid_level {
-            RaidLevel::Mirror => self.rebuild_mirror(&desc, &new_desc, &failed_per_set, &pds_snapshot)?,
-            RaidLevel::Raid5 => self.rebuild_raid5(&desc, &new_desc, &failed_per_set, &pds_snapshot)?,
-            RaidLevel::Raid6 => self.rebuild_raid6(&desc, &new_desc, &failed_per_set, &pds_snapshot)?,
+            RaidLevel::Mirror => {
+                self.rebuild_mirror(&desc, &new_desc, &failed_per_set, &pds_snapshot)?
+            }
+            RaidLevel::Raid5 => {
+                self.rebuild_raid5(&desc, &new_desc, &failed_per_set, &pds_snapshot)?
+            }
+            RaidLevel::Raid6 => {
+                self.rebuild_raid6(&desc, &new_desc, &failed_per_set, &pds_snapshot)?
+            }
             _ => unreachable!("validated earlier"),
         }
 
         // Commit: per-PD bitmap update (Used for new allocations + Free for
         // old chunklets being migrated off live PDs) + ld_list refresh.
         self.commit_rebuild(&new_desc, &new_alloc_by_pd, &freed_by_pd, &pds_snapshot)?;
+        runtime.bump();
 
         Ok(RebuildReport {
             ld_id,
@@ -270,20 +278,18 @@ impl Pool {
                 let target_pd = pds_snapshot.get(&target.pd).ok_or_else(|| {
                     ChunkletError::Invariant(format!("rebuild target PD {} missing", target.pd))
                 })?;
-                self.write_header(target_pd, target.chunklet_index, new_desc.id, role, target.generation)?;
+                self.write_header(
+                    target_pd,
+                    target.chunklet_index,
+                    new_desc.id,
+                    role,
+                    target.generation,
+                )?;
                 for batch_n in 0..REBUILD_BATCHES_PER_CHUNKLET {
                     let off = batch_n * REBUILD_BATCH_BYTES;
                     let take = batch_take(off);
-                    ld.reconstruct_member_strip(
-                        global_member_idx,
-                        off,
-                        &mut buf[..take],
-                    )?;
-                    target_pd.write_chunklet_user(
-                        target.chunklet_index,
-                        off,
-                        &buf[..take],
-                    )?;
+                    ld.reconstruct_member_strip(global_member_idx, off, &mut buf[..take])?;
+                    target_pd.write_chunklet_user(target.chunklet_index, off, &buf[..take])?;
                 }
                 target_pd.sync()?;
             }
@@ -309,20 +315,18 @@ impl Pool {
                 let target_pd = pds_snapshot.get(&target.pd).ok_or_else(|| {
                     ChunkletError::Invariant(format!("rebuild target PD {} missing", target.pd))
                 })?;
-                self.write_header(target_pd, target.chunklet_index, new_desc.id, role, target.generation)?;
+                self.write_header(
+                    target_pd,
+                    target.chunklet_index,
+                    new_desc.id,
+                    role,
+                    target.generation,
+                )?;
                 for batch_n in 0..REBUILD_BATCHES_PER_CHUNKLET {
                     let off = batch_n * REBUILD_BATCH_BYTES;
                     let take = batch_take(off);
-                    ld.reconstruct_member_strip(
-                        global_member_idx,
-                        off,
-                        &mut buf[..take],
-                    )?;
-                    target_pd.write_chunklet_user(
-                        target.chunklet_index,
-                        off,
-                        &buf[..take],
-                    )?;
+                    ld.reconstruct_member_strip(global_member_idx, off, &mut buf[..take])?;
+                    target_pd.write_chunklet_user(target.chunklet_index, off, &buf[..take])?;
                 }
                 target_pd.sync()?;
             }
@@ -348,20 +352,18 @@ impl Pool {
                 let target_pd = pds_snapshot.get(&target.pd).ok_or_else(|| {
                     ChunkletError::Invariant(format!("rebuild target PD {} missing", target.pd))
                 })?;
-                self.write_header(target_pd, target.chunklet_index, new_desc.id, role, target.generation)?;
+                self.write_header(
+                    target_pd,
+                    target.chunklet_index,
+                    new_desc.id,
+                    role,
+                    target.generation,
+                )?;
                 for batch_n in 0..REBUILD_BATCHES_PER_CHUNKLET {
                     let off = batch_n * REBUILD_BATCH_BYTES;
                     let take = batch_take(off);
-                    ld.reconstruct_member_strip(
-                        global_member_idx,
-                        off,
-                        &mut buf[..take],
-                    )?;
-                    target_pd.write_chunklet_user(
-                        target.chunklet_index,
-                        off,
-                        &buf[..take],
-                    )?;
+                    ld.reconstruct_member_strip(global_member_idx, off, &mut buf[..take])?;
+                    target_pd.write_chunklet_user(target.chunklet_index, off, &buf[..take])?;
                 }
                 target_pd.sync()?;
             }
@@ -398,12 +400,14 @@ impl Pool {
         freed_by_pd: &BTreeMap<PdId, Vec<u32>>,
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
     ) -> ChunkletResult<()> {
-        // Update in-memory ld_list first so the encoded bytes reflect the new
-        // placement.
+        // Encode the next descriptor without publishing it in memory until
+        // every live PD has committed. Existing handles keep seeing the old
+        // epoch while rebuild holds the LD runtime write lock.
         let new_ld_bytes = {
-            let mut s = self.state.write();
-            s.ld_list.upsert(new_desc.clone());
-            s.ld_list.encode()?
+            let s = self.state.read();
+            let mut next = s.ld_list.clone();
+            next.upsert(new_desc.clone());
+            next.encode()?
         };
 
         for (pd_id, pd) in pds_snapshot {
@@ -425,6 +429,7 @@ impl Pool {
                 Ok(())
             })?;
         }
+        self.state.write().ld_list.upsert(new_desc.clone());
         Ok(())
     }
 }
@@ -449,9 +454,7 @@ fn pick_replacement_pd(
         .max_by_key(|(pd, free)| (free.len(), std::cmp::Reverse(*pd)))
         .map(|(pd, _)| *pd)
         .ok_or_else(|| {
-            ChunkletError::Config(
-                "rebuild: no live PD with a free chunklet outside the set".into(),
-            )
+            ChunkletError::Config("rebuild: no live PD with a free chunklet outside the set".into())
         })?;
     Ok(chosen)
 }

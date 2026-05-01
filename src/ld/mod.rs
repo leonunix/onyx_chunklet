@@ -30,9 +30,9 @@ pub use raid6::LdRaid6;
 
 use std::sync::Arc;
 
-use crate::error::ChunkletResult;
+use crate::error::{ChunkletError, ChunkletResult};
 use crate::pd::PhysicalDisk;
-use crate::types::LdId;
+use crate::types::{LdId, BLOCK_SIZE};
 
 // `StripWrite` and the cross-PD batched-write submission helper live in
 // `src/io/backend.rs` now (selectable between SyncBackend and
@@ -62,6 +62,34 @@ pub trait LogicalDisk: Send + Sync {
 
     /// Write exactly `buf.len()` bytes at `offset`. Same alignment rules.
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()>;
+}
+
+/// Convert the descriptor's strip-size encoding into bytes.
+///
+/// `0` preserves the historical default of one 4 KiB block. Non-zero strip
+/// sizes must also be block-aligned and fit in a u64 shift. This keeps invalid
+/// admin input from turning into tiny stripes or shift overflows inside RAID
+/// mapping code.
+pub(crate) fn compute_strip_bytes(strip_size_log2: u8) -> ChunkletResult<u64> {
+    if strip_size_log2 == 0 {
+        return Ok(BLOCK_SIZE);
+    }
+    if !(12..63).contains(&strip_size_log2) {
+        return Err(ChunkletError::Invariant(format!(
+            "strip_size_log2 must be 0 or in 12..63, got {}",
+            strip_size_log2
+        )));
+    }
+    let strip = 1u64.checked_shl(strip_size_log2 as u32).ok_or_else(|| {
+        ChunkletError::Invariant(format!("invalid strip_size_log2 {}", strip_size_log2))
+    })?;
+    if strip % BLOCK_SIZE != 0 {
+        return Err(ChunkletError::Invariant(format!(
+            "strip size {} is not block-aligned to {}",
+            strip, BLOCK_SIZE
+        )));
+    }
+    Ok(strip)
 }
 
 /// Look up the `Arc<PhysicalDisk>` for each member listed in a descriptor,

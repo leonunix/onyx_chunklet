@@ -22,7 +22,14 @@ fn make_pool(dir: &TempDir, n_pds: usize) -> (Arc<Pool>, Vec<PathBuf>) {
         raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
         paths.push(p);
     }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0, ..Default::default() }).unwrap();
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (pool, paths)
 }
 
@@ -31,7 +38,9 @@ fn open_pool(paths: &[PathBuf]) -> Arc<Pool> {
     Pool::open(raws).unwrap()
 }
 
-fn pds_map(pool: &Arc<Pool>) -> std::collections::BTreeMap<onyx_chunklet::PdId, Arc<onyx_chunklet::PhysicalDisk>> {
+fn pds_map(
+    pool: &Arc<Pool>,
+) -> std::collections::BTreeMap<onyx_chunklet::PdId, Arc<onyx_chunklet::PhysicalDisk>> {
     let mut m = std::collections::BTreeMap::new();
     for info in pool.list_pds() {
         m.insert(info.pd_id, pool.pd(info.pd_id).unwrap());
@@ -45,9 +54,12 @@ fn raid6_full_stripe_round_trip() {
     let (pool, _) = make_pool(&dir, 5);
     let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
     let ld = pool.open_ld(id).unwrap();
-    let chunklet_user = onyx_chunklet::types::CHUNKLET_SIZE
-        - onyx_chunklet::types::CHUNKLET_HEADER_BYTES;
-    assert_eq!(ld.capacity_bytes(), 3 * (chunklet_user / BLOCK_SIZE) * BLOCK_SIZE);
+    let chunklet_user =
+        onyx_chunklet::types::CHUNKLET_SIZE - onyx_chunklet::types::CHUNKLET_HEADER_BYTES;
+    assert_eq!(
+        ld.capacity_bytes(),
+        3 * (chunklet_user / BLOCK_SIZE) * BLOCK_SIZE
+    );
     assert_eq!(ld.strip_size(), 3 * BLOCK_SIZE as usize);
 
     let payload: Vec<u8> = (0..(3 * 16 * BLOCK_SIZE as usize))
@@ -83,8 +95,10 @@ fn raid6_full_stripe_pq_match_anvin_formulas() {
     let q_pd = pool.pd(q_member.pd).unwrap();
     let mut p_buf = vec![0u8; strip];
     let mut q_buf = vec![0u8; strip];
-    p_pd.read_chunklet_user(p_member.chunklet_index, 0, &mut p_buf).unwrap();
-    q_pd.read_chunklet_user(q_member.chunklet_index, 0, &mut q_buf).unwrap();
+    p_pd.read_chunklet_user(p_member.chunklet_index, 0, &mut p_buf)
+        .unwrap();
+    q_pd.read_chunklet_user(q_member.chunklet_index, 0, &mut q_buf)
+        .unwrap();
 
     let expected_p = 0xa5u8 ^ 0x5a ^ 0xc3; // = 0x3c
     assert!(p_buf.iter().all(|&b| b == expected_p));
@@ -131,8 +145,10 @@ fn raid6_partial_rmw_preserves_other_data_and_parity() {
     let q_pd = pool.pd(q_member.pd).unwrap();
     let mut p_buf = vec![0u8; strip];
     let mut q_buf = vec![0u8; strip];
-    p_pd.read_chunklet_user(p_member.chunklet_index, 0, &mut p_buf).unwrap();
-    q_pd.read_chunklet_user(q_member.chunklet_index, 0, &mut q_buf).unwrap();
+    p_pd.read_chunklet_user(p_member.chunklet_index, 0, &mut p_buf)
+        .unwrap();
+    q_pd.read_chunklet_user(q_member.chunklet_index, 0, &mut q_buf)
+        .unwrap();
 
     let expected_p = 0x11u8 ^ 0x99 ^ 0x33;
     use onyx_chunklet::ld::gf256::{g_pow, mul};
@@ -216,13 +232,23 @@ fn raid6_drops_5_chunklets() {
     let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
     let mut total = 0u32;
     for info in pool.list_pds() {
-        total += pool.pd(info.pd_id).unwrap().snapshot().1.count(ChunkletState::Used);
+        total += pool
+            .pd(info.pd_id)
+            .unwrap()
+            .snapshot()
+            .1
+            .count(ChunkletState::Used);
     }
     assert_eq!(total, 5);
     pool.drop_ld(id).unwrap();
     let mut total2 = 0u32;
     for info in pool.list_pds() {
-        total2 += pool.pd(info.pd_id).unwrap().snapshot().1.count(ChunkletState::Used);
+        total2 += pool
+            .pd(info.pd_id)
+            .unwrap()
+            .snapshot()
+            .1
+            .count(ChunkletState::Used);
     }
     assert_eq!(total2, 0);
 }
@@ -235,6 +261,16 @@ fn raid6_rejects_when_too_few_pds() {
     let err = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).err().unwrap();
     let s = format!("{}", err);
     assert!(s.contains("distinct PDs") || s.contains("free"), "{}", s);
+}
+
+#[test]
+fn raid6_rejects_invalid_strip_size_log2() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    for bad in [1, 11, 63, 64] {
+        let err = pool.create_ld(LdSpec::raid6(3, 1, 1, bad)).err().unwrap();
+        assert!(format!("{}", err).contains("strip_size_log2"), "{}", err);
+    }
 }
 
 /// Regression for the partial-write offset bug: when `strip_size > BLOCK_SIZE`
@@ -276,7 +312,9 @@ fn raid6_partial_rmw_strip_gt_block_spans_positions() {
     // Verify P = XOR(D_i) and Q = sum(g^i * D_i) are correct.
     use onyx_chunklet::ld::gf256;
     let desc = pool.list_lds().into_iter().next().unwrap();
-    let pds: Vec<_> = (0..5).map(|i| pool.pd(desc.members[i].pd).unwrap()).collect();
+    let pds: Vec<_> = (0..5)
+        .map(|i| pool.pd(desc.members[i].pd).unwrap())
+        .collect();
     let mut data = vec![vec![0u8; strip]; 3];
     for i in 0..3 {
         pds[i]

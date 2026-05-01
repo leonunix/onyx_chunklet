@@ -28,7 +28,14 @@ fn make_pool(dir: &TempDir, n_pds: usize) -> (Arc<Pool>, Vec<PathBuf>) {
         raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
         paths.push(p);
     }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0, ..Default::default() }).unwrap();
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (pool, paths)
 }
 
@@ -45,8 +52,8 @@ fn raid5_full_stripe_round_trip() {
     let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
     let ld = pool.open_ld(id).unwrap();
     // Capacity = 3 * (1 GiB - 4 KiB).
-    let chunklet_user = onyx_chunklet::types::CHUNKLET_SIZE
-        - onyx_chunklet::types::CHUNKLET_HEADER_BYTES;
+    let chunklet_user =
+        onyx_chunklet::types::CHUNKLET_SIZE - onyx_chunklet::types::CHUNKLET_HEADER_BYTES;
     assert_eq!(ld.capacity_bytes(), 3 * chunklet_user);
     // Strip size = full stripe = 3 * 4 KiB.
     assert_eq!(ld.strip_size(), 3 * BLOCK_SIZE as usize);
@@ -75,7 +82,9 @@ fn raid5_parity_matches_data_xor() {
     let mut payload = vec![0u8; 3 * strip];
     payload[0..strip].iter_mut().for_each(|b| *b = 0xa5);
     payload[strip..2 * strip].iter_mut().for_each(|b| *b = 0x5a);
-    payload[2 * strip..3 * strip].iter_mut().for_each(|b| *b = 0xc3);
+    payload[2 * strip..3 * strip]
+        .iter_mut()
+        .for_each(|b| *b = 0xc3);
     ld.write_at(0, &payload).unwrap();
 
     // Read parity = D0 ^ D1 ^ D2 = 0xa5 ^ 0x5a ^ 0xc3 = 0x3c.
@@ -217,6 +226,16 @@ fn raid5_rejects_when_too_few_pds() {
 }
 
 #[test]
+fn raid5_rejects_invalid_strip_size_log2() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    for bad in [1, 11, 63, 64] {
+        let err = pool.create_ld(LdSpec::raid5(3, 1, 1, bad)).err().unwrap();
+        assert!(format!("{}", err).contains("strip_size_log2"), "{}", err);
+    }
+}
+
+#[test]
 fn raid5_unaligned_partial_within_strip() {
     // Subblock writes that span less than a full stripe + don't start at 0.
     let dir = TempDir::new().unwrap();
@@ -287,7 +306,9 @@ fn raid5_partial_rmw_strip_gt_block_spans_positions() {
     // Verify parity == XOR of all data strips (proves parity wasn't read or
     // written at the wrong chunklet offset).
     let desc = pool.list_lds().into_iter().next().unwrap();
-    let pds: Vec<_> = (0..4).map(|i| pool.pd(desc.members[i].pd).unwrap()).collect();
+    let pds: Vec<_> = (0..4)
+        .map(|i| pool.pd(desc.members[i].pd).unwrap())
+        .collect();
     let mut data = vec![vec![0u8; strip]; 3];
     for i in 0..3 {
         pds[i]
@@ -345,7 +366,9 @@ fn raid5_partial_rmw_starts_at_pos1_sub_strip() {
 
     // Parity must still equal XOR of all data strips.
     let desc = pool.list_lds().into_iter().next().unwrap();
-    let pds: Vec<_> = (0..4).map(|i| pool.pd(desc.members[i].pd).unwrap()).collect();
+    let pds: Vec<_> = (0..4)
+        .map(|i| pool.pd(desc.members[i].pd).unwrap())
+        .collect();
     let mut data = vec![vec![0u8; strip]; 3];
     for i in 0..3 {
         pds[i]

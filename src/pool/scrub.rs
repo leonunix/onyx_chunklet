@@ -88,6 +88,15 @@ impl Pool {
     /// this changes scrub from "blocks every other admin op for the full
     /// duration" to "blocks them only during the final bad-mark commit".
     pub fn scrub_ld(&self, ld_id: LdId) -> ChunkletResult<ScrubReport> {
+        let _commit = self.manifest_lock.lock();
+        let runtime = self
+            .state
+            .read()
+            .ld_runtime
+            .get(&ld_id)
+            .cloned()
+            .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", ld_id)))?;
+        let _io = runtime.io_lock.write();
         let desc = self
             .find_ld(ld_id)
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", ld_id)))?;
@@ -130,6 +139,9 @@ impl Pool {
             RaidLevel::Raid6 => {
                 self.scrub_raid6(&desc, &pds_snapshot, &mut report)?;
             }
+        }
+        if report.marked_bad > 0 {
+            runtime.bump();
         }
 
         Ok(report)
@@ -406,9 +418,6 @@ impl Pool {
         if bad_marks.is_empty() {
             return Ok(0);
         }
-        // Acquire manifest_lock only when there's actual mutation work to
-        // do; the long read-only scrub IO above ran without it.
-        let _commit = self.manifest_lock.lock();
         let mut total = 0;
         for (pd_id, idxs) in bad_marks {
             let pd = pds_snapshot

@@ -22,7 +22,14 @@ fn make_pool(dir: &TempDir, names: &[&str]) -> (Arc<Pool>, Vec<PathBuf>) {
         raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
         paths.push(p);
     }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0, ..Default::default() }).unwrap();
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (pool, paths)
 }
 
@@ -40,7 +47,9 @@ fn raid1_round_trip() {
     let ld = pool.open_ld(id).unwrap();
     assert_eq!(ld.capacity_bytes(), CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES);
 
-    let payload: Vec<u8> = (0..(64 << 10)).map(|i| ((i * 23 + 11) % 251) as u8).collect();
+    let payload: Vec<u8> = (0..(64 << 10))
+        .map(|i| ((i * 23 + 11) % 251) as u8)
+        .collect();
     ld.write_at(0, &payload).unwrap();
     let mut readback = vec![0u8; payload.len()];
     ld.read_at(0, &mut readback).unwrap();
@@ -58,7 +67,10 @@ fn raid1_marks_two_chunklets_used() {
         let (_, bitmap, _) = pd.snapshot();
         used_total += bitmap.count(ChunkletState::Used);
     }
-    assert_eq!(used_total, 2, "RAID-1 with 2 copies should consume 2 chunklets");
+    assert_eq!(
+        used_total, 2,
+        "RAID-1 with 2 copies should consume 2 chunklets"
+    );
 }
 
 #[test]
@@ -69,7 +81,10 @@ fn raid10_round_trip_with_strip_alignment() {
     let id = pool.create_ld(LdSpec::mirror(2, 2, 1, 0)).unwrap();
     let ld = pool.open_ld(id).unwrap();
     // Capacity = row_size * num_rows * chunklet_user_size = 2 * 1 * (1 GiB - 4 KiB).
-    assert_eq!(ld.capacity_bytes(), 2 * (CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES));
+    assert_eq!(
+        ld.capacity_bytes(),
+        2 * (CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES)
+    );
     assert_eq!(ld.strip_size(), BLOCK_SIZE as usize);
 
     // Write enough to span both stripes (8 blocks = 32 KiB).
@@ -93,7 +108,10 @@ fn raid10_uses_4_chunklets_total() {
         let (_, bitmap, _) = pd.snapshot();
         used_total += bitmap.count(ChunkletState::Used);
     }
-    assert_eq!(used_total, 4, "RAID-10 (mirror=2, row_size=2) should use 4 chunklets");
+    assert_eq!(
+        used_total, 4,
+        "RAID-10 (mirror=2, row_size=2) should use 4 chunklets"
+    );
 }
 
 #[test]
@@ -121,7 +139,11 @@ fn mirror_drop_frees_all_copies() {
     let dir = TempDir::new().unwrap();
     let (pool, _) = make_pool(&dir, &["pd0", "pd1", "pd2", "pd3"]);
     let id = pool.create_ld(LdSpec::mirror(2, 2, 1, 0)).unwrap();
+    let old_handle = pool.open_ld(id).unwrap();
     pool.drop_ld(id).unwrap();
+    let mut buf = vec![0u8; BLOCK_SIZE as usize];
+    let err = old_handle.read_at(0, &mut buf).err().unwrap();
+    assert!(format!("{}", err).contains("stale"), "{}", err);
     for info in pool.list_pds() {
         let pd = pool.pd(info.pd_id).unwrap();
         let (_, bitmap, _) = pd.snapshot();
@@ -151,7 +173,8 @@ fn raid1_serves_reads_after_one_copy_corrupted() {
     for m in &desc.members {
         let pd = pool.pd(m.pd).unwrap();
         let mut buf = vec![0u8; payload.len()];
-        pd.read_chunklet_user(m.chunklet_index, 0, &mut buf).unwrap();
+        pd.read_chunklet_user(m.chunklet_index, 0, &mut buf)
+            .unwrap();
         assert_eq!(buf, payload);
     }
 }
@@ -190,6 +213,7 @@ fn mark_chunklet_bad_persists_and_excludes_member_from_reads() {
     let (pool, paths) = make_pool(&dir, &["pd0", "pd1", "pd2"]);
     let id = pool.create_ld(LdSpec::mirror(3, 1, 1, 0)).unwrap();
     let ld = pool.open_ld(id).unwrap();
+    let old_handle = ld.clone();
     let payload: Vec<u8> = (0..(48 << 10)).map(|i| (i % 211) as u8).collect();
     ld.write_at(0, &payload).unwrap();
     drop(ld);
@@ -198,6 +222,9 @@ fn mark_chunklet_bad_persists_and_excludes_member_from_reads() {
     let desc = pool.list_lds().into_iter().next().unwrap();
     let bad = desc.members[0];
     pool.mark_chunklet_bad(bad.pd, bad.chunklet_index).unwrap();
+    let mut stale_read = vec![0u8; payload.len()];
+    let err = old_handle.read_at(0, &mut stale_read).err().unwrap();
+    assert!(format!("{}", err).contains("stale"), "{}", err);
     let pd = pool.pd(bad.pd).unwrap();
     let (_, bm, _) = pd.snapshot();
     assert_eq!(bm.get(bad.chunklet_index).unwrap(), ChunkletState::Bad);

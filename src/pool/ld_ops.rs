@@ -14,10 +14,61 @@ use crate::allocator::{plan_alloc, AllocRequest, PdFreeView};
 use crate::chunklet::ChunkletHeader;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
-use crate::ld::{LdMirror, LdPlain, LdRaid0, LdRaid5, LdRaid6, LogicalDisk};
+use crate::ld::{compute_strip_bytes, LdMirror, LdPlain, LdRaid0, LdRaid5, LdRaid6, LogicalDisk};
 use crate::pd::PhysicalDisk;
-use crate::pool::Pool;
-use crate::types::{ChunkletState, HaDomain, LdId, LdRole, PdId, RaidLevel};
+use crate::pool::{LdRuntime, Pool};
+use crate::types::{
+    ChunkletState, HaDomain, LdId, LdRole, PdId, RaidLevel, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
+};
+
+struct RuntimeLogicalDisk {
+    inner: Arc<dyn LogicalDisk>,
+    runtime: Arc<LdRuntime>,
+    opened_epoch: u64,
+}
+
+impl RuntimeLogicalDisk {
+    fn new(inner: Arc<dyn LogicalDisk>, runtime: Arc<LdRuntime>) -> Self {
+        let opened_epoch = runtime.snapshot_epoch();
+        Self {
+            inner,
+            runtime,
+            opened_epoch,
+        }
+    }
+}
+
+impl LogicalDisk for RuntimeLogicalDisk {
+    fn id(&self) -> LdId {
+        self.inner.id()
+    }
+
+    fn capacity_bytes(&self) -> u64 {
+        self.inner.capacity_bytes()
+    }
+
+    fn block_size(&self) -> usize {
+        self.inner.block_size()
+    }
+
+    fn strip_size(&self) -> usize {
+        self.inner.strip_size()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
+        self.runtime.check_open(self.id(), self.opened_epoch)?;
+        let _guard = self.runtime.io_lock.read();
+        self.runtime.check_open(self.id(), self.opened_epoch)?;
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
+        self.runtime.check_open(self.id(), self.opened_epoch)?;
+        let _guard = self.runtime.io_lock.write();
+        self.runtime.check_open(self.id(), self.opened_epoch)?;
+        self.inner.write_at(offset, buf)
+    }
+}
 
 /// Caller-supplied LD-creation spec.
 #[derive(Clone, Debug)]
@@ -187,6 +238,16 @@ impl Pool {
                 }
             }
         }
+        if !matches!(spec.raid_level, RaidLevel::Plain) {
+            let strip_bytes = compute_strip_bytes(spec.strip_size_log2)?;
+            let chunklet_user = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
+            if strip_bytes > chunklet_user {
+                return Err(ChunkletError::Invariant(format!(
+                    "strip_bytes {} > chunklet_user_size {}",
+                    strip_bytes, chunklet_user
+                )));
+            }
+        }
 
         let _commit = self.manifest_lock.lock();
 
@@ -247,33 +308,47 @@ impl Pool {
             .find(id)
             .cloned()
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", id)))?;
-        match desc.raid_level {
+        let runtime = s
+            .ld_runtime
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", id)))?;
+        let inner: Arc<dyn LogicalDisk> = match desc.raid_level {
             RaidLevel::Plain => {
                 let plain = LdPlain::open(desc, &s.pds)?;
-                Ok(Arc::new(plain))
+                Arc::new(plain)
             }
             RaidLevel::Mirror => {
                 let mirror = LdMirror::open(desc, &s.pds)?;
-                Ok(Arc::new(mirror))
+                Arc::new(mirror)
             }
             RaidLevel::Raid5 => {
                 let raid5 = LdRaid5::open(desc, &s.pds)?;
-                Ok(Arc::new(raid5))
+                Arc::new(raid5)
             }
             RaidLevel::Raid0 => {
                 let raid0 = LdRaid0::open(desc, &s.pds)?;
-                Ok(Arc::new(raid0))
+                Arc::new(raid0)
             }
             RaidLevel::Raid6 => {
                 let raid6 = LdRaid6::open(desc, &s.pds)?;
-                Ok(Arc::new(raid6))
+                Arc::new(raid6)
             }
-        }
+        };
+        Ok(Arc::new(RuntimeLogicalDisk::new(inner, runtime)))
     }
 
     /// Drop an LD: free all its chunklets and remove from the pool's LD list.
     pub fn drop_ld(&self, id: LdId) -> ChunkletResult<()> {
         let _commit = self.manifest_lock.lock();
+        let runtime = self
+            .state
+            .read()
+            .ld_runtime
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", id)))?;
+        let _io = runtime.io_lock.write();
         let (removed, new_ld_bytes) = {
             let s = self.state.read();
             let removed = s
@@ -317,7 +392,10 @@ impl Pool {
                 Ok(())
             })?;
         }
-        self.state.write().ld_list.remove(id);
+        runtime.mark_dropped();
+        let mut s = self.state.write();
+        s.ld_list.remove(id);
+        s.ld_runtime.remove(&id);
         Ok(())
     }
 
@@ -336,9 +414,10 @@ impl Pool {
     /// returns the error; on-disk repair is a P5+ tooling task.
     fn commit_new_ld(&self, desc: LdDescriptor) -> ChunkletResult<()> {
         let new_ld_bytes = {
-            let mut s = self.state.write();
-            s.ld_list.upsert(desc.clone());
-            s.ld_list.encode()?
+            let s = self.state.read();
+            let mut next = s.ld_list.clone();
+            next.upsert(desc.clone());
+            next.encode()?
         };
 
         let mut new_chunklets_by_pd: BTreeMap<PdId, Vec<(u32, LdRole)>> = BTreeMap::new();
@@ -354,14 +433,15 @@ impl Pool {
             self.do_per_pd_commits(&desc, &new_chunklets_by_pd, &pds_snapshot, &new_ld_bytes);
 
         if let Err(e) = commit_result {
-            let mut s = self.state.write();
-            s.ld_list.remove(desc.id);
             tracing::error!(
-                "create_ld failed mid-commit; in-memory rolled back, on-disk may be inconsistent: {}",
+                "create_ld failed mid-commit; in-memory was not published, on-disk may be inconsistent: {}",
                 e
             );
             return Err(e);
         }
+        let mut s = self.state.write();
+        s.ld_list.upsert(desc.clone());
+        s.ld_runtime.insert(desc.id, Arc::new(LdRuntime::new()));
         Ok(())
     }
 

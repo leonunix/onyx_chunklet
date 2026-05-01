@@ -86,47 +86,55 @@ impl Pool {
             }
         }
 
-        let mut affected = Vec::with_capacity(lds_with_members.len());
-        let mut members_migrated = 0;
-        for (ld_id, _) in &lds_with_members {
-            // rebuild_ld treats draining PDs as needs-rebuild sources (see
-            // pool/rebuild.rs `member_needs_rebuild`).
-            let report = self.rebuild_ld(*ld_id)?;
-            members_migrated += report.rebuilt_members;
-            affected.push(*ld_id);
-        }
+        let result = (|| {
+            let mut affected = Vec::with_capacity(lds_with_members.len());
+            let mut members_migrated = 0;
+            for (ld_id, _) in &lds_with_members {
+                // rebuild_ld treats draining PDs as needs-rebuild sources (see
+                // pool/rebuild.rs `member_needs_rebuild`).
+                let report = self.rebuild_ld(*ld_id)?;
+                members_migrated += report.rebuilt_members;
+                affected.push(*ld_id);
+            }
 
-        // After rebuild, the PD should have no Used chunklets that belong to
-        // any LD. Set DRAINED in pool_pd_list on every (other) PD's manifest.
-        self.persist_drained_flag(pd_id)?;
+            // After rebuild, the PD should have no Used chunklets that belong
+            // to any LD. Set DRAINED in pool_pd_list on every manifest.
+            self.persist_drained_flag(pd_id)?;
 
-        // Mark as Drained in pd_health (treat as Failed for future IO).
-        // We keep the PD's Arc<PhysicalDisk> in `pds` so any in-flight
-        // reference can finish, but logically it's gone.
-        {
-            let mut s = self.state.write();
-            s.draining.remove(&pd_id);
-            // Leave the PD in pds for now; admin can call remove_drained_pd
-            // (Phase 9+) to fully evict.
-        }
+            Ok(DrainReport {
+                pd_id,
+                lds_affected: affected,
+                members_migrated,
+            })
+        })();
 
-        Ok(DrainReport {
-            pd_id,
-            lds_affected: affected,
-            members_migrated,
-        })
+        self.state.write().draining.remove(&pd_id);
+        result
     }
 
     fn persist_drained_flag(&self, pd_id: PdId) -> ChunkletResult<()> {
         let _commit = self.manifest_lock.lock();
         let pds_snapshot = self.state.read().pds.clone();
-        // Build new pd_list with DRAINED flag set on the target.
+        // Build new pd_list with DRAINED flag set on the target while
+        // preserving any existing flags on the other PDs.
         let new_pd_list: Vec<crate::superblock::PoolPdEntry> = {
             let s = self.state.read();
+            let existing_flags = s
+                .pds
+                .values()
+                .next()
+                .map(|pd| {
+                    let (body, _, _) = pd.snapshot();
+                    body.pd_list
+                        .into_iter()
+                        .map(|entry| (entry.pd_id, entry.flags))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
             s.pd_seq_to_id
                 .values()
                 .map(|id| {
-                    let mut flags = 0u32;
+                    let mut flags = existing_flags.get(id).copied().unwrap_or(0);
                     if *id == pd_id {
                         flags |= pool_pd_flags::DRAINED;
                     }

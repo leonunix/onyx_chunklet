@@ -36,6 +36,7 @@ pub use scrub::{ScrubMismatch, ScrubMismatchKind, ScrubReport};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -45,7 +46,7 @@ use crate::io::RawDevice;
 use crate::ld::descriptor::LdList;
 use crate::pd::{PdInfo, PhysicalDisk};
 use crate::superblock::PoolPdEntry;
-use crate::types::{PdId, PoolId};
+use crate::types::{LdId, PdId, PoolId};
 
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -86,11 +87,69 @@ pub(crate) struct PoolState {
     pub draining: std::collections::BTreeSet<PdId>,
     /// Authoritative LD list, mirrored on every PD's manifest.
     pub ld_list: LdList,
+    /// Shared runtime gates for LD handles. Descriptors are persistent state;
+    /// runtimes are process-local guards that make all handles for one LD
+    /// share IO exclusion and stale-handle detection across rebuild/drop/scrub.
+    pub ld_runtime: BTreeMap<LdId, Arc<LdRuntime>>,
     /// Authoritative CPG list, mirrored on every PD's manifest.
     pub cpg_list: cpg::CpgList,
     /// Number of bitmap entries fixed by forward reconciliation during the
     /// open that produced this Pool. 0 on a clean open.
     pub last_reconciliation_count: usize,
+}
+
+pub(crate) struct LdRuntime {
+    pub io_lock: RwLock<()>,
+    epoch: AtomicU64,
+    dropped: AtomicBool,
+}
+
+impl LdRuntime {
+    pub fn new() -> Self {
+        Self {
+            io_lock: RwLock::new(()),
+            epoch: AtomicU64::new(0),
+            dropped: AtomicBool::new(false),
+        }
+    }
+
+    pub fn snapshot_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    pub fn bump(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn mark_dropped(&self) {
+        self.dropped.store(true, Ordering::Release);
+        self.bump();
+    }
+
+    pub fn check_open(&self, ld_id: LdId, opened_epoch: u64) -> ChunkletResult<()> {
+        if self.dropped.load(Ordering::Acquire) {
+            return Err(ChunkletError::Invariant(format!(
+                "LD {} handle is stale: LD was dropped",
+                ld_id
+            )));
+        }
+        let current = self.epoch.load(Ordering::Acquire);
+        if current != opened_epoch {
+            return Err(ChunkletError::Invariant(format!(
+                "LD {} handle is stale: runtime epoch advanced from {} to {}",
+                ld_id, opened_epoch, current
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn build_ld_runtime(ld_list: &LdList) -> BTreeMap<LdId, Arc<LdRuntime>> {
+    ld_list
+        .lds
+        .iter()
+        .map(|desc| (desc.id, Arc::new(LdRuntime::new())))
+        .collect()
 }
 
 /// Per-PD health enum. Phase 5 only distinguishes Healthy / Failed (PD-level).
@@ -152,6 +211,7 @@ impl Pool {
                 pd_seq_to_id,
                 draining: std::collections::BTreeSet::new(),
                 ld_list: LdList::default(),
+                ld_runtime: BTreeMap::new(),
                 cpg_list: cpg::CpgList::default(),
                 last_reconciliation_count: 0,
             }),
@@ -255,6 +315,7 @@ impl Pool {
                 pds,
                 pd_seq_to_id,
                 draining: std::collections::BTreeSet::new(),
+                ld_runtime: build_ld_runtime(&ld_list),
                 ld_list,
                 cpg_list,
                 last_reconciliation_count: reconciled,
@@ -370,6 +431,7 @@ impl Pool {
                 pd_seq_to_id,
                 pd_health,
                 draining: std::collections::BTreeSet::new(),
+                ld_runtime: build_ld_runtime(&ld_list),
                 ld_list,
                 cpg_list,
                 last_reconciliation_count: reconciled,
@@ -523,16 +585,42 @@ impl Pool {
     /// Out-of-range `chunklet_index` returns `Invariant`.
     pub fn mark_chunklet_bad(&self, pd_id: PdId, chunklet_index: u32) -> ChunkletResult<()> {
         let _commit = self.manifest_lock.lock();
-        let pd = self
-            .state
-            .read()
-            .pds
-            .get(&pd_id)
-            .cloned()
-            .ok_or_else(|| ChunkletError::Invariant(format!("PD {} not in pool", pd_id)))?;
+        let (pd, affected) = {
+            let s = self.state.read();
+            let pd = s
+                .pds
+                .get(&pd_id)
+                .cloned()
+                .ok_or_else(|| ChunkletError::Invariant(format!("PD {} not in pool", pd_id)))?;
+            let mut affected = s
+                .ld_list
+                .lds
+                .iter()
+                .filter(|desc| {
+                    desc.members
+                        .iter()
+                        .any(|m| m.pd == pd_id && m.chunklet_index == chunklet_index)
+                })
+                .filter_map(|desc| {
+                    s.ld_runtime
+                        .get(&desc.id)
+                        .cloned()
+                        .map(|runtime| (desc.id, runtime))
+                })
+                .collect::<Vec<_>>();
+            affected.sort_by_key(|(ld_id, _)| *ld_id);
+            (pd, affected)
+        };
+        let _io_guards = affected
+            .iter()
+            .map(|(_, runtime)| runtime.io_lock.write())
+            .collect::<Vec<_>>();
         pd.commit_manifest(move |_body, bitmap| {
             bitmap.set(chunklet_index, crate::types::ChunkletState::Bad)
         })?;
+        for (_, runtime) in &affected {
+            runtime.bump();
+        }
         Ok(())
     }
 }

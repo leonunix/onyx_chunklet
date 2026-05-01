@@ -36,11 +36,9 @@ use std::sync::Arc;
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
-use crate::ld::{resolve_members, LogicalDisk};
+use crate::ld::{compute_strip_bytes, resolve_members, LogicalDisk};
 use crate::pd::PhysicalDisk;
-use crate::types::{
-    LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
-};
+use crate::types::{LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
 
 const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
 
@@ -82,7 +80,7 @@ impl LdRaid0 {
                 expected
             )));
         }
-        let strip_bytes = compute_strip_bytes(desc.strip_size_log2);
+        let strip_bytes = compute_strip_bytes(desc.strip_size_log2)?;
         if strip_bytes > CHUNKLET_USER_BYTES {
             return Err(ChunkletError::Invariant(format!(
                 "strip_bytes {} > chunklet_user_size {}",
@@ -112,9 +110,9 @@ impl LdRaid0 {
                 offset, len
             )));
         }
-        let end = offset.checked_add(len as u64).ok_or_else(|| {
-            ChunkletError::Invariant("Raid0 IO offset overflow".into())
-        })?;
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| ChunkletError::Invariant("Raid0 IO offset overflow".into()))?;
         if end > self.capacity {
             return Err(ChunkletError::Invariant(format!(
                 "Raid0 IO out of range: offset={} len={} capacity={}",
@@ -126,7 +124,11 @@ impl LdRaid0 {
 
     fn for_each_segment<F>(&self, offset: u64, total_len: usize, mut op: F) -> ChunkletResult<()>
     where
-        F: FnMut(usize /* member_idx */, u64 /* in_chunklet_off */, std::ops::Range<usize>) -> ChunkletResult<()>,
+        F: FnMut(
+            usize, /* member_idx */
+            u64,   /* in_chunklet_off */
+            std::ops::Range<usize>,
+        ) -> ChunkletResult<()>,
     {
         let usable_per_chunklet = (CHUNKLET_USER_BYTES / self.strip_bytes) * self.strip_bytes;
         let row_bytes = (self.desc.row_size as u64) * usable_per_chunklet;
@@ -201,12 +203,4 @@ fn degraded_error(pd: &crate::types::PdId) -> ChunkletError {
         "Raid0 LD member on failed PD {} — Raid0 has no redundancy, IO impossible",
         pd
     ))
-}
-
-fn compute_strip_bytes(strip_size_log2: u8) -> u64 {
-    if strip_size_log2 == 0 {
-        BLOCK_SIZE
-    } else {
-        1u64 << strip_size_log2
-    }
 }

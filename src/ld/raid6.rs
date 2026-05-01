@@ -70,7 +70,9 @@ use parking_lot::Mutex;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256;
-use crate::ld::{parallel_strip_writes, resolve_members, LogicalDisk, StripWrite};
+use crate::ld::{
+    compute_strip_bytes, parallel_strip_writes, resolve_members, LogicalDisk, StripWrite,
+};
 use crate::pd::PhysicalDisk;
 use crate::types::{
     LdId, LdRole, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
@@ -116,7 +118,7 @@ impl LdRaid6 {
                 expected
             )));
         }
-        let strip_bytes = compute_strip_bytes(desc.strip_size_log2);
+        let strip_bytes = compute_strip_bytes(desc.strip_size_log2)?;
         if strip_bytes > CHUNKLET_USER_BYTES {
             return Err(ChunkletError::Invariant(format!(
                 "strip_bytes {} > chunklet_user_size {}",
@@ -950,13 +952,5 @@ impl LdRaid6 {
             });
         }
         parallel_strip_writes(ops)
-    }
-}
-
-fn compute_strip_bytes(strip_size_log2: u8) -> u64 {
-    if strip_size_log2 == 0 {
-        BLOCK_SIZE
-    } else {
-        1u64 << strip_size_log2
     }
 }

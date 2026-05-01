@@ -21,7 +21,14 @@ fn make_pool(dir: &TempDir, n_pds: usize) -> (Arc<Pool>, Vec<PathBuf>) {
         raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
         paths.push(p);
     }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0, ..Default::default() }).unwrap();
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (pool, paths)
 }
 
@@ -37,9 +44,14 @@ fn raid0_round_trip_2_chunklets() {
     // 2-chunklet stripe.
     let id = pool.create_ld(LdSpec::raid0(2, 1, 0)).unwrap();
     let ld = pool.open_ld(id).unwrap();
-    assert_eq!(ld.capacity_bytes(), 2 * (CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES));
+    assert_eq!(
+        ld.capacity_bytes(),
+        2 * (CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES)
+    );
 
-    let payload: Vec<u8> = (0..(64 << 10)).map(|i| ((i * 19 + 5) % 251) as u8).collect();
+    let payload: Vec<u8> = (0..(64 << 10))
+        .map(|i| ((i * 19 + 5) % 251) as u8)
+        .collect();
     ld.write_at(0, &payload).unwrap();
     let mut readback = vec![0u8; payload.len()];
     ld.read_at(0, &mut readback).unwrap();
@@ -71,7 +83,8 @@ fn raid0_stripe_actually_distributes_blocks() {
     for (i, m) in desc.members.iter().enumerate() {
         let pd = pool.pd(m.pd).unwrap();
         let mut buf = vec![0u8; strip];
-        pd.read_chunklet_user(m.chunklet_index, 0, &mut buf).unwrap();
+        pd.read_chunklet_user(m.chunklet_index, 0, &mut buf)
+            .unwrap();
         assert!(
             buf.iter().all(|&b| b == expected_patterns[i]),
             "member {}: expected all {:02x}, got first byte {:02x}",
@@ -137,4 +150,14 @@ fn raid0_strip_size_log2_works_for_larger_strips() {
     let mut readback = vec![0u8; payload.len()];
     ld.read_at(0, &mut readback).unwrap();
     assert_eq!(readback, payload);
+}
+
+#[test]
+fn raid0_rejects_invalid_strip_size_log2() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 2);
+    for bad in [1, 11, 63, 64] {
+        let err = pool.create_ld(LdSpec::raid0(2, 1, bad)).err().unwrap();
+        assert!(format!("{}", err).contains("strip_size_log2"), "{}", err);
+    }
 }
