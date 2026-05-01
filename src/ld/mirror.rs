@@ -90,14 +90,15 @@ impl LdMirror {
         }
 
         let strip_bytes = compute_strip_bytes(desc.strip_size_log2);
-        if CHUNKLET_USER_BYTES % strip_bytes != 0 {
+        if strip_bytes > CHUNKLET_USER_BYTES {
             return Err(ChunkletError::Invariant(format!(
-                "strip_bytes {} does not divide chunklet_user_size {}",
+                "strip_bytes {} > chunklet_user_size {}",
                 strip_bytes, CHUNKLET_USER_BYTES
             )));
         }
+        let usable_per_chunklet = (CHUNKLET_USER_BYTES / strip_bytes) * strip_bytes;
         let members = resolve_members(pds, &desc)?;
-        let capacity = (desc.row_size as u64) * (desc.num_rows as u64) * CHUNKLET_USER_BYTES;
+        let capacity = (desc.row_size as u64) * (desc.num_rows as u64) * usable_per_chunklet;
         Ok(Self {
             desc,
             members,
@@ -139,7 +140,8 @@ impl LdMirror {
     where
         F: FnMut(usize /* row */, usize /* set */, u64 /* in_chunklet_off */, std::ops::Range<usize>) -> ChunkletResult<()>,
     {
-        let row_bytes = (self.desc.row_size as u64) * CHUNKLET_USER_BYTES;
+        let usable_per_chunklet = (CHUNKLET_USER_BYTES / self.strip_bytes) * self.strip_bytes;
+        let row_bytes = (self.desc.row_size as u64) * usable_per_chunklet;
         let strip_bytes = self.strip_bytes;
         let row_size = self.desc.row_size as u64;
 

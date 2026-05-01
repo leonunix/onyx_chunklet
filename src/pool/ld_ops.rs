@@ -14,7 +14,7 @@ use crate::allocator::{plan_alloc, AllocRequest, PdFreeView};
 use crate::chunklet::ChunkletHeader;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
-use crate::ld::{LdMirror, LdPlain, LdRaid5, LogicalDisk};
+use crate::ld::{LdMirror, LdPlain, LdRaid0, LdRaid5, LogicalDisk};
 use crate::pd::PhysicalDisk;
 use crate::pool::Pool;
 use crate::types::{ChunkletState, HaDomain, LdId, LdRole, PdId, RaidLevel};
@@ -75,6 +75,20 @@ impl LdSpec {
             ha_domain: HaDomain::Pd,
         }
     }
+
+    /// RAID-0 spec. `stripe_width` = K chunklets striped per row; `num_rows`
+    /// chains additional rows for capacity. No redundancy. Strip default =
+    /// one 4 KiB block when `strip_size_log2 = 0`.
+    pub fn raid0(stripe_width: u16, num_rows: u16, strip_size_log2: u8) -> Self {
+        Self {
+            raid_level: RaidLevel::Raid0,
+            set_size: 1,
+            row_size: stripe_width,
+            num_rows,
+            strip_size_log2,
+            ha_domain: HaDomain::Pd,
+        }
+    }
 }
 
 impl Pool {
@@ -126,6 +140,25 @@ impl Pool {
                     ));
                 }
             }
+            RaidLevel::Raid0 => {
+                if spec.set_size != 1 {
+                    return Err(ChunkletError::Invariant(format!(
+                        "Raid0 LD requires set_size=1, got {}",
+                        spec.set_size
+                    )));
+                }
+                if spec.row_size < 2 {
+                    return Err(ChunkletError::Invariant(format!(
+                        "Raid0 LD requires row_size >= 2 (use Plain for unstriped), got {}",
+                        spec.row_size
+                    )));
+                }
+                if spec.num_rows == 0 {
+                    return Err(ChunkletError::Invariant(
+                        "Raid0 LD requires num_rows >= 1".into(),
+                    ));
+                }
+            }
             other => {
                 return Err(ChunkletError::Unsupported(format!(
                     "raid_level {:?} not yet implemented",
@@ -142,7 +175,7 @@ impl Pool {
             * (spec.num_rows as usize);
         // Build per-set role pattern, then repeat for every set in the LD.
         let role_per_set: Vec<LdRole> = match spec.raid_level {
-            RaidLevel::Plain | RaidLevel::Mirror => {
+            RaidLevel::Plain | RaidLevel::Mirror | RaidLevel::Raid0 => {
                 vec![LdRole::Data; spec.set_size as usize]
             }
             RaidLevel::Raid5 => {
@@ -206,6 +239,10 @@ impl Pool {
             RaidLevel::Raid5 => {
                 let raid5 = LdRaid5::open(desc, &s.pds)?;
                 Ok(Arc::new(raid5))
+            }
+            RaidLevel::Raid0 => {
+                let raid0 = LdRaid0::open(desc, &s.pds)?;
+                Ok(Arc::new(raid0))
             }
             other => Err(ChunkletError::Unsupported(format!(
                 "raid_level {:?} not implemented yet",

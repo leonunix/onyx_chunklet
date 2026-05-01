@@ -98,6 +98,18 @@ enum LdOp {
         #[arg(long)]
         chunklets: u16,
     },
+    /// Create a RAID-0 LD (striping, no redundancy).
+    CreateRaid0 {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// Stripe width (chunklets per row).
+        #[arg(long)]
+        stripe_width: u16,
+        #[arg(long, default_value_t = 1)]
+        rows: u16,
+        #[arg(long, default_value_t = 0)]
+        strip_log2: u8,
+    },
     /// Create a RAID-5 LD (data chunklets per set + 1 parity).
     CreateRaid5 {
         #[arg(long, required = true, value_delimiter = ',')]
@@ -229,6 +241,22 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             let pool = Pool::open(raws)?;
             let id = pool.create_ld(LdSpec::plain(chunklets))?;
             println!("created LD {} (Plain, {} chunklets)", id, chunklets);
+            print_ld_table(&pool);
+            Ok(())
+        }
+        LdOp::CreateRaid0 {
+            pool,
+            stripe_width,
+            rows,
+            strip_log2,
+        } => {
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let id = pool.create_ld(LdSpec::raid0(stripe_width, rows, strip_log2))?;
+            println!(
+                "created LD {} (Raid0, stripe_width={} rows={} strip_log2={})",
+                id, stripe_width, rows, strip_log2
+            );
             print_ld_table(&pool);
             Ok(())
         }

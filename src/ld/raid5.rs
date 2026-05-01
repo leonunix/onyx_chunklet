@@ -104,9 +104,9 @@ impl LdRaid5 {
             )));
         }
         let strip_bytes = compute_strip_bytes(desc.strip_size_log2);
-        if CHUNKLET_USER_BYTES % strip_bytes != 0 {
+        if strip_bytes > CHUNKLET_USER_BYTES {
             return Err(ChunkletError::Invariant(format!(
-                "strip_bytes {} does not divide chunklet_user_size {}",
+                "strip_bytes {} > chunklet_user_size {}",
                 strip_bytes, CHUNKLET_USER_BYTES
             )));
         }
@@ -134,10 +134,11 @@ impl LdRaid5 {
         }
 
         let members = resolve_members(pds, &desc)?;
+        let usable_per_chunklet = (CHUNKLET_USER_BYTES / strip_bytes) * strip_bytes;
         let capacity = (desc.row_size as u64)
             * (desc.num_rows as u64)
             * (data_per_set as u64)
-            * CHUNKLET_USER_BYTES;
+            * usable_per_chunklet;
         Ok(Self {
             desc,
             members,
@@ -175,9 +176,10 @@ impl LdRaid5 {
     /// Resolve an LD offset to its (set_index, in_chunklet_off) tuple plus
     /// the data position within the stripe.
     fn locate(&self, ld_offset: u64) -> StripeAddr {
+        let usable_per_chunklet = (CHUNKLET_USER_BYTES / self.strip_bytes) * self.strip_bytes;
         let row_user = (self.desc.row_size as u64)
             * (self.data_per_set as u64)
-            * CHUNKLET_USER_BYTES;
+            * usable_per_chunklet;
         let row_n = (ld_offset / row_user) as usize;
         let in_row = ld_offset % row_user;
         let global_fs_in_row = in_row / self.full_stripe_bytes;

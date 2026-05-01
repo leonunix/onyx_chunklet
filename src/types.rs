@@ -186,6 +186,10 @@ pub enum RaidLevel {
     Raid5 = 2,
     /// RAID-6: N data + P + Q (P4).
     Raid6 = 3,
+    /// RAID-0: striping, no redundancy (P3). Each row stripes across `row_size`
+    /// chunklets at `strip_size_log2` granularity. Distinct from Plain (which
+    /// is linear concat, single chunklet at a time).
+    Raid0 = 4,
 }
 
 impl RaidLevel {
@@ -195,6 +199,7 @@ impl RaidLevel {
             1 => Ok(Self::Mirror),
             2 => Ok(Self::Raid5),
             3 => Ok(Self::Raid6),
+            4 => Ok(Self::Raid0),
             other => Err(crate::ChunkletError::Format(format!(
                 "unknown RaidLevel byte: {}",
                 other
