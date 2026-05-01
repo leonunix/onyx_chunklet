@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod fault;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

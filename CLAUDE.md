@@ -212,8 +212,17 @@ RAID 容错的根。违反 = 一个 PD 失败可能干掉整个 set。每次 all
 
 - **sparse file backend**：`PhysicalDisk::open_file_for_test(path, size)`。Phase 0~5
   全程在 10 个 sparse file 上跑（10 × 80 GiB ≈ 800 GiB，单机 ext4 上够用）。
-- **fault injection**：`testing::fault::*`：partial write、IO error、torn write、
-  superblock crc 翻转、chunklet header gen 倒退。每条都有对应 ignored 测试。
+- **fault injection**：
+  - `tests/common/fault.rs::FaultInjectingBackend` — wraps an `IoBackend`, fails
+    writes targeting a specific PD after N successes. Pre-fault non-target ops
+    still go through, so partial-failure shape (K-1 of K copies durable) is
+    realistic. Install via `pd.set_backend(Arc::new(FaultInjectingBackend::new(...)))`.
+  - `tests/fault_injection.rs` houses the `#[ignore]` cases. Run with
+    `cargo test --release -- --ignored`. Currently covers: mirror torn-state
+    recovery via scrub, R5 full-stripe parity-write fault detected by scrub.
+  - Future fault types to layer on the same backend: torn write (partial bytes
+    written then fault), superblock CRC flip (already exercised via direct
+    `RawDevice::write_at`), chunklet header gen rollback.
 - **真盘验收**：Phase 6+ 上 nvme-box（10 块 NVMe），soak ≥ 7×24h，禁止用 Python
   harness 做性能判断。
 
