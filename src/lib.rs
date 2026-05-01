@@ -15,15 +15,21 @@
 //!
 //! 目前只覆盖 PD/Pool/superblock COW pair。Allocator / LD / CPG 在后续 phase。
 
+pub mod allocator;
 pub mod bitmap;
+pub mod chunklet;
 pub mod error;
 pub mod io;
+pub mod ld;
 pub mod pd;
 pub mod pool;
 pub mod superblock;
 pub mod types;
 
 pub use error::{ChunkletError, ChunkletResult};
+pub use ld::{LdDescriptor, LdList, LdPlain, LogicalDisk};
 pub use pd::PhysicalDisk;
 pub use pool::{Pool, PoolConfig};
-pub use types::{ChunkletId, CpgId, LdId, PdId, PoolId};
+pub use types::{
+    ChunkletId, CpgId, HaDomain, LdId, LdMember, LdRole, PdId, PoolId, RaidLevel,
+};

@@ -70,6 +70,10 @@ pub struct PdInfo {
 
 impl PhysicalDisk {
     /// Initialize a blank PD with a fresh manifest at `gen = 1`, slots A.
+    ///
+    /// `ld_list_bytes` is the encoded `LdList` that the new PD inherits from
+    /// the pool. Pool::create passes an empty list; Pool::admit passes the
+    /// current pool-wide LD list so the new PD's manifest stays consistent.
     pub fn init(
         raw: RawDevice,
         pool_id: PoolId,
@@ -78,6 +82,7 @@ impl PhysicalDisk {
         pool_pd_count: u32,
         pd_list: Vec<crate::superblock::PoolPdEntry>,
         spare_pct: u8,
+        ld_list_bytes: Vec<u8>,
     ) -> ChunkletResult<Arc<Self>> {
         let pd_size = raw.size();
         let total_chunklets = compute_total_chunklets(pd_size)?;
@@ -101,6 +106,7 @@ impl PhysicalDisk {
             spare_pct,
         );
         body.pd_list = pd_list;
+        body.ld_list_bytes = ld_list_bytes;
         body.bitmap_slot_id = 0;
         body.bitmap_crc32c = bitmap.crc32c();
 
@@ -340,6 +346,47 @@ impl PhysicalDisk {
         self.raw.write_at(buf, abs)
     }
 
+    /// Write the on-disk chunklet header (4 KiB). Caller must `sync()` after
+    /// any batch of header writes for durability.
+    pub fn write_chunklet_header(
+        &self,
+        chunklet_index: u32,
+        header_bytes: &[u8; CHUNKLET_HEADER_BYTES as usize],
+    ) -> ChunkletResult<()> {
+        let total = self.state.read().total_chunklets;
+        if chunklet_index >= total {
+            return Err(ChunkletError::Invariant(format!(
+                "chunklet index {} >= total {}",
+                chunklet_index, total
+            )));
+        }
+        let chunklet_base = PD_RESERVED_BYTES + (chunklet_index as u64) * CHUNKLET_SIZE;
+        self.raw.write_at(header_bytes, chunklet_base)
+    }
+
+    /// Read the raw chunklet header bytes (4 KiB).
+    pub fn read_chunklet_header_bytes(
+        &self,
+        chunklet_index: u32,
+    ) -> ChunkletResult<[u8; CHUNKLET_HEADER_BYTES as usize]> {
+        let total = self.state.read().total_chunklets;
+        if chunklet_index >= total {
+            return Err(ChunkletError::Invariant(format!(
+                "chunklet index {} >= total {}",
+                chunklet_index, total
+            )));
+        }
+        let chunklet_base = PD_RESERVED_BYTES + (chunklet_index as u64) * CHUNKLET_SIZE;
+        let mut buf = [0u8; CHUNKLET_HEADER_BYTES as usize];
+        // The chunklet header is exactly one 4 KiB block — aligned for O_DIRECT.
+        self.raw.read_at(&mut buf, chunklet_base)?;
+        Ok(buf)
+    }
+
+    pub fn sync(&self) -> ChunkletResult<()> {
+        self.raw.sync()
+    }
+
     fn chunklet_user_abs_offset(
         &self,
         chunklet_index: u32,
@@ -488,7 +535,7 @@ mod tests {
         let raw = sparse_pd(&dir, "pd0", TEST_PD_SIZE);
         let path = raw.path().to_path_buf();
 
-        let pd = PhysicalDisk::init(raw, pool_id, pd_id, 0, 1, vec![], 5).unwrap();
+        let pd = PhysicalDisk::init(raw, pool_id, pd_id, 0, 1, vec![], 5, vec![]).unwrap();
         let info = pd.info();
         assert_eq!(info.pool_id, pool_id);
         assert_eq!(info.pd_id, pd_id);
@@ -517,6 +564,7 @@ mod tests {
             1,
             vec![],
             0,
+            vec![],
         )
         .unwrap();
 
@@ -551,6 +599,7 @@ mod tests {
             1,
             vec![],
             0,
+            vec![],
         )
         .unwrap();
 
@@ -573,6 +622,7 @@ mod tests {
             1,
             vec![],
             0,
+            vec![],
         )
         .err()
         .expect("expected init to fail");

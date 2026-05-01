@@ -11,9 +11,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use onyx_chunklet::io::{AlignedBuf, RawDevice};
+use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::superblock::{SuperblockSlot, SLOT_BYTES};
 use onyx_chunklet::types::{
-    PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET, SUPERBLOCK_SLOT_B_OFFSET,
+    LdId, PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET, SUPERBLOCK_SLOT_B_OFFSET,
 };
 use onyx_chunklet::{ChunkletResult, Pool, PoolConfig};
 
@@ -30,6 +31,8 @@ enum Command {
     Pool(PoolCmd),
     /// Per-PD low-level operations (scan slots, etc.).
     Pd(PdCmd),
+    /// Logical disk operations (create / list / drop).
+    Ld(LdCmd),
 }
 
 #[derive(Parser, Debug)]
@@ -78,6 +81,37 @@ enum PdOp {
     Scan { device: PathBuf },
 }
 
+#[derive(Parser, Debug)]
+struct LdCmd {
+    #[command(subcommand)]
+    op: LdOp,
+}
+
+#[derive(Subcommand, Debug)]
+enum LdOp {
+    /// Create a new Plain LD on the pool.
+    CreatePlain {
+        /// Devices in the pool (comma-separated).
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// Number of chunklets to claim.
+        #[arg(long)]
+        chunklets: u16,
+    },
+    /// List all LDs on the pool.
+    List {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+    },
+    /// Drop an LD from the pool by uuid.
+    Drop {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// LD uuid.
+        ld_id: String,
+    },
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -97,6 +131,7 @@ fn run(cli: Cli) -> ChunkletResult<()> {
     match cli.cmd {
         Command::Pool(p) => run_pool(p),
         Command::Pd(p) => run_pd(p),
+        Command::Ld(p) => run_ld(p),
     }
 }
 
@@ -153,6 +188,56 @@ fn run_pd(cmd: PdCmd) -> ChunkletResult<()> {
             let raw = RawDevice::open(&device)?;
             scan_pd_slots(&raw)
         }
+    }
+}
+
+fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
+    match cmd.op {
+        LdOp::CreatePlain { pool, chunklets } => {
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let id = pool.create_ld(LdSpec::plain(chunklets))?;
+            println!("created LD {} (Plain, {} chunklets)", id, chunklets);
+            print_ld_table(&pool);
+            Ok(())
+        }
+        LdOp::List { pool } => {
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            print_ld_table(&pool);
+            Ok(())
+        }
+        LdOp::Drop { pool, ld_id } => {
+            let parsed = uuid::Uuid::parse_str(&ld_id)
+                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
+            let id = LdId::from_bytes(*parsed.as_bytes());
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            pool.drop_ld(id)?;
+            println!("dropped LD {}", id);
+            print_ld_table(&pool);
+            Ok(())
+        }
+    }
+}
+
+fn print_ld_table(pool: &Pool) {
+    let lds = pool.list_lds();
+    if lds.is_empty() {
+        println!("no LDs");
+        return;
+    }
+    println!("LDs ({}):", lds.len());
+    for d in lds {
+        println!(
+            "  id={} raid={:?} set={} row={} rows={} members={}",
+            d.id,
+            d.raid_level,
+            d.set_size,
+            d.row_size,
+            d.num_rows,
+            d.members.len()
+        );
     }
 }
 

@@ -158,4 +158,82 @@ impl HaDomain {
     pub fn is_supported(self) -> bool {
         matches!(self, HaDomain::Pd)
     }
+
+    pub fn from_u8(b: u8) -> ChunkletResult<Self> {
+        match b {
+            0 => Ok(Self::Pd),
+            1 => Ok(Self::Numa),
+            2 => Ok(Self::PcieSwitch),
+            other => Err(crate::ChunkletError::Format(format!(
+                "unknown HaDomain byte: {}",
+                other
+            ))),
+        }
+    }
+}
+
+use crate::ChunkletResult;
+
+/// RAID level supported by an LD. Phase numbers indicate when each lands.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u8)]
+pub enum RaidLevel {
+    /// Linear concat (P1). No redundancy, no striping; offset → single chunklet.
+    Plain = 0,
+    /// Mirror with N copies (P2). N=2 is RAID-1; combined with stripe rows = RAID-10.
+    Mirror = 1,
+    /// RAID-5: N data + 1 parity (P3).
+    Raid5 = 2,
+    /// RAID-6: N data + P + Q (P4).
+    Raid6 = 3,
+}
+
+impl RaidLevel {
+    pub fn from_u8(b: u8) -> ChunkletResult<Self> {
+        match b {
+            0 => Ok(Self::Plain),
+            1 => Ok(Self::Mirror),
+            2 => Ok(Self::Raid5),
+            3 => Ok(Self::Raid6),
+            other => Err(crate::ChunkletError::Format(format!(
+                "unknown RaidLevel byte: {}",
+                other
+            ))),
+        }
+    }
+}
+
+/// Role of a chunklet within an LD's RAID set.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u8)]
+pub enum LdRole {
+    Data = 0,
+    ParityP = 1,
+    ParityQ = 2,
+    /// Reserved for future spare-promotion records.
+    Spare = 3,
+}
+
+impl LdRole {
+    pub fn from_u8(b: u8) -> ChunkletResult<Self> {
+        match b {
+            0 => Ok(Self::Data),
+            1 => Ok(Self::ParityP),
+            2 => Ok(Self::ParityQ),
+            3 => Ok(Self::Spare),
+            other => Err(crate::ChunkletError::Format(format!(
+                "unknown LdRole byte: {}",
+                other
+            ))),
+        }
+    }
+}
+
+/// One chunklet member of an LD: which PD, which chunklet on that PD, and
+/// what role it plays.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub struct LdMember {
+    pub pd: PdId,
+    pub chunklet_index: u32,
+    pub role: LdRole,
 }

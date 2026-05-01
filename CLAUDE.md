@@ -245,6 +245,8 @@ RAID 容错的根。违反 = 一个 PD 失败可能干掉整个 set。每次 all
 ## 提交规范
 
 - 提交不要带 Claude 署名（参照 onyx 主仓库 feedback memory）。
-- 每个 phase 一个独立 PR；commit message 用中文短句，开头标 phase（如 `[P0] add superblock COW pair`）。
+- **commit message 用英文**，开头标 phase（如 `[P1] add allocator + LdPlain`）。
+  正文也英文，描述改了什么 + 为什么 + 验收门。
+- 每个 phase 一个独立 PR / 独立 commit。
 - on-disk 格式变更必须 bump `SUPERBLOCK_VERSION`，并在 PR 描述里写明迁移策略
   （Phase 0~7 期间：no migration, 重做 pool）。
