@@ -11,9 +11,10 @@
 use std::path::PathBuf;
 
 use onyx_chunklet::io::{AlignedBuf, RawDevice};
+use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::superblock::SLOT_BYTES;
 use onyx_chunklet::types::{
-    BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_B_OFFSET, BITMAP_SLOT_BYTES,
+    ChunkletState, BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_B_OFFSET, BITMAP_SLOT_BYTES,
     PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET, SUPERBLOCK_SLOT_B_OFFSET,
 };
 use onyx_chunklet::{Pool, PoolConfig};
@@ -107,6 +108,63 @@ fn survives_bitmap_head_slot_corruption_via_tail() {
     );
     let pool = Pool::open(open_paths(&paths)).unwrap();
     assert_eq!(pool.pd_count(), 2);
+}
+
+/// Regression: cross-PD `commit_manifest` loops in `create_ld` /
+/// `commit_rebuild` aren't atomic. If one PD's commit lands but another
+/// crashes / is delayed, the loaded LD list (best-view by gen) references
+/// chunklets whose bitmap on the lagging PD still says Free → future
+/// allocator can pick the same chunklet again. Pool::open should run a
+/// forward bitmap reconciliation (mark every descriptor-referenced
+/// chunklet Used).
+#[test]
+fn forward_reconciles_descriptor_to_bitmap_on_open() {
+    let dir = TempDir::new().unwrap();
+    let raws: Vec<_> = (0..4)
+        .map(|i| {
+            let p = dir.path().join(format!("pd{}", i));
+            (p.clone(), RawDevice::open_or_create(&p, PD_SIZE).unwrap())
+        })
+        .collect();
+    let paths: Vec<_> = raws.iter().map(|(p, _)| p.clone()).collect();
+    let pool = Pool::create(
+        raws.into_iter().map(|(_, r)| r).collect(),
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _ld = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+
+    // Pick a member, manually revert its bitmap entry to Free (simulate a
+    // PD whose commit_manifest didn't land while best-view does).
+    let desc = pool.list_lds().into_iter().next().unwrap();
+    let target = desc.members[0];
+    let pd = pool.pd(target.pd).unwrap();
+    pd.commit_manifest(|_body, bitmap| bitmap.set(target.chunklet_index, ChunkletState::Free))
+        .unwrap();
+    {
+        let (_, bitmap, _) = pd.snapshot();
+        assert_eq!(bitmap.get(target.chunklet_index).unwrap(), ChunkletState::Free);
+    }
+
+    drop(pool);
+
+    let raws: Vec<_> = paths.iter().map(|p| RawDevice::open(p).unwrap()).collect();
+    let pool2 = Pool::open(raws).unwrap();
+    assert_eq!(
+        pool2.last_reconciliation_count(),
+        1,
+        "expected forward reconcile to fix one bitmap entry"
+    );
+    let pd2 = pool2.pd(target.pd).unwrap();
+    let (_, bitmap, _) = pd2.snapshot();
+    assert_eq!(
+        bitmap.get(target.chunklet_index).unwrap(),
+        ChunkletState::Used,
+        "reconciliation must restore Used mark for descriptor-referenced chunklet"
+    );
 }
 
 #[test]

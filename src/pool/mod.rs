@@ -84,6 +84,9 @@ pub(crate) struct PoolState {
     pub ld_list: LdList,
     /// Authoritative CPG list, mirrored on every PD's manifest.
     pub cpg_list: cpg::CpgList,
+    /// Number of bitmap entries fixed by forward reconciliation during the
+    /// open that produced this Pool. 0 on a clean open.
+    pub last_reconciliation_count: usize,
 }
 
 /// Per-PD health enum. Phase 5 only distinguishes Healthy / Failed (PD-level).
@@ -146,6 +149,7 @@ impl Pool {
                 draining: std::collections::BTreeSet::new(),
                 ld_list: LdList::default(),
                 cpg_list: cpg::CpgList::default(),
+                last_reconciliation_count: 0,
             }),
             manifest_lock: Mutex::new(()),
         }))
@@ -241,6 +245,8 @@ impl Pool {
             None => (LdList::default(), cpg::CpgList::default()),
         };
 
+        let reconciled = forward_reconcile_bitmaps(&ld_list, &pds)?;
+
         Ok(Arc::new(Self {
             pool_id,
             state: RwLock::new(PoolState {
@@ -250,6 +256,7 @@ impl Pool {
                 draining: std::collections::BTreeSet::new(),
                 ld_list,
                 cpg_list,
+                last_reconciliation_count: reconciled,
             }),
             manifest_lock: Mutex::new(()),
         }))
@@ -354,6 +361,8 @@ impl Pool {
             None => (LdList::default(), cpg::CpgList::default()),
         };
 
+        let reconciled = forward_reconcile_bitmaps(&ld_list, &pds)?;
+
         Ok(Arc::new(Self {
             pool_id,
             state: RwLock::new(PoolState {
@@ -363,6 +372,7 @@ impl Pool {
                 draining: std::collections::BTreeSet::new(),
                 ld_list,
                 cpg_list,
+                last_reconciliation_count: reconciled,
             }),
             manifest_lock: Mutex::new(()),
         }))
@@ -493,6 +503,14 @@ impl Pool {
             .and_then(|id| s.pds.get(id))
             .cloned()
     }
+
+    /// Number of bitmap entries forward-reconciliation fixed during the last
+    /// `Pool::open` / `Pool::open_with_missing` call. 0 on a clean open;
+    /// non-zero indicates a prior cross-PD `commit_manifest` loop didn't
+    /// fully land. Mainly for tests + diagnostics.
+    pub fn last_reconciliation_count(&self) -> usize {
+        self.state.read().last_reconciliation_count
+    }
 }
 
 /// Majority vote for pool_id across opened PDs. With our quorum policy
@@ -508,6 +526,68 @@ fn majority_pool_id(pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<PoolId> {
         .find(|(_, count)| *count >= need)
         .map(|(id, _)| id)
         .ok_or_else(|| ChunkletError::PoolMismatch("no pool_id majority".into()))
+}
+
+/// Forward bitmap reconciliation: walk every loaded LD descriptor and ensure
+/// the chunklet referenced by each member is marked `Used` on its owning PD.
+///
+/// Cross-PD `commit_manifest` loops in `create_ld` / `commit_rebuild` /
+/// `drop_ld` / etc. are not atomic. If best-view at open time picks a higher-
+/// gen PD that records a new descriptor while a sibling PD lagged behind on
+/// its bitmap update, the result is "descriptor says chunklet X is mine"
+/// but bitmap says Free. Untouched, the allocator could later hand X out
+/// to a different LD → double-allocation.
+///
+/// This helper runs once at open, mutates only PDs needing fixes, and is
+/// idempotent (Used → Used is a no-op). It is FORWARD-only: bitmap entries
+/// claimed by no descriptor stay where they are. Cleaning those up (the
+/// `drop_ld` half-commit case) is left to a future `Pool::fsck` command.
+///
+/// Returns the number of `(pd, chunklet_index)` pairs that needed fixing.
+fn forward_reconcile_bitmaps(
+    ld_list: &LdList,
+    pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+) -> ChunkletResult<usize> {
+    let mut fixes_by_pd: BTreeMap<PdId, Vec<u32>> = BTreeMap::new();
+    for ld in &ld_list.lds {
+        for member in &ld.members {
+            let pd = match pds.get(&member.pd) {
+                Some(pd) => pd,
+                None => continue, // member's PD missing — Phase-7 quorum repair territory
+            };
+            let (_, bitmap, _) = pd.snapshot();
+            let state = match bitmap.get(member.chunklet_index) {
+                Ok(s) => s,
+                Err(_) => continue, // out-of-range index; superblock corrupt? skip silently
+            };
+            if state != crate::types::ChunkletState::Used {
+                fixes_by_pd
+                    .entry(member.pd)
+                    .or_default()
+                    .push(member.chunklet_index);
+            }
+        }
+    }
+
+    let mut total = 0usize;
+    for (pd_id, indices) in fixes_by_pd {
+        let pd = pds.get(&pd_id).expect("pd_id keyed from pds map");
+        let n = indices.len();
+        let captured = indices.clone();
+        pd.commit_manifest(move |_body, bitmap| {
+            for idx in &captured {
+                bitmap.set(*idx, crate::types::ChunkletState::Used)?;
+            }
+            Ok(())
+        })?;
+        tracing::warn!(
+            "forward reconcile fixed {} bitmap entries on PD {} (bumping to Used)",
+            n,
+            pd_id
+        );
+        total += n;
+    }
+    Ok(total)
 }
 
 /// Convenience: open a list of paths as raw devices. Used by `chunkletctl`.
