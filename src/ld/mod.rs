@@ -14,16 +14,19 @@
 //!   races with member-set mutations.
 
 pub mod descriptor;
+pub mod gf256;
 pub mod mirror;
 pub mod plain;
 pub mod raid0;
 pub mod raid5;
+pub mod raid6;
 
 pub use descriptor::{LdDescriptor, LdList};
 pub use mirror::LdMirror;
 pub use plain::LdPlain;
 pub use raid0::LdRaid0;
 pub use raid5::LdRaid5;
+pub use raid6::LdRaid6;
 
 use std::sync::Arc;
 

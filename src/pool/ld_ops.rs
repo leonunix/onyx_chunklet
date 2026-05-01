@@ -14,7 +14,7 @@ use crate::allocator::{plan_alloc, AllocRequest, PdFreeView};
 use crate::chunklet::ChunkletHeader;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
-use crate::ld::{LdMirror, LdPlain, LdRaid0, LdRaid5, LogicalDisk};
+use crate::ld::{LdMirror, LdPlain, LdRaid0, LdRaid5, LdRaid6, LogicalDisk};
 use crate::pd::PhysicalDisk;
 use crate::pool::Pool;
 use crate::types::{ChunkletState, HaDomain, LdId, LdRole, PdId, RaidLevel};
@@ -89,6 +89,19 @@ impl LdSpec {
             ha_domain: HaDomain::Pd,
         }
     }
+
+    /// RAID-6 spec. `data_per_set` = K (data chunklets per set; total set
+    /// size = K + 2). Same row / num_rows / strip semantics as `raid5`.
+    pub fn raid6(data_per_set: u8, row_size: u16, num_rows: u16, strip_size_log2: u8) -> Self {
+        Self {
+            raid_level: RaidLevel::Raid6,
+            set_size: data_per_set + 2,
+            row_size,
+            num_rows,
+            strip_size_log2,
+            ha_domain: HaDomain::Pd,
+        }
+    }
 }
 
 impl Pool {
@@ -100,8 +113,9 @@ impl Pool {
         self.state.read().ld_list.find(id).cloned()
     }
 
-    /// Plan + create a new LD. Phase 1 supports `Plain`; Phase 2 adds
-    /// `Mirror`. Other levels return `Unsupported`.
+    /// Plan + create a new LD. Supports Plain (P1), Mirror (P2), Raid5 +
+    /// Raid0 (P3), Raid6 (P4). Spec validation is per-level; allocator
+    /// failures (e.g. set_size > distinct PDs) bubble up unchanged.
     ///
     /// On success the new LD is durably persisted on every PD's manifest.
     pub fn create_ld(&self, spec: LdSpec) -> ChunkletResult<LdId> {
@@ -159,11 +173,18 @@ impl Pool {
                     ));
                 }
             }
-            other => {
-                return Err(ChunkletError::Unsupported(format!(
-                    "raid_level {:?} not yet implemented",
-                    other
-                )));
+            RaidLevel::Raid6 => {
+                if spec.set_size < 4 {
+                    return Err(ChunkletError::Invariant(format!(
+                        "Raid6 LD requires set_size >= 4 (>= 2+2), got {}",
+                        spec.set_size
+                    )));
+                }
+                if spec.row_size == 0 || spec.num_rows == 0 {
+                    return Err(ChunkletError::Invariant(
+                        "Raid6 LD requires row_size >= 1 and num_rows >= 1".into(),
+                    ));
+                }
             }
         }
 
@@ -244,10 +265,10 @@ impl Pool {
                 let raid0 = LdRaid0::open(desc, &s.pds)?;
                 Ok(Arc::new(raid0))
             }
-            other => Err(ChunkletError::Unsupported(format!(
-                "raid_level {:?} not implemented yet",
-                other
-            ))),
+            RaidLevel::Raid6 => {
+                let raid6 = LdRaid6::open(desc, &s.pds)?;
+                Ok(Arc::new(raid6))
+            }
         }
     }
 

@@ -152,15 +152,23 @@ trait LogicalDisk {
 - degraded set：从存活 chunklet 重算缺失数据。R5 缺 1 = XOR；R6 缺 1 = XOR；R6 缺 2
   = 求解 P/Q 二元方程（用 `reed-solomon-erasure` 的 reconstruct）。
 
-### Reed-Solomon 选型
+### Reed-Solomon 选型（最终方案：全 Anvin）
 
-- **full-stripe encode**：`reed-solomon-erasure` crate（开 `simd-accel` feature），
-  适合 RAID-6（k+2，小 parity 数），benchmark 上比 `reed-solomon-simd` 在 ≤42
-  recovery shards 场景更快。
-- **partial RMW delta**：自己写。XOR 一行即可（带 SIMD intrinsics 是 phase 4 优
-  化）；GF(2⁸) g^i 增量按 Anvin《The mathematics of RAID-6》算法照抄，约 200 行。
-- **decode / reconstruct**：用 `reed-solomon-erasure` 的 `reconstruct(...)`，不要
-  自己复现 Vandermonde 求逆。
+最初计划是 full-stripe 用 `reed-solomon-erasure`、partial RMW 自己写，但实际
+落地时发现矛盾：reed-solomon-erasure 用 Cauchy/Vandermonde 编码，与 Anvin
+"P=XOR, Q=Σ g^i·D_i" 公式产出的 parity 不兼容。partial RMW 的增量公式只在
+Anvin 体系下成立——也就是说必须 encode/decode/RMW 全部用 Anvin。
+
+最终选择：**全部自己写（Anvin 系列）**，不引入 `reed-solomon-erasure`。
+
+- `gf256.rs`：GF(2⁸) 在 primitive poly 0x11d 下的 mul_by_g + g^i LUT
+- full-stripe encode：直接走 Anvin 公式 P=⊕D_i, Q=Σ g^i·D_i
+- partial RMW：delta_P = ⊕(old⊕new); delta_Q = ⊕ g^i·(old⊕new); new_PQ = old ⊕ delta
+- 1 missing reconstruct (data)：从 P 反推 D_x = P ⊕ ⊕_{i≠x} D_i
+- 2 missing reconstruct：解 PQ 联立方程，按 Anvin 论文 Section 4 公式
+  （需要 GF(2⁸) inverse，用预算 LUT）
+
+约 250-300 行代码 + LUT。优势：零外部依赖、语义可控、和 Linux md raid6 一致。
 
 ### Sparing & rebuild
 

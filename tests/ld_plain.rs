@@ -6,8 +6,8 @@ use std::sync::Arc;
 use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::pool::LdSpec;
-use onyx_chunklet::types::{ChunkletState, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
-use onyx_chunklet::{HaDomain, Pool, PoolConfig};
+use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
+use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
 /// 4 GiB sparse files: ~2 chunklets each (4 GiB - 2 MiB reserved / 1 GiB ≈ 3, but
@@ -115,22 +115,6 @@ fn drop_ld_frees_chunklets() {
         let (_, bitmap, _) = pd.snapshot();
         assert_eq!(bitmap.count(ChunkletState::Used), 0);
     }
-}
-
-#[test]
-fn rejects_unimplemented_raid_levels() {
-    let dir = TempDir::new().unwrap();
-    let (pool, _paths) = make_pool(&dir, &["pd0", "pd1", "pd2", "pd3", "pd4"]);
-    // Raid6 not implemented until P4.
-    let spec = LdSpec {
-        raid_level: RaidLevel::Raid6,
-        set_size: 5,
-        row_size: 1,
-        num_rows: 1,
-        strip_size_log2: 0,
-        ha_domain: HaDomain::Pd,
-    };
-    assert!(pool.create_ld(spec).is_err());
 }
 
 #[test]
