@@ -14,23 +14,9 @@ use onyx_chunklet::types::RaidLevel;
 use onyx_chunklet::ChunkletError;
 use tempfile::TempDir;
 
-use common::{make_pool, open_full, open_subset, path_for_member};
+use common::{make_pool, open_full, open_subset, path_for_member, pattern};
 
 const STRIP: usize = 4096;
-
-/// Deterministic per-byte pattern keyed by `tag` so different fills produce
-/// distinct byte sequences across a single LD.
-fn pattern(tag: u64, len: usize, base: u64) -> Vec<u8> {
-    (0..len)
-        .map(|i| {
-            let mut x = tag.wrapping_add((base + i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            x ^= x >> 33;
-            x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-            x ^= x >> 33;
-            (x >> 56) as u8
-        })
-        .collect()
-}
 
 // -------- RAID-5 ------------------------------------------------------------
 

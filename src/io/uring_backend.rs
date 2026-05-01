@@ -71,15 +71,13 @@ impl IoBackend for UringBackend {
 }
 
 fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
-    // Bounce the user data into 4 KiB-aligned buffers up front. SQEs
-    // reference the bounce buffers by raw pointer; they must outlive
-    // `submit_and_wait`, which is why this Vec is held until the end of
-    // the function.
+    // SQEs reference these bounce buffers by raw pointer; the Vec is
+    // held until the end of the function so the kernel sees them live
+    // through `submit_and_wait`.
     let mut bounces: Vec<AlignedBuf> = Vec::with_capacity(ops.len());
     let mut ptrs: Vec<(*const u8, u32)> = Vec::with_capacity(ops.len());
     for op in ops {
-        let mut buf = AlignedBuf::new(op.data.len())?;
-        buf.as_mut_slice()[..op.data.len()].copy_from_slice(op.data);
+        let buf = AlignedBuf::from_slice(op.data)?;
         ptrs.push((buf.as_slice().as_ptr(), op.data.len() as u32));
         bounces.push(buf);
     }

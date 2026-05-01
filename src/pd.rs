@@ -29,8 +29,8 @@ use parking_lot::RwLock;
 
 use crate::bitmap::Bitmap;
 use crate::error::{ChunkletError, ChunkletResult};
-use crate::io::sync_backend::SyncBackend;
-use crate::io::{AlignedBuf, IoBackend, RawDevice};
+use crate::io::backend::make_backend;
+use crate::io::{AlignedBuf, IoBackend, IoBackendKind, RawDevice};
 use crate::superblock::{SuperblockBody, SuperblockSlot, SLOT_BYTES};
 use crate::types::{
     BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_B_OFFSET, BITMAP_SLOT_BYTES, BLOCK_SIZE, CHUNKLET_HEADER_BYTES,
@@ -202,10 +202,12 @@ impl PhysicalDisk {
         self.backend.read().clone()
     }
 
-    /// Raw fd of the underlying device. Exposed for the `UringBackend`
-    /// SQE plumbing; bypasses the `RawDevice` `read_at`/`write_at` loops
-    /// so the caller is responsible for alignment + bounds checking.
-    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+    /// Raw fd of the underlying device. Used by direct-fd IO submission
+    /// paths (currently only `UringBackend`) that bypass `RawDevice`'s
+    /// `read_at`/`write_at` loops, so the caller is responsible for
+    /// alignment + bounds checking. `pub(crate)` keeps the fd inside
+    /// chunklet — downstream crates have no business grabbing it.
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         self.raw.as_raw_fd()
     }
@@ -418,9 +420,9 @@ impl PhysicalDisk {
     }
 
     /// Resolve a (chunklet, in-chunklet offset, length) into an absolute
-    /// device offset, validating bounds. `pub(crate)` because the
-    /// `UringBackend` SQE plumbing needs it to bypass `RawDevice` and
-    /// post `IORING_OP_WRITE` directly against the raw fd.
+    /// device offset, validating bounds. `pub(crate)` so direct-fd IO
+    /// submission paths can bypass `RawDevice`'s read/write loops while
+    /// still going through the same offset math.
     pub(crate) fn chunklet_user_abs_offset(
         &self,
         chunklet_index: u32,
@@ -447,11 +449,13 @@ impl PhysicalDisk {
 }
 
 /// Compute total chunklets that fit on a PD given its raw size.
-/// Default backend used when a PD is opened without a Pool (test
-/// helpers, `PhysicalDisk::open`/`init` standalone). `Pool::create` and
-/// `Pool::open*` overwrite via `pd.set_backend(...)` immediately after.
+/// Default backend stamped on every `PhysicalDisk` at construction
+/// time. `Pool::create` overwrites with the pool's configured backend
+/// right after; standalone PD tests + ad-hoc `PhysicalDisk::open` use
+/// this default. Single source of truth lives in `make_backend` so a
+/// future change to `IoBackendKind::default()` propagates here.
 fn default_backend() -> Arc<dyn IoBackend> {
-    Arc::new(SyncBackend)
+    make_backend(IoBackendKind::default())
 }
 
 fn compute_total_chunklets(pd_size: u64) -> ChunkletResult<u32> {

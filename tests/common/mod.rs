@@ -8,15 +8,25 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use onyx_chunklet::io::RawDevice;
+use onyx_chunklet::io::{IoBackendKind, RawDevice};
 use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
 const PD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Create a fresh pool of `n` sparse-backed PDs. Returns the pool plus the
-/// device paths so callers can drop members later via `open_subset`.
+/// Create a fresh pool of `n` sparse-backed PDs (default Sync backend).
+/// Returns the pool plus the device paths so callers can drop members
+/// later via `open_subset`.
 pub fn make_pool(dir: &TempDir, n: usize) -> (Arc<Pool>, Vec<PathBuf>) {
+    make_pool_with(dir, n, IoBackendKind::Sync)
+}
+
+/// Same as `make_pool` but with an explicit IO backend choice.
+pub fn make_pool_with(
+    dir: &TempDir,
+    n: usize,
+    backend: IoBackendKind,
+) -> (Arc<Pool>, Vec<PathBuf>) {
     let mut raws = Vec::new();
     let mut paths = Vec::new();
     for i in 0..n {
@@ -24,8 +34,30 @@ pub fn make_pool(dir: &TempDir, n: usize) -> (Arc<Pool>, Vec<PathBuf>) {
         raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
         paths.push(p);
     }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0, ..Default::default() }).unwrap();
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            io_backend: backend,
+        },
+    )
+    .unwrap();
     (pool, paths)
+}
+
+/// Deterministic per-byte splitmix pattern. Seeded by `tag`, addressed
+/// by absolute byte offset, so writes done in arbitrary chunks and reads
+/// at arbitrary offsets produce matching bytes.
+pub fn pattern(tag: u64, len: usize, base: u64) -> Vec<u8> {
+    (0..len)
+        .map(|i| {
+            let mut x = tag.wrapping_add((base + i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            x ^= x >> 33;
+            (x >> 56) as u8
+        })
+        .collect()
 }
 
 /// Reopen the pool excluding the PDs at the given path indices. Quorum

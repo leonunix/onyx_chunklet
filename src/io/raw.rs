@@ -105,15 +105,6 @@ impl RawDevice {
     pub fn is_direct_io(&self) -> bool {
         self.direct_io
     }
-}
-
-impl AsRawFd for RawDevice {
-    fn as_raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
-    }
-}
-
-impl RawDevice {
 
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> ChunkletResult<()> {
         self.bounds_check(offset, buf.len() as u64)?;
@@ -130,8 +121,7 @@ impl RawDevice {
     pub fn write_at(&self, buf: &[u8], offset: u64) -> ChunkletResult<()> {
         self.bounds_check(offset, buf.len() as u64)?;
         if self.direct_io && self.unaligned(offset, buf.len(), buf.as_ptr() as usize) {
-            let mut aligned = AlignedBuf::new(buf.len())?;
-            aligned.as_mut_slice()[..buf.len()].copy_from_slice(buf);
+            let aligned = AlignedBuf::from_slice(buf)?;
             return self.write_loop(aligned.as_slice(), offset);
         }
         self.write_loop(buf, offset)
@@ -223,5 +213,11 @@ impl RawDevice {
     fn unaligned(&self, offset: u64, len: usize, ptr_addr: usize) -> bool {
         let bs = BLOCK_SIZE as usize;
         offset % BLOCK_SIZE != 0 || len % bs != 0 || ptr_addr % bs != 0
+    }
+}
+
+impl AsRawFd for RawDevice {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 }

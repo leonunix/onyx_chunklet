@@ -16,7 +16,23 @@ unsafe impl Sync for AlignedBuf {}
 
 impl AlignedBuf {
     /// Allocate `size` bytes, rounded up to a multiple of `BLOCK_SIZE`.
+    /// Memory is zero-initialized — use [`AlignedBuf::from_slice`] when
+    /// you'll fully overwrite the buffer right away.
     pub fn new(size: usize) -> ChunkletResult<Self> {
+        Self::alloc(size, /* zeroed */ true)
+    }
+
+    /// Allocate an aligned buffer sized for `src` and copy `src` into it.
+    /// Skips the zero-fill that `new` does, since the contents are
+    /// overwritten by the copy. Used by `RawDevice::write_at` and
+    /// `UringBackend` for the unaligned-to-aligned bounce path.
+    pub fn from_slice(src: &[u8]) -> ChunkletResult<Self> {
+        let mut buf = Self::alloc(src.len(), /* zeroed */ false)?;
+        buf.as_mut_slice()[..src.len()].copy_from_slice(src);
+        Ok(buf)
+    }
+
+    fn alloc(size: usize, zeroed: bool) -> ChunkletResult<Self> {
         let aligned_size = round_up(size, BLOCK_SIZE as usize);
         if aligned_size == 0 {
             return Err(ChunkletError::Config(
@@ -26,7 +42,13 @@ impl AlignedBuf {
         let layout = Layout::from_size_align(aligned_size, BLOCK_SIZE as usize)
             .map_err(|e| ChunkletError::Config(format!("invalid layout: {}", e)))?;
         // SAFETY: layout is valid (size > 0, align is a power of two).
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        let ptr = unsafe {
+            if zeroed {
+                alloc::alloc_zeroed(layout)
+            } else {
+                alloc::alloc(layout)
+            }
+        };
         if ptr.is_null() {
             return Err(ChunkletError::Io(std::io::Error::from(
                 std::io::ErrorKind::OutOfMemory,
