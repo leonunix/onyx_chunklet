@@ -78,12 +78,12 @@ impl Bitmap {
                 crate::ChunkletError::Format(format!("bitmap[{}]: {}", i, e))
             })?;
         }
-        // Tail bytes (padding) must be zero.
-        for (i, &b) in slot_bytes[total_chunklets as usize..]
-            .iter()
-            .enumerate()
-            .take(64)
-        {
+        // Tail bytes (padding) must be zero across the FULL slot region.
+        // Earlier code took only the first 64 bytes of padding which let
+        // arbitrary garbage past offset N+64 slip through CRC-checked but
+        // semantically invalid; expand to full coverage so any drift is
+        // caught at decode time.
+        for (i, &b) in slot_bytes[total_chunklets as usize..].iter().enumerate() {
             if b != 0 {
                 return Err(crate::ChunkletError::Format(format!(
                     "non-zero padding byte at offset {}: {}",
@@ -166,6 +166,18 @@ mod tests {
         let mut bytes = [0u8; BITMAP_SLOT_BYTES as usize];
         bytes[10] = 1; // beyond total_chunklets=4
         let err = Bitmap::decode(&bytes, 4).unwrap_err();
+        assert!(matches!(err, crate::ChunkletError::Format(_)));
+    }
+
+    /// Regression: padding check used to stop after 64 bytes; non-zero
+    /// bytes deep into the slot would slip past decode despite being
+    /// semantically invalid.
+    #[test]
+    fn rejects_non_zero_padding_far_from_data_region() {
+        let mut bytes = [0u8; BITMAP_SLOT_BYTES as usize];
+        // Way past `total_chunklets = 100` AND past the old 64-byte window.
+        bytes[200000] = 0x42;
+        let err = Bitmap::decode(&bytes, 100).unwrap_err();
         assert!(matches!(err, crate::ChunkletError::Format(_)));
     }
 }
