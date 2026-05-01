@@ -390,7 +390,10 @@ impl Pool {
                         owner_ld: desc.id,
                         chunklet_index: chunklet_idx,
                         role,
-                        generation: 1,
+                        // Fresh allocation: descriptor stamps generation=0
+                        // for every member at create_ld time, so the chunklet
+                        // header matches.
+                        generation: 0,
                     };
                     pd.write_chunklet_header(chunklet_idx, &header.encode())?;
                 }

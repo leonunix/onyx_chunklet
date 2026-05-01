@@ -160,6 +160,7 @@ fn pick_set(
             pd: chosen,
             chunklet_index,
             role,
+            generation: 0,
         });
         used_pds.push(chosen);
     }

@@ -17,7 +17,8 @@
 //!              [0..16]  pd_id (16 bytes)
 //!              [16..20] chunklet_index u32 LE
 //!              [20..21] role u8
-//!              [21..24] reserved
+//!              [21..22] generation u8 (rebuild counter; 0 on fresh alloc)
+//!              [22..24] reserved
 //! ```
 //!
 //! # List format (the bytes stored in `SuperblockBody::ld_list_bytes`)
@@ -74,7 +75,8 @@ impl LdDescriptor {
             out[off..off + 16].copy_from_slice(&m.pd.to_bytes());
             out[off + 16..off + 20].copy_from_slice(&m.chunklet_index.to_le_bytes());
             out[off + 20] = m.role as u8;
-            // [21..24] reserved.
+            out[off + 21] = m.generation;
+            // [22..24] reserved.
         }
         Ok(out)
     }
@@ -121,6 +123,12 @@ impl LdDescriptor {
                     bytes[off + 16..off + 20].try_into().unwrap(),
                 ),
                 role: LdRole::from_u8(bytes[off + 20])?,
+                // Old (pre-Commit-3) descriptors wrote 0 into the reserved
+                // byte at [21]; new descriptors stamp the rebuild counter
+                // there. Reading 0 from a legacy descriptor matches "fresh
+                // allocation" and is consistent with the chunklet header
+                // generation written at create_ld time.
+                generation: bytes[off + 21],
             });
         }
         Ok((
@@ -211,6 +219,7 @@ mod tests {
                     pd: PdId::new_v4(),
                     chunklet_index: i as u32,
                     role: LdRole::Data,
+                    generation: 0,
                 })
                 .collect(),
         }

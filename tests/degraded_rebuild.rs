@@ -254,6 +254,102 @@ fn rebuild_no_op_when_nothing_failed() {
     assert_eq!(report.rebuilt_members, 0);
 }
 
+// ------ Per-member rebuild generation --------------------------------------
+
+#[test]
+fn rebuild_bumps_member_generation() {
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, 3);
+    let ld_id = pool.create_ld(LdSpec::mirror(2, 1, 1, 0)).unwrap();
+
+    // Fresh allocation: every member starts at generation 0.
+    let desc0 = pool.find_ld(ld_id).unwrap();
+    for (i, m) in desc0.members.iter().enumerate() {
+        assert_eq!(m.generation, 0, "fresh member {} should start at gen 0", i);
+    }
+    drop(pool);
+
+    // Drop member 0's PD and rebuild.
+    let pool_full = open_full(&paths);
+    let drop_pd = desc0.members[0].pd;
+    let drop_idx = paths
+        .iter()
+        .position(|p| pool_full.pd(drop_pd).unwrap().path() == p)
+        .unwrap();
+    drop(pool_full);
+
+    let pool_deg = open_subset(&paths, &[drop_idx]);
+    pool_deg.rebuild_ld(ld_id).unwrap();
+    let desc1 = pool_deg.find_ld(ld_id).unwrap();
+    assert_eq!(desc1.members[0].generation, 1, "rebuilt member should bump to 1");
+    assert_eq!(desc1.members[1].generation, 0, "untouched member stays at 0");
+
+    // Chunklet header on the freshly-allocated chunklet must carry the
+    // same generation (low 8 bits) as the descriptor.
+    let new_pd = pool_deg.pd(desc1.members[0].pd).unwrap();
+    let header_bytes = new_pd
+        .read_chunklet_header_bytes(desc1.members[0].chunklet_index)
+        .unwrap();
+    let stored_gen = u64::from_le_bytes(header_bytes[40..48].try_into().unwrap());
+    assert_eq!(
+        (stored_gen & 0xff) as u8,
+        desc1.members[0].generation,
+        "chunklet header generation must match descriptor"
+    );
+
+    // Persist across reopen.
+    drop(pool_deg);
+    let pool_reopen = open_subset(&paths, &[drop_idx]);
+    let desc2 = pool_reopen.find_ld(ld_id).unwrap();
+    assert_eq!(desc2.members[0].generation, 1);
+    assert_eq!(desc2.members[1].generation, 0);
+}
+
+#[test]
+fn multiple_rebuilds_increment_generation() {
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, 5);
+    let ld_id = pool.create_ld(LdSpec::mirror(2, 1, 1, 0)).unwrap();
+    let desc0 = pool.find_ld(ld_id).unwrap();
+    drop(pool);
+
+    // Round 1: drop member 0's PD, rebuild onto a healthy PD.
+    let pool_full = open_full(&paths);
+    let drop_pd_a = desc0.members[0].pd;
+    let drop_idx_a = paths
+        .iter()
+        .position(|p| pool_full.pd(drop_pd_a).unwrap().path() == p)
+        .unwrap();
+    drop(pool_full);
+    let pool_deg = open_subset(&paths, &[drop_idx_a]);
+    pool_deg.rebuild_ld(ld_id).unwrap();
+    let desc1 = pool_deg.find_ld(ld_id).unwrap();
+    assert_eq!(desc1.members[0].generation, 1);
+    let post1_pd_a = desc1.members[0].pd;
+    drop(pool_deg);
+
+    // Round 2: drop the new home of member 0 (post-round-1 location), rebuild
+    // again. open_with_missing reads the original 4-PD layout and tolerates
+    // 2 missing — original pd that died in round 1 + the new one we drop now.
+    let drop_idx_b = paths
+        .iter()
+        .position(|p| {
+            // open the device briefly to find which path holds post1_pd_a
+            let raw = onyx_chunklet::io::RawDevice::open(p).unwrap();
+            let pd = onyx_chunklet::PhysicalDisk::open(raw).unwrap();
+            pd.pd_id() == post1_pd_a
+        })
+        .unwrap();
+
+    let pool_deg2 = open_subset(&paths, &[drop_idx_a, drop_idx_b]);
+    pool_deg2.rebuild_ld(ld_id).unwrap();
+    let desc2 = pool_deg2.find_ld(ld_id).unwrap();
+    assert_eq!(
+        desc2.members[0].generation, 2,
+        "second rebuild should increment to 2"
+    );
+}
+
 // ------ Spare bitmap state -------------------------------------------------
 
 #[test]

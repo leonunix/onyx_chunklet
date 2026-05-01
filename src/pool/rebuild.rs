@@ -160,7 +160,7 @@ impl Pool {
             working_free.remove(pd);
         }
         // For each set, build the new placement.
-        let mut new_alloc_by_pd: BTreeMap<PdId, Vec<(u32, LdRole)>> = BTreeMap::new();
+        let mut new_alloc_by_pd: BTreeMap<PdId, Vec<(u32, LdRole, u8)>> = BTreeMap::new();
         for (set_idx, failed) in failed_per_set.iter().enumerate() {
             if failed.is_empty() {
                 continue;
@@ -172,7 +172,13 @@ impl Pool {
                 .map(|i| desc.members[base + i].pd)
                 .collect();
             for &failed_pos in failed {
-                let role = desc.members[base + failed_pos].role;
+                let old_member = desc.members[base + failed_pos];
+                let role = old_member.role;
+                // Bump the rebuild counter so the freshly-written chunklet
+                // header carries a generation > the pre-rebuild value.
+                // A crash mid-rebuild then leaves a header gen != descriptor
+                // gen, which forward_reconcile_bitmaps logs at next open.
+                let new_gen = old_member.generation.wrapping_add(1);
                 let target_pd = pick_replacement_pd(
                     &working_free,
                     &pds_snapshot,
@@ -186,10 +192,11 @@ impl Pool {
                 new_alloc_by_pd
                     .entry(target_pd)
                     .or_default()
-                    .push((chunklet_idx, role));
+                    .push((chunklet_idx, role, new_gen));
                 let m = &mut new_desc.members[base + failed_pos];
                 m.pd = target_pd;
                 m.chunklet_index = chunklet_idx;
+                m.generation = new_gen;
             }
         }
 
@@ -197,6 +204,8 @@ impl Pool {
         // We open a temporary LD instance built from the ORIGINAL descriptor +
         // current pds map (failed members will be `None`), which is exactly
         // what the reconstruct math needs.
+        // new_desc carries the bumped per-member generation; helpers stamp
+        // it into the chunklet header so a crash mid-rebuild is detectable.
         match desc.raid_level {
             RaidLevel::Mirror => self.rebuild_mirror(&desc, &new_desc, &failed_per_set, &pds_snapshot)?,
             RaidLevel::Raid5 => self.rebuild_raid5(&desc, &new_desc, &failed_per_set, &pds_snapshot)?,
@@ -254,7 +263,7 @@ impl Pool {
                 let target_pd = pds_snapshot.get(&target.pd).ok_or_else(|| {
                     ChunkletError::Invariant(format!("rebuild target PD {} missing", target.pd))
                 })?;
-                self.write_header(target_pd, target.chunklet_index, new_desc.id, role)?;
+                self.write_header(target_pd, target.chunklet_index, new_desc.id, role, target.generation)?;
                 for batch_n in 0..REBUILD_BATCHES_PER_CHUNKLET {
                     let off = batch_n * REBUILD_BATCH_BYTES;
                     let take = batch_take(off);
@@ -293,7 +302,7 @@ impl Pool {
                 let target_pd = pds_snapshot.get(&target.pd).ok_or_else(|| {
                     ChunkletError::Invariant(format!("rebuild target PD {} missing", target.pd))
                 })?;
-                self.write_header(target_pd, target.chunklet_index, new_desc.id, role)?;
+                self.write_header(target_pd, target.chunklet_index, new_desc.id, role, target.generation)?;
                 for batch_n in 0..REBUILD_BATCHES_PER_CHUNKLET {
                     let off = batch_n * REBUILD_BATCH_BYTES;
                     let take = batch_take(off);
@@ -332,7 +341,7 @@ impl Pool {
                 let target_pd = pds_snapshot.get(&target.pd).ok_or_else(|| {
                     ChunkletError::Invariant(format!("rebuild target PD {} missing", target.pd))
                 })?;
-                self.write_header(target_pd, target.chunklet_index, new_desc.id, role)?;
+                self.write_header(target_pd, target.chunklet_index, new_desc.id, role, target.generation)?;
                 for batch_n in 0..REBUILD_BATCHES_PER_CHUNKLET {
                     let off = batch_n * REBUILD_BATCH_BYTES;
                     let take = batch_take(off);
@@ -359,15 +368,17 @@ impl Pool {
         chunklet_idx: u32,
         owner_ld: LdId,
         role: LdRole,
+        generation: u8,
     ) -> ChunkletResult<()> {
         let header = ChunkletHeader {
             owner_ld,
             chunklet_index: chunklet_idx,
             role,
-            // Bumped per rebuild — Phase 5 keeps it 1 since we don't yet track
-            // member generation in the descriptor. Phase 7 will likely promote
-            // generation to a per-member field for crash-mid-rebuild detection.
-            generation: 1,
+            // ChunkletHeader carries u64 generation but only the low 8 bits
+            // are meaningful; LdMember stores u8 to fit a previously-reserved
+            // descriptor byte. Wrap-around at 256 same-position rebuilds is
+            // theoretical, not realistic.
+            generation: generation as u64,
         };
         pd.write_chunklet_header(chunklet_idx, &header.encode())?;
         Ok(())
@@ -376,7 +387,7 @@ impl Pool {
     fn commit_rebuild(
         &self,
         new_desc: &LdDescriptor,
-        new_alloc_by_pd: &BTreeMap<PdId, Vec<(u32, LdRole)>>,
+        new_alloc_by_pd: &BTreeMap<PdId, Vec<(u32, LdRole, u8)>>,
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
     ) -> ChunkletResult<()> {
         // Update in-memory ld_list first so the encoded bytes reflect the new
@@ -391,7 +402,7 @@ impl Pool {
             let owned = new_alloc_by_pd.get(pd_id).cloned().unwrap_or_default();
             let new_ld_bytes_v = new_ld_bytes.clone();
             pd.commit_manifest(move |body, bitmap| {
-                for (idx, _role) in &owned {
+                for (idx, _role, _gen) in &owned {
                     bitmap.set(*idx, ChunkletState::Used)?;
                 }
                 body.ld_list_bytes = new_ld_bytes_v;

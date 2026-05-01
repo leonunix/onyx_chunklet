@@ -234,11 +234,21 @@ impl LdRole {
     }
 }
 
-/// One chunklet member of an LD: which PD, which chunklet on that PD, and
-/// what role it plays.
+/// One chunklet member of an LD: which PD, which chunklet on that PD, what
+/// role it plays, and the rebuild generation counter.
+///
+/// `generation` increments each time this member is rebuilt onto a fresh
+/// chunklet. The same value is stamped into the chunklet header at rebuild
+/// time, so a crash mid-rebuild leaves a header generation that mismatches
+/// the descriptor — the discrepancy is logged at open time. Stored in one
+/// of the previously-reserved bytes of the on-disk member encoding (no
+/// SUPERBLOCK_VERSION bump). Wrap-around at 256 is theoretical; same
+/// (PD, chunklet_index) being rebuilt 256 times without intermediate drop
+/// is not realistic.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct LdMember {
     pub pd: PdId,
     pub chunklet_index: u32,
     pub role: LdRole,
+    pub generation: u8,
 }
