@@ -190,7 +190,7 @@ impl Pool {
 
         let _commit = self.manifest_lock.lock();
 
-        let pd_views = self.snapshot_free_views();
+        let pd_views = self.snapshot_free_views()?;
         let total_members = (spec.set_size as usize)
             * (spec.row_size as usize)
             * (spec.num_rows as usize);
@@ -316,27 +316,13 @@ impl Pool {
         Ok(())
     }
 
-    pub(crate) fn snapshot_free_views(&self) -> Vec<PdFreeView> {
-        let s = self.state.read();
-        let mut out = Vec::with_capacity(s.pds.len());
-        for (pd_id, pd) in &s.pds {
-            let (_, bitmap, _) = pd.snapshot();
-            let mut free_indices = Vec::new();
-            for i in 0..bitmap.len() {
-                if bitmap
-                    .get(i)
-                    .map(|st| st == ChunkletState::Free)
-                    .unwrap_or(false)
-                {
-                    free_indices.push(i);
-                }
-            }
-            out.push(PdFreeView {
-                pd: *pd_id,
-                free_indices,
-            });
-        }
-        out
+    pub(crate) fn snapshot_free_views(&self) -> ChunkletResult<Vec<PdFreeView>> {
+        let pds = self.state.read().pds.clone();
+        let map = crate::pool::collect_free_indices_per_pd(&pds, /* include_spare */ false)?;
+        Ok(map
+            .into_iter()
+            .map(|(pd, free_indices)| PdFreeView { pd, free_indices })
+            .collect())
     }
 
     /// Persist a freshly-allocated LD: write chunklet headers, mark bitmap

@@ -243,24 +243,13 @@ impl Pool {
 
     /// Snapshot per-live-PD free chunklet index lists. Spare-state chunklets
     /// are folded in as well so rebuild can dip into the spare pool when free
-    /// is exhausted.
+    /// is exhausted. Thin wrapper over the shared `collect_free_indices_per_pd`
+    /// helper in `pool/mod.rs`.
     fn snapshot_working_free(
         &self,
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
     ) -> ChunkletResult<BTreeMap<PdId, Vec<u32>>> {
-        let mut out = BTreeMap::new();
-        for (pd_id, pd) in pds_snapshot {
-            let (_, bitmap, _) = pd.snapshot();
-            let mut free_indices = Vec::new();
-            for i in 0..bitmap.len() {
-                let st = bitmap.get(i)?;
-                if st == ChunkletState::Free || st == ChunkletState::Spare {
-                    free_indices.push(i);
-                }
-            }
-            out.insert(*pd_id, free_indices);
-        }
-        Ok(out)
+        crate::pool::collect_free_indices_per_pd(pds_snapshot, /* include_spare */ true)
     }
 
     fn rebuild_mirror(

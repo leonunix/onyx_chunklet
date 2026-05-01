@@ -540,6 +540,34 @@ impl Pool {
     }
 }
 
+/// Walk every PD's bitmap and collect chunklet indices in the requested
+/// "free-ish" states, sorted ascending. The single source of truth for
+/// `Pool::snapshot_free_views` (allocator: regular alloc, no spare) and
+/// `Pool::snapshot_working_free` (rebuild: regular alloc + spare pool
+/// because rebuild is allowed to dip into reserved spares when normal
+/// free is exhausted).
+pub(crate) fn collect_free_indices_per_pd(
+    pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+    include_spare: bool,
+) -> ChunkletResult<BTreeMap<PdId, Vec<u32>>> {
+    use crate::types::ChunkletState;
+    let mut out = BTreeMap::new();
+    for (pd_id, pd) in pds {
+        let (_, bitmap, _) = pd.snapshot();
+        let mut indices = Vec::new();
+        for i in 0..bitmap.len() {
+            let st = bitmap.get(i)?;
+            let want = st == ChunkletState::Free
+                || (include_spare && st == ChunkletState::Spare);
+            if want {
+                indices.push(i);
+            }
+        }
+        out.insert(*pd_id, indices);
+    }
+    Ok(out)
+}
+
 /// Simple-majority vote for pool_id across the opened PDs. Threshold is
 /// `floor(N/2) + 1` of the SET WE OPENED (not of the declared pool size —
 /// that quorum is enforced separately by `Pool::open_with_missing` against
