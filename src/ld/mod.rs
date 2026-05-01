@@ -67,11 +67,7 @@ pub(crate) fn parallel_strip_writes(writes: Vec<StripWrite<'_>>) -> ChunkletResu
         let handles: Vec<_> = writes
             .iter()
             .map(|w| {
-                let pd = w.pd.clone();
-                let idx = w.chunklet_index;
-                let off = w.in_chunklet_off;
-                let data = w.data;
-                s.spawn(move || pd.write_chunklet_user(idx, off, data))
+                s.spawn(move || w.pd.write_chunklet_user(w.chunklet_index, w.in_chunklet_off, w.data))
             })
             .collect();
         let mut first_err: Option<ChunkletError> = None;

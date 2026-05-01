@@ -43,4 +43,14 @@ pub enum ChunkletError {
 
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    #[error(
+        "{raid:?} set {set_idx}: {failed} failed members exceeds redundancy budget {budget}"
+    )]
+    WriteRedundancyExceeded {
+        raid: crate::types::RaidLevel,
+        set_idx: usize,
+        failed: usize,
+        budget: usize,
+    },
 }

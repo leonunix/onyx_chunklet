@@ -74,6 +74,7 @@ use std::sync::Arc;
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
+use crate::ld::gf256::xor_into;
 use crate::ld::{parallel_strip_writes, resolve_members, LogicalDisk, StripWrite};
 use crate::pd::PhysicalDisk;
 use crate::types::{
@@ -274,20 +275,6 @@ impl LdRaid5 {
         self.members[self.member_idx_parity(set_idx)].is_none()
     }
 
-    /// Reject writes to a set whose total failure count exceeds R5's
-    /// redundancy budget (1).
-    fn check_writable(&self, set_idx: usize) -> ChunkletResult<()> {
-        let f = self.failed_data_positions(set_idx).len()
-            + (self.parity_failed(set_idx) as usize);
-        if f > 1 {
-            return Err(ChunkletError::Invariant(format!(
-                "Raid5 set {} has {} failed members; cannot write (max 1)",
-                set_idx, f
-            )));
-        }
-        Ok(())
-    }
-
     /// Encode the parity strip from all K data strips at `in_chunklet_off`.
     /// Used by rebuild when the parity chunklet itself is what was lost.
     pub fn encode_parity_strip(
@@ -474,7 +461,19 @@ impl LdRaid5 {
         start: StripeAddr,
         buf: &[u8],
     ) -> ChunkletResult<()> {
-        self.check_writable(start.set_idx)?;
+        // Compute failure pattern once and reuse for the F-budget check
+        // and the path dispatch below.
+        let f_data = self.failed_data_positions(start.set_idx).len();
+        let p_failed = self.parity_failed(start.set_idx);
+        let f_total = f_data + p_failed as usize;
+        if f_total > 1 {
+            return Err(ChunkletError::WriteRedundancyExceeded {
+                raid: RaidLevel::Raid5,
+                set_idx: start.set_idx,
+                failed: f_total,
+                budget: 1,
+            });
+        }
 
         let strip = self.strip_bytes;
         let k = self.data_per_set;
@@ -505,11 +504,6 @@ impl LdRaid5 {
             return self.write_full_stripe(start.set_idx, start.in_chunklet_off, &positions, buf);
         }
 
-        // Partial write — pick the cheapest correct path given the failure
-        // pattern. check_writable already enforces F ≤ 1 above.
-        let f_data = self.failed_data_positions(start.set_idx).len();
-        let p_failed = self.parity_failed(start.set_idx);
-
         if f_data == 0 && p_failed {
             // Only parity is gone: skip parity entirely, write data direct.
             return self.write_data_only(start.set_idx, start.in_chunklet_off, &positions, buf);
@@ -539,10 +533,9 @@ impl LdRaid5 {
                 )
             }
         } else {
-            // F=1 data-failed (parity healthy by check_writable). RMW would
-            // need to read the failed PD's old data for delta computation
-            // when that position is in the modified set; RW handles it
-            // uniformly via reconstruct.
+            // F=1 data-failed (parity healthy). RMW would need to read the
+            // failed PD's old data for delta computation when that position
+            // is in the modified set; RW handles it uniformly via reconstruct.
             self.write_partial_stripe_rw(
                 start.set_idx,
                 start.in_chunklet_off,
@@ -774,31 +767,10 @@ impl LdRaid5 {
     }
 }
 
-/// XOR `src` into `dst` byte-wise. Both slices must have equal length.
-fn xor_into(dst: &mut [u8], src: &[u8]) {
-    debug_assert_eq!(dst.len(), src.len());
-    for i in 0..dst.len() {
-        dst[i] ^= src[i];
-    }
-}
-
 fn compute_strip_bytes(strip_size_log2: u8) -> u64 {
     if strip_size_log2 == 0 {
         BLOCK_SIZE
     } else {
         1u64 << strip_size_log2
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn xor_into_basic() {
-        let mut a = vec![0xff, 0x00, 0xaa];
-        let b = vec![0xf0, 0x0f, 0x55];
-        xor_into(&mut a, &b);
-        assert_eq!(a, vec![0x0f, 0x0f, 0xff]);
     }
 }

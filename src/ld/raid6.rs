@@ -272,21 +272,6 @@ impl LdRaid6 {
         self.members[self.member_idx_q(set_idx)].is_none()
     }
 
-    /// Reject writes to a set whose total failure count exceeds R6's
-    /// redundancy budget (2).
-    fn check_writable(&self, set_idx: usize) -> ChunkletResult<()> {
-        let f = self.failed_data_positions(set_idx).len()
-            + (self.parity_p_failed(set_idx) as usize)
-            + (self.parity_q_failed(set_idx) as usize);
-        if f > 2 {
-            return Err(ChunkletError::Invariant(format!(
-                "Raid6 set {} has {} failed members; cannot write (max 2)",
-                set_idx, f
-            )));
-        }
-        Ok(())
-    }
-
     /// Encode P from all K data strips at `in_chunklet_off`.
     pub fn encode_p_strip(
         &self,
@@ -635,7 +620,20 @@ impl LdRaid6 {
         start: StripeAddr,
         buf: &[u8],
     ) -> ChunkletResult<()> {
-        self.check_writable(start.set_idx)?;
+        // Compute failure pattern once and reuse for the F-budget check
+        // and the path dispatch below.
+        let f_data = self.failed_data_positions(start.set_idx).len();
+        let p_failed = self.parity_p_failed(start.set_idx);
+        let q_failed = self.parity_q_failed(start.set_idx);
+        let f_total = f_data + p_failed as usize + q_failed as usize;
+        if f_total > 2 {
+            return Err(ChunkletError::WriteRedundancyExceeded {
+                raid: RaidLevel::Raid6,
+                set_idx: start.set_idx,
+                failed: f_total,
+                budget: 2,
+            });
+        }
 
         let strip = self.strip_bytes;
         let k = self.data_per_set;
@@ -659,10 +657,6 @@ impl LdRaid6 {
         if is_full_stripe {
             return self.write_full_stripe(start.set_idx, start.in_chunklet_off, &positions, buf);
         }
-
-        let f_data = self.failed_data_positions(start.set_idx).len();
-        let p_failed = self.parity_p_failed(start.set_idx);
-        let q_failed = self.parity_q_failed(start.set_idx);
 
         if f_data == 0 && p_failed && q_failed {
             // Both parities gone (F=2): just write data, no parity work.

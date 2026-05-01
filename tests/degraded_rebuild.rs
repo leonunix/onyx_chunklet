@@ -2,43 +2,13 @@
 //! verify degraded reads succeed via reconstruct, then `Pool::rebuild_ld`
 //! restores full redundancy and post-rebuild reads still match.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+mod common;
 
-use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::ChunkletState;
-use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
-const PD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
-
-fn make_pool(dir: &TempDir, n: usize) -> (Arc<Pool>, Vec<PathBuf>) {
-    let mut raws = Vec::new();
-    let mut paths = Vec::new();
-    for i in 0..n {
-        let p = dir.path().join(format!("pd{}", i));
-        raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
-        paths.push(p);
-    }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0 }).unwrap();
-    (pool, paths)
-}
-
-fn open_subset(paths: &[PathBuf], drop_idx: &[usize]) -> Arc<Pool> {
-    let raws: Vec<_> = paths
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !drop_idx.contains(i))
-        .map(|(_, p)| RawDevice::open(p).unwrap())
-        .collect();
-    Pool::open_with_missing(raws).unwrap()
-}
-
-fn open_full(paths: &[PathBuf]) -> Arc<Pool> {
-    let raws: Vec<_> = paths.iter().map(|p| RawDevice::open(p).unwrap()).collect();
-    Pool::open(raws).unwrap()
-}
+use common::{make_pool, open_full, open_subset};
 
 // ------ Mirror RAID-1 ------------------------------------------------------
 

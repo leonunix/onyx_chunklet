@@ -7,53 +7,16 @@
 //! against a degraded set, read every byte back through the LD trait —
 //! reconstruct paths surface any parity mismatch.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+mod common;
 
-use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::pool::LdSpec;
-use onyx_chunklet::{Pool, PoolConfig};
+use onyx_chunklet::types::RaidLevel;
+use onyx_chunklet::ChunkletError;
 use tempfile::TempDir;
 
-const PD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+use common::{make_pool, open_full, open_subset, path_for_member};
+
 const STRIP: usize = 4096;
-
-fn make_pool(dir: &TempDir, n: usize) -> (Arc<Pool>, Vec<PathBuf>) {
-    let mut raws = Vec::new();
-    let mut paths = Vec::new();
-    for i in 0..n {
-        let p = dir.path().join(format!("pd{}", i));
-        raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
-        paths.push(p);
-    }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0 }).unwrap();
-    (pool, paths)
-}
-
-fn open_subset(paths: &[PathBuf], drop_idx: &[usize]) -> Arc<Pool> {
-    let raws: Vec<_> = paths
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !drop_idx.contains(i))
-        .map(|(_, p)| RawDevice::open(p).unwrap())
-        .collect();
-    Pool::open_with_missing(raws).unwrap()
-}
-
-fn open_full(paths: &[PathBuf]) -> Arc<Pool> {
-    let raws: Vec<_> = paths.iter().map(|p| RawDevice::open(p).unwrap()).collect();
-    Pool::open(raws).unwrap()
-}
-
-/// Locate the path holding the LD member at `member_idx`.
-fn path_for_member(pool: &Pool, paths: &[PathBuf], member_idx: usize) -> usize {
-    let desc = pool.list_lds().into_iter().next().unwrap();
-    let pd_id = desc.members[member_idx].pd;
-    paths
-        .iter()
-        .position(|p| pool.pd(pd_id).unwrap().path() == p)
-        .unwrap()
-}
 
 /// Deterministic per-byte pattern keyed by `tag` so different fills produce
 /// distinct byte sequences across a single LD.
@@ -179,8 +142,14 @@ fn r5_two_failures_reject_write() {
     let ld = pool.open_ld(ld_id).unwrap();
     let buf = vec![0u8; STRIP];
     let err = ld.write_at(0, &buf).err().expect("write should fail with F=2");
-    let msg = format!("{}", err);
-    assert!(msg.contains("max 1"), "wrong error: {}", msg);
+    match err {
+        ChunkletError::WriteRedundancyExceeded { raid, failed, budget, .. } => {
+            assert_eq!(raid, RaidLevel::Raid5);
+            assert_eq!(failed, 2);
+            assert_eq!(budget, 1);
+        }
+        other => panic!("wrong error variant: {:?}", other),
+    }
 }
 
 /// R5 healthy: RW path (M=2 of K=3, full-strip) must produce parity
@@ -361,8 +330,14 @@ fn r6_three_failures_reject_write() {
     let ld = pool.open_ld(ld_id).unwrap();
     let buf = vec![0u8; STRIP];
     let err = ld.write_at(0, &buf).err().expect("write should fail with F=3");
-    let msg = format!("{}", err);
-    assert!(msg.contains("max 2"), "wrong error: {}", msg);
+    match err {
+        ChunkletError::WriteRedundancyExceeded { raid, failed, budget, .. } => {
+            assert_eq!(raid, RaidLevel::Raid6);
+            assert_eq!(failed, 3);
+            assert_eq!(budget, 2);
+        }
+        other => panic!("wrong error variant: {:?}", other),
+    }
 }
 
 /// R6 healthy RW path: M=2 of K=3, full-strip → (K-M)=1 < (M+2)=4 → RW.
