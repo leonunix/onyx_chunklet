@@ -72,10 +72,15 @@ pub fn mul(a: u8, b: u8) -> u8 {
     t.antilog[i]
 }
 
-/// Multiplicative inverse in GF(2^8). Caller must ensure `a != 0`.
+/// Multiplicative inverse in GF(2^8). Panics if `a == 0` (the operation is
+/// undefined in the field). Release builds panic too — silently returning a
+/// bogus value would let an upstream invariant violation produce wrong
+/// reconstruct math without any signal.
 #[inline]
 pub fn inv(a: u8) -> u8 {
-    debug_assert!(a != 0);
+    if a == 0 {
+        panic!("gf256::inv(0) is undefined");
+    }
     let t = tables();
     t.antilog[(255 - t.log[a as usize] as usize) % 255]
 }
@@ -164,6 +169,15 @@ mod tests {
         }
         // g^255 wraps to g^0 = 1
         assert_eq!(g_pow(255), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "gf256::inv(0)")]
+    fn inv_zero_panics() {
+        // Defensive: release-mode panic too. inv(0) is undefined and any
+        // hit means an upstream invariant violation that mustn't be
+        // silently papered over.
+        let _ = inv(0);
     }
 
     #[test]
