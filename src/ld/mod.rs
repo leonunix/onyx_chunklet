@@ -30,9 +30,64 @@ pub use raid6::LdRaid6;
 
 use std::sync::Arc;
 
-use crate::error::ChunkletResult;
+use crate::error::{ChunkletError, ChunkletResult};
 use crate::pd::PhysicalDisk;
 use crate::types::LdId;
+
+/// One PD-level write prepared by an LD. The lifetime ties `data` to whatever
+/// buffer the caller owns; `parallel_strip_writes` runs entirely within a
+/// scoped thread so it never escapes the caller's stack.
+pub(crate) struct StripWrite<'a> {
+    pub pd: Arc<PhysicalDisk>,
+    pub chunklet_index: u32,
+    pub in_chunklet_off: u64,
+    pub data: &'a [u8],
+}
+
+/// Issue every write in `writes` concurrently, blocking until all complete.
+///
+/// Uses `std::thread::scope` so each PD's `pwrite` runs on its own thread —
+/// for K+1 (R5) or K+2 (R6) members this means parity + data strips fan out
+/// in parallel. Returns the first error seen (others are dropped). For 0 or
+/// 1 entries we skip the spawn overhead entirely.
+///
+/// Phase 8b will replace this with a batched io_uring submit; the call shape
+/// stays the same so callers don't need to know which backend they're on.
+pub(crate) fn parallel_strip_writes(writes: Vec<StripWrite<'_>>) -> ChunkletResult<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    if writes.len() == 1 {
+        let w = &writes[0];
+        return w
+            .pd
+            .write_chunklet_user(w.chunklet_index, w.in_chunklet_off, w.data);
+    }
+    std::thread::scope(|s| -> ChunkletResult<()> {
+        let handles: Vec<_> = writes
+            .iter()
+            .map(|w| {
+                let pd = w.pd.clone();
+                let idx = w.chunklet_index;
+                let off = w.in_chunklet_off;
+                let data = w.data;
+                s.spawn(move || pd.write_chunklet_user(idx, off, data))
+            })
+            .collect();
+        let mut first_err: Option<ChunkletError> = None;
+        for h in handles {
+            match h.join().expect("strip-write worker panicked") {
+                Ok(()) => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    })
+}
 
 /// Public interface every LD implementation exposes.
 pub trait LogicalDisk: Send + Sync {

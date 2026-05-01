@@ -14,13 +14,37 @@
 //!
 //! # Write paths
 //!
-//! - **Full-stripe**: P + Q encoded directly from new data; K + 2 writes.
-//! - **Partial RMW**: per touched data position i,
-//!     `delta = old_D_i ⊕ new_D_i`
-//!     `delta_P ⊕= delta`
-//!     `delta_Q ⊕= g^i · delta`
-//!   then `new_P = old_P ⊕ delta_P`, `new_Q = old_Q ⊕ delta_Q`. Reads:
-//!   M old data + old P + old Q. Writes: M new data + new P + new Q.
+//! All write fan-outs go through `parallel_strip_writes`, which spawns one
+//! thread per surviving member (K+2 strips on a healthy R6 set). Three
+//! sub-paths feed it:
+//!
+//! - **Full-stripe**: P + Q encoded directly from new data; up to K+2
+//!   writes (skips writes to failed PDs in degraded mode). No reads.
+//! - **Partial RMW**: `delta_P ⊕= old_D_i ⊕ new_D_i`,
+//!   `delta_Q ⊕= g^i · (old_D_i ⊕ new_D_i)`; new P/Q = old XOR delta.
+//!   Costs M+2 reads, M+2 writes. Healthy-set only — degraded sets always
+//!   take RW because RMW can't compute correct parity when a modified
+//!   position sits on a failed PD, and can't read old P/Q when a parity is
+//!   gone.
+//! - **Partial RW** (reconstruct-write): materialize all K new strips
+//!   (read unmodified, reconstruct unmodified-failed via available parity,
+//!   copy modified bytes), recompute P + Q from scratch, write modified
+//!   data + parities. Costs K-M reads + M+2 writes. Used when:
+//!     * `(K-M) < (M+2)` and all modified positions are full-strip aligned
+//!       (the threshold where RW beats RMW), OR
+//!     * the set is degraded with at least one data position failed.
+//!
+//! Degraded write tolerates **F ≤ 2** failed members (any combination of
+//! data + parity).
+//! - F=2 P+Q both failed: short-circuit to data-only write (no parity
+//!   computation).
+//! - F=1 with one parity gone: RW computes both parities, writes only the
+//!   surviving one.
+//! - F=2 with one data + one parity gone: RW reconstructs the missing data
+//!   via the surviving parity (P → XOR formula; Q → g^(-x) · (Q ⊕ Σ
+//!   g^i·D_i)); writes the surviving parity.
+//! - F=2 with two data gone: RW reconstructs both via `reconstruct_two_data`.
+//! - F ≥ 3: rejected.
 //!
 //! # Reconstruct (used by Phase 5 degraded reads)
 //!
@@ -38,13 +62,13 @@
 //! - **1 data + parity** missing: rebuild data from the surviving parity, then
 //!   re-encode the missing parity. Implemented as two passes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256;
-use crate::ld::{resolve_members, LogicalDisk};
+use crate::ld::{parallel_strip_writes, resolve_members, LogicalDisk, StripWrite};
 use crate::pd::PhysicalDisk;
 use crate::types::{
     LdId, LdRole, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
@@ -219,19 +243,6 @@ impl LdRaid6 {
         pd.read_chunklet_user(chunklet_idx, in_chunklet_off, bytes)
     }
 
-    fn write_data_strip(
-        &self,
-        set_idx: usize,
-        data_pos: usize,
-        in_chunklet_off: u64,
-        bytes: &[u8],
-    ) -> ChunkletResult<()> {
-        let m = self.member_idx_data(set_idx, data_pos);
-        let pd = self.member_pd(m)?;
-        let chunklet_idx = self.desc.members[m].chunklet_index;
-        pd.write_chunklet_user(chunklet_idx, in_chunklet_off, bytes)
-    }
-
     fn read_p(&self, set_idx: usize, off: u64, bytes: &mut [u8]) -> ChunkletResult<()> {
         let m = self.member_idx_p(set_idx);
         let pd = self.member_pd(m)?;
@@ -246,25 +257,34 @@ impl LdRaid6 {
         pd.read_chunklet_user(chunklet_idx, off, bytes)
     }
 
-    fn write_p(&self, set_idx: usize, off: u64, bytes: &[u8]) -> ChunkletResult<()> {
-        let m = self.member_idx_p(set_idx);
-        let pd = self.member_pd(m)?;
-        let chunklet_idx = self.desc.members[m].chunklet_index;
-        pd.write_chunklet_user(chunklet_idx, off, bytes)
-    }
-
-    fn write_q(&self, set_idx: usize, off: u64, bytes: &[u8]) -> ChunkletResult<()> {
-        let m = self.member_idx_q(set_idx);
-        let pd = self.member_pd(m)?;
-        let chunklet_idx = self.desc.members[m].chunklet_index;
-        pd.write_chunklet_user(chunklet_idx, off, bytes)
-    }
-
     /// Indices of failed data positions in the given set (subset of 0..K).
     fn failed_data_positions(&self, set_idx: usize) -> Vec<usize> {
         (0..self.data_per_set)
             .filter(|&pos| self.members[self.member_idx_data(set_idx, pos)].is_none())
             .collect()
+    }
+
+    fn parity_p_failed(&self, set_idx: usize) -> bool {
+        self.members[self.member_idx_p(set_idx)].is_none()
+    }
+
+    fn parity_q_failed(&self, set_idx: usize) -> bool {
+        self.members[self.member_idx_q(set_idx)].is_none()
+    }
+
+    /// Reject writes to a set whose total failure count exceeds R6's
+    /// redundancy budget (2).
+    fn check_writable(&self, set_idx: usize) -> ChunkletResult<()> {
+        let f = self.failed_data_positions(set_idx).len()
+            + (self.parity_p_failed(set_idx) as usize)
+            + (self.parity_q_failed(set_idx) as usize);
+        if f > 2 {
+            return Err(ChunkletError::Invariant(format!(
+                "Raid6 set {} has {} failed members; cannot write (max 2)",
+                set_idx, f
+            )));
+        }
+        Ok(())
     }
 
     /// Encode P from all K data strips at `in_chunklet_off`.
@@ -379,6 +399,90 @@ impl LdRaid6 {
         Ok(())
     }
 
+    /// Reconstruct one missing data position via Q (used when P is the
+    /// missing parity).
+    ///
+    /// `Q = Σ g^i · D_i` ⇒  `g^x · D_x = Q ⊕ Σ_{i≠x} g^i · D_i`
+    /// ⇒  `D_x = g^(-x) · (Q ⊕ Σ_{i≠x} g^i · D_i)`
+    pub fn reconstruct_one_data_via_q(
+        &self,
+        set_idx: usize,
+        missing_data_pos: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        if missing_data_pos >= self.data_per_set {
+            return Err(ChunkletError::Invariant(format!(
+                "missing_data_pos {} >= data_per_set {}",
+                missing_data_pos, self.data_per_set
+            )));
+        }
+        self.read_q(set_idx, in_chunklet_off, out)?;
+        let mut tmp = vec![0u8; out.len()];
+        for pos in 0..self.data_per_set {
+            if pos == missing_data_pos {
+                continue;
+            }
+            self.read_data_strip(set_idx, pos, in_chunklet_off, &mut tmp)?;
+            gf256::mul_xor_into(out, &tmp, gf256::g_pow(pos));
+        }
+        // out now = g^x · D_x; multiply by g^(-x) = inv(g^x).
+        let g_neg_x = gf256::inv(gf256::g_pow(missing_data_pos));
+        for byte in out.iter_mut() {
+            *byte = gf256::mul(*byte, g_neg_x);
+        }
+        Ok(())
+    }
+
+    /// Reconstruct one unmodified-failed data position. Picks the cheapest
+    /// surviving parity (P preferred over Q since XOR is cheaper than the
+    /// Q-based formula). Used by the partial-stripe RW write path when
+    /// computing new parity needs the old value of a failed PD's strip.
+    fn reconstruct_unmodified_data(
+        &self,
+        set_idx: usize,
+        missing_data_pos: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        let failed = self.failed_data_positions(set_idx);
+        let p_ok = !self.parity_p_failed(set_idx);
+        let q_ok = !self.parity_q_failed(set_idx);
+
+        if failed.len() == 2 {
+            // Both data losses share this set — single-parity reconstruct
+            // can't isolate them. Use the PQ system (needs both parities).
+            if !(p_ok && q_ok) {
+                return Err(ChunkletError::Invariant(format!(
+                    "Raid6 set {}: 2 data losses + parity loss exceeds redundancy",
+                    set_idx
+                )));
+            }
+            let (x, y) = (failed[0], failed[1]);
+            let (dx, dy) = self.reconstruct_two_data(set_idx, x, y, in_chunklet_off, out.len())?;
+            if missing_data_pos == x {
+                out.copy_from_slice(&dx);
+            } else if missing_data_pos == y {
+                out.copy_from_slice(&dy);
+            } else {
+                return Err(ChunkletError::Invariant(format!(
+                    "reconstruct_unmodified_data pos {} not in failed set {:?}",
+                    missing_data_pos, failed
+                )));
+            }
+            Ok(())
+        } else if p_ok {
+            self.reconstruct_one_data(set_idx, missing_data_pos, in_chunklet_off, out)
+        } else if q_ok {
+            self.reconstruct_one_data_via_q(set_idx, missing_data_pos, in_chunklet_off, out)
+        } else {
+            Err(ChunkletError::Invariant(format!(
+                "Raid6 set {}: cannot reconstruct (no surviving parity)",
+                set_idx
+            )))
+        }
+    }
+
     /// Reconstruct two missing data positions x < y via the PQ system.
     /// Outputs `(D_x, D_y)`.
     pub fn reconstruct_two_data(
@@ -473,38 +577,24 @@ impl LogicalDisk for LdRaid6 {
             let addr = self.locate(cursor);
             let strip_remain = self.strip_bytes - addr.in_strip_off;
             let take = std::cmp::min(remaining as u64, strip_remain) as usize;
-            // Are we reading a failed data position? If so, dispatch to the
-            // 1- or 2-failure reconstruct path.
+            // Are we reading a failed data position? If so, route through
+            // `reconstruct_unmodified_data`, which picks the cheapest
+            // surviving parity (P preferred, falls back to Q when P is
+            // also down) and dispatches to the 1- or 2-failure formula.
             let failed = self.failed_data_positions(addr.set_idx);
             if failed.contains(&addr.data_pos) {
                 let strip_len = self.strip_bytes as usize;
                 let strip_base = addr.in_chunklet_off - addr.in_strip_off;
-                if failed.len() == 1 {
-                    let mut tmp = vec![0u8; strip_len];
-                    self.reconstruct_one_data(
-                        addr.set_idx,
-                        addr.data_pos,
-                        strip_base,
-                        &mut tmp,
-                    )?;
-                    buf[buf_start..buf_start + take].copy_from_slice(
-                        &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
-                    );
-                } else if failed.len() == 2 {
-                    let (x, y) = (failed[0], failed[1]);
-                    let (dx, dy) =
-                        self.reconstruct_two_data(addr.set_idx, x, y, strip_base, strip_len)?;
-                    let want = if addr.data_pos == x { dx } else { dy };
-                    buf[buf_start..buf_start + take].copy_from_slice(
-                        &want[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
-                    );
-                } else {
-                    return Err(ChunkletError::Invariant(format!(
-                        "Raid6 set {} has {} failed data positions (>2), unrecoverable",
-                        addr.set_idx,
-                        failed.len()
-                    )));
-                }
+                let mut tmp = vec![0u8; strip_len];
+                self.reconstruct_unmodified_data(
+                    addr.set_idx,
+                    addr.data_pos,
+                    strip_base,
+                    &mut tmp,
+                )?;
+                buf[buf_start..buf_start + take].copy_from_slice(
+                    &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
+                );
             } else {
                 self.read_data_strip(
                     addr.set_idx,
@@ -545,6 +635,8 @@ impl LdRaid6 {
         start: StripeAddr,
         buf: &[u8],
     ) -> ChunkletResult<()> {
+        self.check_writable(start.set_idx)?;
+
         let strip = self.strip_bytes;
         let k = self.data_per_set;
         let mut positions: Vec<(usize, u64, std::ops::Range<usize>)> = Vec::with_capacity(k);
@@ -564,15 +656,57 @@ impl LdRaid6 {
             && positions.iter().all(|(_p, off, range)| {
                 *off == 0 && (range.end - range.start) as u64 == strip
             });
-
         if is_full_stripe {
-            self.write_full_stripe(start.set_idx, start.in_chunklet_off, &positions, buf)?;
-        } else {
-            self.write_partial_stripe(start.set_idx, start.in_chunklet_off, &positions, buf)?;
+            return self.write_full_stripe(start.set_idx, start.in_chunklet_off, &positions, buf);
         }
-        Ok(())
+
+        let f_data = self.failed_data_positions(start.set_idx).len();
+        let p_failed = self.parity_p_failed(start.set_idx);
+        let q_failed = self.parity_q_failed(start.set_idx);
+
+        if f_data == 0 && p_failed && q_failed {
+            // Both parities gone (F=2): just write data, no parity work.
+            return self.write_data_only(start.set_idx, start.in_chunklet_off, &positions, buf);
+        }
+
+        let healthy = f_data == 0 && !p_failed && !q_failed;
+        if healthy {
+            // RMW vs RW based on M-vs-K threshold (RW only when all
+            // modifications are full-strip; sub-strip mods make RW pay
+            // for gap-fill reads that wipe out the win).
+            let m = positions.len();
+            let all_full_strip = positions.iter().all(|(_p, off, range)| {
+                *off == 0 && (range.end - range.start) as u64 == strip
+            });
+            if all_full_strip && (k - m) < (m + 2) {
+                self.write_partial_stripe_rw(
+                    start.set_idx,
+                    start.in_chunklet_off,
+                    &positions,
+                    buf,
+                )
+            } else {
+                self.write_partial_stripe_rmw(
+                    start.set_idx,
+                    start.in_chunklet_off,
+                    &positions,
+                    buf,
+                )
+            }
+        } else {
+            // Any failure: unified RW handles all sub-cases (single
+            // surviving parity, single missing data, two missing data).
+            self.write_partial_stripe_rw(
+                start.set_idx,
+                start.in_chunklet_off,
+                &positions,
+                buf,
+            )
+        }
     }
 
+    /// Fan out one write per surviving member, computed from the new data.
+    /// Skips writes to failed PDs (degraded fast path).
     fn write_full_stripe(
         &self,
         set_idx: usize,
@@ -585,16 +719,72 @@ impl LdRaid6 {
         let mut q = vec![0u8; strip];
         for (pos, _off, range) in positions {
             let data = &buf[range.clone()];
-            self.write_data_strip(set_idx, *pos, in_chunklet_off, data)?;
             gf256::xor_into(&mut p, data);
             gf256::mul_xor_into(&mut q, data, gf256::g_pow(*pos));
         }
-        self.write_p(set_idx, in_chunklet_off, &p)?;
-        self.write_q(set_idx, in_chunklet_off, &q)?;
-        Ok(())
+
+        let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 2);
+        for (pos, _off, range) in positions {
+            let m = self.member_idx_data(set_idx, *pos);
+            if let Some(pd) = &self.members[m] {
+                ops.push(StripWrite {
+                    pd: pd.clone(),
+                    chunklet_index: self.desc.members[m].chunklet_index,
+                    in_chunklet_off,
+                    data: &buf[range.clone()],
+                });
+            }
+        }
+        let pm = self.member_idx_p(set_idx);
+        if let Some(pd) = &self.members[pm] {
+            ops.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[pm].chunklet_index,
+                in_chunklet_off,
+                data: &p,
+            });
+        }
+        let qm = self.member_idx_q(set_idx);
+        if let Some(pd) = &self.members[qm] {
+            ops.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[qm].chunklet_index,
+                in_chunklet_off,
+                data: &q,
+            });
+        }
+        parallel_strip_writes(ops)
     }
 
-    fn write_partial_stripe(
+    /// F=2 P+Q failed fast path: skip both parities, write data only.
+    /// Zero reads, ≤K writes. Both parities recovered later by rebuild.
+    fn write_data_only(
+        &self,
+        set_idx: usize,
+        in_chunklet_off: u64,
+        positions: &[(usize, u64, std::ops::Range<usize>)],
+        buf: &[u8],
+    ) -> ChunkletResult<()> {
+        let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len());
+        for (pos, _off, range) in positions {
+            let m = self.member_idx_data(set_idx, *pos);
+            let pd = self.members[m].as_ref().expect(
+                "write_data_only invariant: data PDs must be healthy when both parities are failed",
+            );
+            ops.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[m].chunklet_index,
+                in_chunklet_off,
+                data: &buf[range.clone()],
+            });
+        }
+        parallel_strip_writes(ops)
+    }
+
+    /// Read-modify-write: per touched data position compute deltas for P
+    /// and Q, apply to old P/Q, write modified data + new P + new Q.
+    /// Healthy-set only (needs old data, P, Q all readable).
+    fn write_partial_stripe_rmw(
         &self,
         set_idx: usize,
         in_chunklet_off: u64,
@@ -625,12 +815,152 @@ impl LdRaid6 {
         gf256::xor_into(&mut p, &delta_p);
         gf256::xor_into(&mut q, &delta_q);
 
+        let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 2);
         for (pos, _off, range) in positions {
-            self.write_data_strip(set_idx, *pos, in_chunklet_off, &buf[range.clone()])?;
+            let m = self.member_idx_data(set_idx, *pos);
+            let pd = self.members[m]
+                .as_ref()
+                .expect("RMW path requires all data PDs healthy");
+            ops.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[m].chunklet_index,
+                in_chunklet_off,
+                data: &buf[range.clone()],
+            });
         }
-        self.write_p(set_idx, in_chunklet_off, &p)?;
-        self.write_q(set_idx, in_chunklet_off, &q)?;
-        Ok(())
+        let pm = self.member_idx_p(set_idx);
+        let pd_p = self.members[pm]
+            .as_ref()
+            .expect("RMW path requires P healthy");
+        ops.push(StripWrite {
+            pd: pd_p.clone(),
+            chunklet_index: self.desc.members[pm].chunklet_index,
+            in_chunklet_off,
+            data: &p,
+        });
+        let qm = self.member_idx_q(set_idx);
+        let pd_q = self.members[qm]
+            .as_ref()
+            .expect("RMW path requires Q healthy");
+        ops.push(StripWrite {
+            pd: pd_q.clone(),
+            chunklet_index: self.desc.members[qm].chunklet_index,
+            in_chunklet_off,
+            data: &q,
+        });
+        parallel_strip_writes(ops)
+    }
+
+    /// Reconstruct-write: build full new strips for every data position
+    /// (read unmodified, reconstruct unmodified-failed via available
+    /// parity, copy modified bytes), recompute P + Q from scratch, write
+    /// modified data + parities. Skips writes to failed PDs.
+    ///
+    /// Handles every degraded sub-case the redundancy budget allows
+    /// (F ≤ 2 with at least one parity surviving). Caller routes the
+    /// double-parity-failed case to `write_data_only`.
+    fn write_partial_stripe_rw(
+        &self,
+        set_idx: usize,
+        in_chunklet_off: u64,
+        positions: &[(usize, u64, std::ops::Range<usize>)],
+        buf: &[u8],
+    ) -> ChunkletResult<()> {
+        let strip = self.strip_bytes as usize;
+        let k = self.data_per_set;
+
+        let modified_map: HashMap<usize, (u64, std::ops::Range<usize>)> = positions
+            .iter()
+            .map(|(p, off, r)| (*p, (*off, r.clone())))
+            .collect();
+
+        let mut new_strips: Vec<Vec<u8>> = (0..k).map(|_| vec![0u8; strip]).collect();
+        for pos in 0..k {
+            let pd_failed = self.members[self.member_idx_data(set_idx, pos)].is_none();
+            match modified_map.get(&pos) {
+                Some((off, range)) => {
+                    let new_data = &buf[range.clone()];
+                    let off = *off as usize;
+                    let len = new_data.len();
+                    if off == 0 && len == strip {
+                        new_strips[pos].copy_from_slice(new_data);
+                    } else {
+                        if pd_failed {
+                            self.reconstruct_unmodified_data(
+                                set_idx,
+                                pos,
+                                in_chunklet_off,
+                                &mut new_strips[pos],
+                            )?;
+                        } else {
+                            self.read_data_strip(
+                                set_idx,
+                                pos,
+                                in_chunklet_off,
+                                &mut new_strips[pos],
+                            )?;
+                        }
+                        new_strips[pos][off..off + len].copy_from_slice(new_data);
+                    }
+                }
+                None => {
+                    if pd_failed {
+                        self.reconstruct_unmodified_data(
+                            set_idx,
+                            pos,
+                            in_chunklet_off,
+                            &mut new_strips[pos],
+                        )?;
+                    } else {
+                        self.read_data_strip(
+                            set_idx,
+                            pos,
+                            in_chunklet_off,
+                            &mut new_strips[pos],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let mut p = vec![0u8; strip];
+        let mut q = vec![0u8; strip];
+        for (i, s) in new_strips.iter().enumerate() {
+            gf256::xor_into(&mut p, s);
+            gf256::mul_xor_into(&mut q, s, gf256::g_pow(i));
+        }
+
+        let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 2);
+        for (pos, _off, range) in positions {
+            let m = self.member_idx_data(set_idx, *pos);
+            if let Some(pd) = &self.members[m] {
+                ops.push(StripWrite {
+                    pd: pd.clone(),
+                    chunklet_index: self.desc.members[m].chunklet_index,
+                    in_chunklet_off,
+                    data: &buf[range.clone()],
+                });
+            }
+        }
+        let pm = self.member_idx_p(set_idx);
+        if let Some(pd) = &self.members[pm] {
+            ops.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[pm].chunklet_index,
+                in_chunklet_off,
+                data: &p,
+            });
+        }
+        let qm = self.member_idx_q(set_idx);
+        if let Some(pd) = &self.members[qm] {
+            ops.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[qm].chunklet_index,
+                in_chunklet_off,
+                data: &q,
+            });
+        }
+        parallel_strip_writes(ops)
     }
 }
 
