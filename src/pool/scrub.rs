@@ -36,6 +36,11 @@ pub struct ScrubReport {
     pub batches_checked: u64,
     pub mismatches: Vec<ScrubMismatch>,
     pub marked_bad: usize,
+    /// Sets that scrub skipped because a redundancy member was missing
+    /// (Failed PD or Bad chunklet). Without this counter, the scrub of a
+    /// fully-degraded LD reads as "0 batches checked, 0 mismatches" — the
+    /// operator can't tell whether the LD is healthy or just unscrubbable.
+    pub sets_skipped_degraded: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +87,7 @@ impl Pool {
             batches_checked: 0,
             mismatches: Vec::new(),
             marked_bad: 0,
+            sets_skipped_degraded: 0,
         };
 
         match desc.raid_level {
@@ -150,7 +156,13 @@ impl Pool {
                 }
                 report.batches_checked += 1;
                 if copies.len() < 2 {
-                    continue; // need at least 2 alive copies to compare
+                    // Need at least 2 alive copies to compare. Bump
+                    // skipped-degraded once per set (not per batch);
+                    // we only care about whether this set was scrubbable.
+                    if batch_n == 0 {
+                        report.sets_skipped_degraded += 1;
+                    }
+                    continue;
                 }
                 // Find the most common value pattern (by byte equality).
                 let mut counts: Vec<usize> = vec![1; copies.len()];
@@ -210,9 +222,12 @@ impl Pool {
         for set_idx in 0..n_sets {
             let base = set_idx * n;
             // Need parity + all data alive to do the comparison. If anything's
-            // already dead, skip — rebuild handles those.
+            // already dead, skip — rebuild handles those. Bump
+            // sets_skipped_degraded so the report distinguishes
+            // "scrub clean" from "scrub couldn't run".
             let parity_member = &desc.members[base + k];
             if pds_snapshot.get(&parity_member.pd).is_none() {
+                report.sets_skipped_degraded += 1;
                 continue;
             }
             let mut data_pds = Vec::with_capacity(k);
@@ -228,6 +243,7 @@ impl Pool {
                 }
             }
             if !all_alive {
+                report.sets_skipped_degraded += 1;
                 continue;
             }
 
@@ -290,6 +306,7 @@ impl Pool {
             if pds_snapshot.get(&p_member.pd).is_none()
                 || pds_snapshot.get(&q_member.pd).is_none()
             {
+                report.sets_skipped_degraded += 1;
                 continue;
             }
             let mut data_pds = Vec::with_capacity(k);
@@ -305,6 +322,7 @@ impl Pool {
                 }
             }
             if !all_alive {
+                report.sets_skipped_degraded += 1;
                 continue;
             }
 

@@ -10,6 +10,16 @@ use onyx_chunklet::types::ChunkletState;
 use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
+fn open_subset(paths: &[PathBuf], drop_idx: &[usize]) -> Arc<Pool> {
+    let raws: Vec<_> = paths
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !drop_idx.contains(i))
+        .map(|(_, p)| RawDevice::open(p).unwrap())
+        .collect();
+    Pool::open_with_missing(raws).unwrap()
+}
+
 const PD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
 fn make_pool(dir: &TempDir, n: usize) -> (Arc<Pool>, Vec<PathBuf>) {
@@ -189,4 +199,71 @@ fn plain_scrub_no_op() {
     let report = pool.scrub_ld(id).unwrap();
     assert!(report.mismatches.is_empty());
     assert_eq!(report.marked_bad, 0);
+}
+
+/// Regression: scrub used to silently `continue` past sets with a missing
+/// member, returning report.mismatches=[] which read like "all clean".
+/// `sets_skipped_degraded` now counts those skips so the operator can see
+/// the LD is degraded and the scrub didn't cover it.
+#[test]
+fn raid5_scrub_reports_skipped_when_data_member_missing() {
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &vec![0xc3_u8; 12 * 4096]).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    // Drop a data PD (member 0).
+    let drop_pd = desc.members[0].pd;
+    let drop_idx = paths
+        .iter()
+        .position(|p| pool.pd(drop_pd).unwrap().path() == p)
+        .unwrap();
+    drop(pool);
+
+    let pool_deg = open_subset(&paths, &[drop_idx]);
+    let report = pool_deg.scrub_ld(id).unwrap();
+    assert!(report.mismatches.is_empty(), "no actual mismatch expected");
+    assert!(
+        report.sets_skipped_degraded > 0,
+        "scrub must surface degraded sets that it skipped"
+    );
+}
+
+#[test]
+fn raid6_scrub_reports_skipped_when_p_missing() {
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &vec![0xa1_u8; 12 * 4096]).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let p_member = desc.members[3]; // P slot
+    let drop_idx = paths
+        .iter()
+        .position(|p| pool.pd(p_member.pd).unwrap().path() == p)
+        .unwrap();
+    drop(pool);
+
+    let pool_deg = open_subset(&paths, &[drop_idx]);
+    let report = pool_deg.scrub_ld(id).unwrap();
+    assert!(report.mismatches.is_empty());
+    assert!(report.sets_skipped_degraded > 0);
+}
+
+#[test]
+fn raid5_scrub_clean_set_does_not_skip() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &vec![0x44_u8; 12 * 4096]).unwrap();
+    drop(ld);
+    let report = pool.scrub_ld(id).unwrap();
+    assert_eq!(report.sets_skipped_degraded, 0);
+    assert!(report.mismatches.is_empty());
 }
