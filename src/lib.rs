@@ -27,7 +27,7 @@ pub mod superblock;
 pub mod types;
 
 pub use error::{ChunkletError, ChunkletResult};
-pub use ld::{LdDescriptor, LdList, LdPlain, LogicalDisk};
+pub use ld::{LdDescriptor, LdList, LdMirror, LdPlain, LogicalDisk};
 pub use pd::PhysicalDisk;
 pub use pool::{Pool, PoolConfig};
 pub use types::{

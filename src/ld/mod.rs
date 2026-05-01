@@ -14,9 +14,11 @@
 //!   races with member-set mutations.
 
 pub mod descriptor;
+pub mod mirror;
 pub mod plain;
 
 pub use descriptor::{LdDescriptor, LdList};
+pub use mirror::LdMirror;
 pub use plain::LdPlain;
 
 use std::sync::Arc;

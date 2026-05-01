@@ -118,12 +118,13 @@ fn drop_ld_frees_chunklets() {
 }
 
 #[test]
-fn rejects_non_plain_levels() {
+fn rejects_unimplemented_raid_levels() {
     let dir = TempDir::new().unwrap();
-    let (pool, _paths) = make_pool(&dir, &["pd0", "pd1", "pd2"]);
+    let (pool, _paths) = make_pool(&dir, &["pd0", "pd1", "pd2", "pd3"]);
+    // Raid5 / Raid6 not implemented until P3 / P4.
     let spec = LdSpec {
-        raid_level: RaidLevel::Mirror,
-        set_size: 2,
+        raid_level: RaidLevel::Raid5,
+        set_size: 4,
         row_size: 1,
         num_rows: 1,
         strip_size_log2: 0,

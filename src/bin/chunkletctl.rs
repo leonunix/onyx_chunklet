@@ -98,6 +98,23 @@ enum LdOp {
         #[arg(long)]
         chunklets: u16,
     },
+    /// Create a Mirror LD (RAID-1 with copies=N, row=1; RAID-10 with row>1).
+    CreateMirror {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// Mirror copies per set (>= 2).
+        #[arg(long, default_value_t = 2)]
+        copies: u8,
+        /// Number of mirror sets striped within one row.
+        #[arg(long, default_value_t = 1)]
+        row_size: u16,
+        /// Number of stripe rows (capacity multiplier).
+        #[arg(long, default_value_t = 1)]
+        rows: u16,
+        /// Strip size as log2 bytes; 0 = 4 KiB block.
+        #[arg(long, default_value_t = 0)]
+        strip_log2: u8,
+    },
     /// List all LDs on the pool.
     List {
         #[arg(long, required = true, value_delimiter = ',')]
@@ -198,6 +215,23 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             let pool = Pool::open(raws)?;
             let id = pool.create_ld(LdSpec::plain(chunklets))?;
             println!("created LD {} (Plain, {} chunklets)", id, chunklets);
+            print_ld_table(&pool);
+            Ok(())
+        }
+        LdOp::CreateMirror {
+            pool,
+            copies,
+            row_size,
+            rows,
+            strip_log2,
+        } => {
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let id = pool.create_ld(LdSpec::mirror(copies, row_size, rows, strip_log2))?;
+            println!(
+                "created LD {} (Mirror, copies={} row_size={} rows={} strip_log2={})",
+                id, copies, row_size, rows, strip_log2
+            );
             print_ld_table(&pool);
             Ok(())
         }
