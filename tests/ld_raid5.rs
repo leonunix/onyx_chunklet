@@ -237,3 +237,130 @@ fn raid5_unaligned_partial_within_strip() {
     ld.read_at(0, &mut readback).unwrap();
     assert_eq!(readback, payload);
 }
+
+/// Regression for the partial-write offset bug: when `strip_size > BLOCK_SIZE`
+/// AND a write spans `>= 2` data positions starting at a sub-strip-aligned
+/// offset, all helpers (`write_partial_stripe_rmw` / `_rw` / `write_data_only`)
+/// previously used `start.in_chunklet_off` (which embeds `start.in_strip_off`)
+/// for every position. pos[1+] therefore landed at the wrong chunklet offset
+/// and the parity strip was read/written straddling two stripes.
+#[test]
+fn raid5_partial_rmw_strip_gt_block_spans_positions() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    // K=3, strip_size_log2=16 -> 64 KiB strip, full stripe = 192 KiB.
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+
+    let bs = BLOCK_SIZE as usize;
+    let strip = 1usize << 16;
+    let full_stripe = 3 * strip;
+
+    // Initialize first full stripe with a known pattern (each block has a
+    // distinct byte).
+    let mut payload = vec![0u8; full_stripe];
+    for i in 0..(full_stripe / bs) {
+        let v = ((i as u32) & 0xff) as u8;
+        payload[i * bs..(i + 1) * bs].fill(v);
+    }
+    ld.write_at(0, &payload).unwrap();
+
+    // Now do a sub-strip-aligned write that spans pos[0] -> pos[1]: write
+    // 8 KiB starting at LD offset (strip - bs) = 60 KiB. The first 4 KiB
+    // lands in pos[0]'s last block, the next 4 KiB lands in pos[1]'s first
+    // block. start.in_strip_off = 60 KiB, so the buggy code uses chunklet
+    // offset 60 KiB for both reads/writes, which corrupts pos[1] (writes
+    // 4 KiB at offset 60 KiB into pos[1]'s chunklet instead of offset 0).
+    let new = vec![0xa5u8; 2 * bs];
+    let off = (strip - bs) as u64;
+    payload[off as usize..off as usize + 2 * bs].copy_from_slice(&new);
+    ld.write_at(off, &new).unwrap();
+
+    // Read back the entire first stripe and verify byte-for-byte.
+    let mut readback = vec![0u8; full_stripe];
+    ld.read_at(0, &mut readback).unwrap();
+    assert_eq!(
+        readback, payload,
+        "partial RMW spanning pos[0]->pos[1] at sub-strip offset corrupts data"
+    );
+
+    // Verify parity == XOR of all data strips (proves parity wasn't read or
+    // written at the wrong chunklet offset).
+    let desc = pool.list_lds().into_iter().next().unwrap();
+    let pds: Vec<_> = (0..4).map(|i| pool.pd(desc.members[i].pd).unwrap()).collect();
+    let mut data = vec![vec![0u8; strip]; 3];
+    for i in 0..3 {
+        pds[i]
+            .read_chunklet_user(desc.members[i].chunklet_index, 0, &mut data[i])
+            .unwrap();
+    }
+    let mut expected_parity = data[0].clone();
+    for i in 1..3 {
+        for j in 0..strip {
+            expected_parity[j] ^= data[i][j];
+        }
+    }
+    let mut parity = vec![0u8; strip];
+    pds[3]
+        .read_chunklet_user(desc.members[3].chunklet_index, 0, &mut parity)
+        .unwrap();
+    assert_eq!(parity, expected_parity, "parity drifted after partial RMW");
+}
+
+/// Regression: write that starts at a sub-strip offset and spans pos[1]->pos[2]
+/// (skipping pos[0] entirely), `strip_size > BLOCK_SIZE`. Exercises the same
+/// helpers as the spans_positions test but proves the bug isn't specific to
+/// pos[0] being the start position.
+#[test]
+fn raid5_partial_rmw_starts_at_pos1_sub_strip() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+
+    let bs = BLOCK_SIZE as usize;
+    let strip = 1usize << 16;
+    let full_stripe = 3 * strip;
+
+    let mut payload = vec![0u8; full_stripe];
+    for i in 0..(full_stripe / bs) {
+        payload[i * bs..(i + 1) * bs].fill((i as u32 & 0xff) as u8);
+    }
+    ld.write_at(0, &payload).unwrap();
+
+    // Write 8 KiB at LD offset (strip + strip - bs) = 124 KiB. This lands
+    // in pos[1]'s last 4 KiB and pos[2]'s first 4 KiB. start.data_pos = 1,
+    // start.in_strip_off = 60 KiB.
+    let new = vec![0x77u8; 2 * bs];
+    let off = (strip + strip - bs) as u64;
+    payload[off as usize..off as usize + 2 * bs].copy_from_slice(&new);
+    ld.write_at(off, &new).unwrap();
+
+    let mut readback = vec![0u8; full_stripe];
+    ld.read_at(0, &mut readback).unwrap();
+    assert_eq!(
+        readback, payload,
+        "partial RMW spanning pos[1]->pos[2] at sub-strip offset corrupts data"
+    );
+
+    // Parity must still equal XOR of all data strips.
+    let desc = pool.list_lds().into_iter().next().unwrap();
+    let pds: Vec<_> = (0..4).map(|i| pool.pd(desc.members[i].pd).unwrap()).collect();
+    let mut data = vec![vec![0u8; strip]; 3];
+    for i in 0..3 {
+        pds[i]
+            .read_chunklet_user(desc.members[i].chunklet_index, 0, &mut data[i])
+            .unwrap();
+    }
+    let mut expected_parity = data[0].clone();
+    for i in 1..3 {
+        for j in 0..strip {
+            expected_parity[j] ^= data[i][j];
+        }
+    }
+    let mut parity = vec![0u8; strip];
+    pds[3]
+        .read_chunklet_user(desc.members[3].chunklet_index, 0, &mut parity)
+        .unwrap();
+    assert_eq!(parity, expected_parity, "parity drifted after partial RMW");
+}

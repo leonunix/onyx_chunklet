@@ -236,3 +236,101 @@ fn raid6_rejects_when_too_few_pds() {
     let s = format!("{}", err);
     assert!(s.contains("distinct PDs") || s.contains("free"), "{}", s);
 }
+
+/// Regression for the partial-write offset bug: when `strip_size > BLOCK_SIZE`
+/// AND a write spans `>= 2` data positions starting at a sub-strip-aligned
+/// offset, the buggy code uses one `in_chunklet_off` for every position and
+/// for both parities, corrupting pos[1+] data and the parity strips.
+#[test]
+fn raid6_partial_rmw_strip_gt_block_spans_positions() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    // K=3, strip_size_log2=16 -> 64 KiB strip, full stripe = 192 KiB.
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+
+    let bs = BLOCK_SIZE as usize;
+    let strip = 1usize << 16;
+    let full_stripe = 3 * strip;
+
+    let mut payload = vec![0u8; full_stripe];
+    for i in 0..(full_stripe / bs) {
+        payload[i * bs..(i + 1) * bs].fill((i as u32 & 0xff) as u8);
+    }
+    ld.write_at(0, &payload).unwrap();
+
+    // Write 8 KiB at LD offset (strip - bs) = 60 KiB. Spans pos[0]'s last
+    // block + pos[1]'s first block.
+    let new = vec![0xa5u8; 2 * bs];
+    let off = (strip - bs) as u64;
+    payload[off as usize..off as usize + 2 * bs].copy_from_slice(&new);
+    ld.write_at(off, &new).unwrap();
+
+    let mut readback = vec![0u8; full_stripe];
+    ld.read_at(0, &mut readback).unwrap();
+    assert_eq!(
+        readback, payload,
+        "R6 partial RMW spanning pos[0]->pos[1] at sub-strip offset corrupts data"
+    );
+
+    // Verify P = XOR(D_i) and Q = sum(g^i * D_i) are correct.
+    use onyx_chunklet::ld::gf256;
+    let desc = pool.list_lds().into_iter().next().unwrap();
+    let pds: Vec<_> = (0..5).map(|i| pool.pd(desc.members[i].pd).unwrap()).collect();
+    let mut data = vec![vec![0u8; strip]; 3];
+    for i in 0..3 {
+        pds[i]
+            .read_chunklet_user(desc.members[i].chunklet_index, 0, &mut data[i])
+            .unwrap();
+    }
+    let mut expected_p = vec![0u8; strip];
+    let mut expected_q = vec![0u8; strip];
+    for i in 0..3 {
+        for j in 0..strip {
+            expected_p[j] ^= data[i][j];
+        }
+        gf256::mul_xor_into(&mut expected_q, &data[i], gf256::g_pow(i));
+    }
+    let mut p = vec![0u8; strip];
+    let mut q = vec![0u8; strip];
+    pds[3]
+        .read_chunklet_user(desc.members[3].chunklet_index, 0, &mut p)
+        .unwrap();
+    pds[4]
+        .read_chunklet_user(desc.members[4].chunklet_index, 0, &mut q)
+        .unwrap();
+    assert_eq!(p, expected_p, "P parity drifted after R6 partial RMW");
+    assert_eq!(q, expected_q, "Q parity drifted after R6 partial RMW");
+}
+
+/// R6 sibling of `raid5_partial_rmw_starts_at_pos1_sub_strip`: write spanning
+/// pos[1]->pos[2] at sub-strip offset.
+#[test]
+fn raid6_partial_rmw_starts_at_pos1_sub_strip() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+
+    let bs = BLOCK_SIZE as usize;
+    let strip = 1usize << 16;
+    let full_stripe = 3 * strip;
+
+    let mut payload = vec![0u8; full_stripe];
+    for i in 0..(full_stripe / bs) {
+        payload[i * bs..(i + 1) * bs].fill((i as u32 & 0xff) as u8);
+    }
+    ld.write_at(0, &payload).unwrap();
+
+    let new = vec![0x77u8; 2 * bs];
+    let off = (strip + strip - bs) as u64;
+    payload[off as usize..off as usize + 2 * bs].copy_from_slice(&new);
+    ld.write_at(off, &new).unwrap();
+
+    let mut readback = vec![0u8; full_stripe];
+    ld.read_at(0, &mut readback).unwrap();
+    assert_eq!(
+        readback, payload,
+        "R6 partial RMW spanning pos[1]->pos[2] at sub-strip offset corrupts data"
+    );
+}

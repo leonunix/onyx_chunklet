@@ -495,18 +495,25 @@ impl LdRaid5 {
         }
         debug_assert_eq!(consumed, buf.len());
 
+        // Strip-aligned chunklet offset shared by every position + the parity
+        // strip in this (set, set_stripe). Helpers below compute each
+        // position's chunklet IO at `strip_base + off`. NEVER pass
+        // `start.in_chunklet_off` (which embeds `start.in_strip_off`) directly
+        // — that only matches pos[0] and corrupts pos[1+] / parity.
+        let strip_base = start.in_chunklet_off - start.in_strip_off;
+
         // Full-stripe = every data position covered, each spans the entire strip.
         let is_full_stripe = positions.len() == k
             && positions.iter().all(|(_pos, off, range)| {
                 *off == 0 && (range.end - range.start) as u64 == strip
             });
         if is_full_stripe {
-            return self.write_full_stripe(start.set_idx, start.in_chunklet_off, &positions, buf);
+            return self.write_full_stripe(start.set_idx, strip_base, &positions, buf);
         }
 
         if f_data == 0 && p_failed {
             // Only parity is gone: skip parity entirely, write data direct.
-            return self.write_data_only(start.set_idx, start.in_chunklet_off, &positions, buf);
+            return self.write_data_only(start.set_idx, strip_base, &positions, buf);
         }
 
         if f_data == 0 {
@@ -518,40 +525,29 @@ impl LdRaid5 {
                 *off == 0 && (range.end - range.start) as u64 == strip
             });
             if all_full_strip && (k - m) < (m + 1) {
-                self.write_partial_stripe_rw(
-                    start.set_idx,
-                    start.in_chunklet_off,
-                    &positions,
-                    buf,
-                )
+                self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
             } else {
-                self.write_partial_stripe_rmw(
-                    start.set_idx,
-                    start.in_chunklet_off,
-                    &positions,
-                    buf,
-                )
+                self.write_partial_stripe_rmw(start.set_idx, strip_base, &positions, buf)
             }
         } else {
             // F=1 data-failed (parity healthy). RMW would need to read the
             // failed PD's old data for delta computation when that position
             // is in the modified set; RW handles it uniformly via reconstruct.
-            self.write_partial_stripe_rw(
-                start.set_idx,
-                start.in_chunklet_off,
-                &positions,
-                buf,
-            )
+            self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
         }
     }
 
     /// Fan out one write per surviving member, computed from the new data.
     /// Skips writes to failed PDs (degraded fast path; data parity must be
     /// rebuilt later for redundancy to come back).
+    ///
+    /// `strip_base` is the strip-aligned chunklet offset shared by every
+    /// position and the parity strip. For full-stripe writes every position
+    /// has `off == 0`, so each position's chunklet offset equals `strip_base`.
     fn write_full_stripe(
         &self,
         set_idx: usize,
-        in_chunklet_off: u64,
+        strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
     ) -> ChunkletResult<()> {
@@ -562,13 +558,13 @@ impl LdRaid5 {
         }
 
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 1);
-        for (pos, _off, range) in positions {
+        for (pos, off, range) in positions {
             let m = self.member_idx_data(set_idx, *pos);
             if let Some(pd) = &self.members[m] {
                 ops.push(StripWrite {
                     pd: pd.clone(),
                     chunklet_index: self.desc.members[m].chunklet_index,
-                    in_chunklet_off,
+                    in_chunklet_off: strip_base + off,
                     data: &buf[range.clone()],
                 });
             }
@@ -578,7 +574,7 @@ impl LdRaid5 {
             ops.push(StripWrite {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[pm].chunklet_index,
-                in_chunklet_off,
+                in_chunklet_off: strip_base,
                 data: &parity,
             });
         }
@@ -590,12 +586,12 @@ impl LdRaid5 {
     fn write_data_only(
         &self,
         set_idx: usize,
-        in_chunklet_off: u64,
+        strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
     ) -> ChunkletResult<()> {
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len());
-        for (pos, _off, range) in positions {
+        for (pos, off, range) in positions {
             let m = self.member_idx_data(set_idx, *pos);
             // Healthy data PDs only — F=1 with parity failed means all data
             // PDs are alive.
@@ -605,7 +601,7 @@ impl LdRaid5 {
             ops.push(StripWrite {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[m].chunklet_index,
-                in_chunklet_off,
+                in_chunklet_off: strip_base + off,
                 data: &buf[range.clone()],
             });
         }
@@ -615,10 +611,14 @@ impl LdRaid5 {
     /// Read-modify-write: for M modified positions, read old slices, XOR
     /// into a delta, apply delta to old parity, write modified data + new
     /// parity. Healthy-set only — caller routes degraded sets to RW.
+    ///
+    /// Each position's old data is read at `strip_base + off` (the
+    /// position-specific chunklet offset). Parity (full strip) lives at
+    /// `strip_base`.
     fn write_partial_stripe_rmw(
         &self,
         set_idx: usize,
-        in_chunklet_off: u64,
+        strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
     ) -> ChunkletResult<()> {
@@ -628,18 +628,18 @@ impl LdRaid5 {
             let new_data = &buf[range.clone()];
             let len = new_data.len();
             let mut old_data = vec![0u8; len];
-            self.read_data_strip(set_idx, *pos, in_chunklet_off, &mut old_data)?;
+            self.read_data_strip(set_idx, *pos, strip_base + off, &mut old_data)?;
             let dst = &mut delta_full_strip[(*off as usize)..(*off as usize) + len];
             for i in 0..len {
                 dst[i] ^= old_data[i] ^ new_data[i];
             }
         }
         let mut parity = vec![0u8; strip];
-        self.read_parity_strip(set_idx, in_chunklet_off, &mut parity)?;
+        self.read_parity_strip(set_idx, strip_base, &mut parity)?;
         xor_into(&mut parity, &delta_full_strip);
 
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 1);
-        for (pos, _off, range) in positions {
+        for (pos, off, range) in positions {
             let m = self.member_idx_data(set_idx, *pos);
             let pd = self.members[m]
                 .as_ref()
@@ -647,7 +647,7 @@ impl LdRaid5 {
             ops.push(StripWrite {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[m].chunklet_index,
-                in_chunklet_off,
+                in_chunklet_off: strip_base + off,
                 data: &buf[range.clone()],
             });
         }
@@ -658,7 +658,7 @@ impl LdRaid5 {
         ops.push(StripWrite {
             pd: pd.clone(),
             chunklet_index: self.desc.members[pm].chunklet_index,
-            in_chunklet_off,
+            in_chunklet_off: strip_base,
             data: &parity,
         });
         parallel_strip_writes(ops)
@@ -672,10 +672,14 @@ impl LdRaid5 {
     ///
     /// Precondition: parity PD is healthy. Caller routes parity-failed sets
     /// to `write_data_only` (no parity computation needed at all).
+    ///
+    /// All full-strip reads/reconstructs use `strip_base` (strip-aligned
+    /// chunklet offset). Modified data writes use `strip_base + off` for
+    /// each position; parity writes the full strip at `strip_base`.
     fn write_partial_stripe_rw(
         &self,
         set_idx: usize,
-        in_chunklet_off: u64,
+        strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
     ) -> ChunkletResult<()> {
@@ -702,14 +706,14 @@ impl LdRaid5 {
                             self.reconstruct_data(
                                 set_idx,
                                 pos,
-                                in_chunklet_off,
+                                strip_base,
                                 &mut new_strips[pos],
                             )?;
                         } else {
                             self.read_data_strip(
                                 set_idx,
                                 pos,
-                                in_chunklet_off,
+                                strip_base,
                                 &mut new_strips[pos],
                             )?;
                         }
@@ -721,14 +725,14 @@ impl LdRaid5 {
                         self.reconstruct_data(
                             set_idx,
                             pos,
-                            in_chunklet_off,
+                            strip_base,
                             &mut new_strips[pos],
                         )?;
                     } else {
                         self.read_data_strip(
                             set_idx,
                             pos,
-                            in_chunklet_off,
+                            strip_base,
                             &mut new_strips[pos],
                         )?;
                     }
@@ -742,13 +746,13 @@ impl LdRaid5 {
         }
 
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 1);
-        for (pos, _off, range) in positions {
+        for (pos, off, range) in positions {
             let m = self.member_idx_data(set_idx, *pos);
             if let Some(pd) = &self.members[m] {
                 ops.push(StripWrite {
                     pd: pd.clone(),
                     chunklet_index: self.desc.members[m].chunklet_index,
-                    in_chunklet_off,
+                    in_chunklet_off: strip_base + off,
                     data: &buf[range.clone()],
                 });
             }
@@ -760,7 +764,7 @@ impl LdRaid5 {
         ops.push(StripWrite {
             pd: pd.clone(),
             chunklet_index: self.desc.members[pm].chunklet_index,
-            in_chunklet_off,
+            in_chunklet_off: strip_base,
             data: &parity,
         });
         parallel_strip_writes(ops)
