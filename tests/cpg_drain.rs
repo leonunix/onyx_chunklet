@@ -197,3 +197,43 @@ fn drain_marks_target_chunklets_used_on_replacement() {
         ChunkletState::Used
     );
 }
+
+/// Regression: rebuild used to leave the OLD chunklet on a drained
+/// (alive but evicted) PD marked Used, even though the descriptor no
+/// longer referenced it. After many drains a "drained" PD's bitmap
+/// would accumulate orphan-Used entries that nothing actually owned.
+/// commit_rebuild now frees those entries in the same atomic commit
+/// that marks the new chunklet Used.
+#[test]
+fn drain_frees_old_chunklets_on_drained_pd() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::mirror(2, 1, 1, 0)).unwrap();
+
+    // Snapshot pre-drain state.
+    let pre_desc = pool.find_ld(id).unwrap();
+    let drain_pd_id = pre_desc.members[0].pd;
+    let drain_chunklet_idx = pre_desc.members[0].chunklet_index;
+
+    // Sanity: pre-drain the chunklet on drain_pd_id is Used.
+    {
+        let pd = pool.pd(drain_pd_id).unwrap();
+        let (_, bm, _) = pd.snapshot();
+        assert_eq!(bm.get(drain_chunklet_idx).unwrap(), ChunkletState::Used);
+    }
+
+    pool.drain_pd(drain_pd_id).unwrap();
+
+    // Post-drain: descriptor must point to a different PD AND the old
+    // chunklet's bitmap entry on the drained PD must be Free, not
+    // orphan-Used.
+    let post_desc = pool.find_ld(id).unwrap();
+    assert_ne!(post_desc.members[0].pd, drain_pd_id);
+    let pd = pool.pd(drain_pd_id).unwrap();
+    let (_, bm, _) = pd.snapshot();
+    assert_eq!(
+        bm.get(drain_chunklet_idx).unwrap(),
+        ChunkletState::Free,
+        "old chunklet on drained PD must be reclaimed (not orphan-Used)"
+    );
+}

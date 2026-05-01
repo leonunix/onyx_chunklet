@@ -45,9 +45,11 @@ impl Pool {
     /// live PDs. Returns a `RebuildReport` summarizing the work done.
     ///
     /// On success, the LD descriptor is updated in-memory and persisted on
-    /// every live PD's manifest. The new chunklets are marked `Used` in their
-    /// PDs' bitmaps; the OLD failed chunklets are unreachable (their PD is
-    /// gone), so no bitmap update is needed for them.
+    /// every live PD's manifest. New chunklets are marked `Used`; old
+    /// chunklets being migrated AWAY from a live PD (drain target, or a
+    /// healthy PD's scrub-marked-Bad chunklet) are marked `Free` in the
+    /// same commit. Failed PDs (gone from `pds_snapshot`) get no bitmap
+    /// update — their on-disk state is unreachable until they come back.
     pub fn rebuild_ld(&self, ld_id: LdId) -> ChunkletResult<RebuildReport> {
         let _commit = self.manifest_lock.lock();
 
@@ -161,6 +163,12 @@ impl Pool {
         }
         // For each set, build the new placement.
         let mut new_alloc_by_pd: BTreeMap<PdId, Vec<(u32, LdRole, u8)>> = BTreeMap::new();
+        // Old (pd, chunklet) entries to free in the same commit. Only PDs we
+        // can still talk to: draining PDs (alive but being evicted) and
+        // healthy PDs whose chunklet was scrub-marked Bad. Failed PDs have
+        // no entry in pds_snapshot and their bitmap is unreachable anyway —
+        // commit_rebuild's notes call this out.
+        let mut freed_by_pd: BTreeMap<PdId, Vec<u32>> = BTreeMap::new();
         for (set_idx, failed) in failed_per_set.iter().enumerate() {
             if failed.is_empty() {
                 continue;
@@ -193,6 +201,15 @@ impl Pool {
                     .entry(target_pd)
                     .or_default()
                     .push((chunklet_idx, role, new_gen));
+                // Schedule the old chunklet for Free if its PD is alive
+                // (draining or healthy-with-Bad). Otherwise the PD is
+                // Failed; we can't mutate its bitmap.
+                if pds_snapshot.contains_key(&old_member.pd) {
+                    freed_by_pd
+                        .entry(old_member.pd)
+                        .or_default()
+                        .push(old_member.chunklet_index);
+                }
                 let m = &mut new_desc.members[base + failed_pos];
                 m.pd = target_pd;
                 m.chunklet_index = chunklet_idx;
@@ -213,8 +230,9 @@ impl Pool {
             _ => unreachable!("validated earlier"),
         }
 
-        // Commit: per-PD bitmap update (Used) + ld_list refresh.
-        self.commit_rebuild(&new_desc, &new_alloc_by_pd, &pds_snapshot)?;
+        // Commit: per-PD bitmap update (Used for new allocations + Free for
+        // old chunklets being migrated off live PDs) + ld_list refresh.
+        self.commit_rebuild(&new_desc, &new_alloc_by_pd, &freed_by_pd, &pds_snapshot)?;
 
         Ok(RebuildReport {
             ld_id,
@@ -388,6 +406,7 @@ impl Pool {
         &self,
         new_desc: &LdDescriptor,
         new_alloc_by_pd: &BTreeMap<PdId, Vec<(u32, LdRole, u8)>>,
+        freed_by_pd: &BTreeMap<PdId, Vec<u32>>,
         pds_snapshot: &BTreeMap<PdId, Arc<PhysicalDisk>>,
     ) -> ChunkletResult<()> {
         // Update in-memory ld_list first so the encoded bytes reflect the new
@@ -400,10 +419,18 @@ impl Pool {
 
         for (pd_id, pd) in pds_snapshot {
             let owned = new_alloc_by_pd.get(pd_id).cloned().unwrap_or_default();
+            let freed = freed_by_pd.get(pd_id).cloned().unwrap_or_default();
             let new_ld_bytes_v = new_ld_bytes.clone();
             pd.commit_manifest(move |body, bitmap| {
+                // New chunklets allocated on this PD: Free -> Used.
                 for (idx, _role, _gen) in &owned {
                     bitmap.set(*idx, ChunkletState::Used)?;
+                }
+                // Old chunklets migrated AWAY from this PD: Used (or Bad)
+                // -> Free. Same atomic commit ensures bitmap accounting is
+                // consistent with the descriptor swap.
+                for idx in &freed {
+                    bitmap.set(*idx, ChunkletState::Free)?;
                 }
                 body.ld_list_bytes = new_ld_bytes_v;
                 Ok(())
