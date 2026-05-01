@@ -71,9 +71,10 @@ pub struct PdInfo {
 impl PhysicalDisk {
     /// Initialize a blank PD with a fresh manifest at `gen = 1`, slots A.
     ///
-    /// `ld_list_bytes` is the encoded `LdList` that the new PD inherits from
-    /// the pool. Pool::create passes an empty list; Pool::admit passes the
-    /// current pool-wide LD list so the new PD's manifest stays consistent.
+    /// `ld_list_bytes` and `cpg_list_bytes` are the encoded `LdList` /
+    /// `CpgList` the new PD inherits. Pool::create passes empty lists;
+    /// Pool::admit passes the current pool-wide LD + CPG list so the new
+    /// PD's manifest stays consistent with its peers.
     pub fn init(
         raw: RawDevice,
         pool_id: PoolId,
@@ -83,6 +84,7 @@ impl PhysicalDisk {
         pd_list: Vec<crate::superblock::PoolPdEntry>,
         spare_pct: u8,
         ld_list_bytes: Vec<u8>,
+        cpg_list_bytes: Vec<u8>,
     ) -> ChunkletResult<Arc<Self>> {
         let pd_size = raw.size();
         let total_chunklets = compute_total_chunklets(pd_size)?;
@@ -107,6 +109,7 @@ impl PhysicalDisk {
         );
         body.pd_list = pd_list;
         body.ld_list_bytes = ld_list_bytes;
+        body.cpg_list_bytes = cpg_list_bytes;
         body.bitmap_slot_id = 0;
         body.bitmap_crc32c = bitmap.crc32c();
 
@@ -535,7 +538,7 @@ mod tests {
         let raw = sparse_pd(&dir, "pd0", TEST_PD_SIZE);
         let path = raw.path().to_path_buf();
 
-        let pd = PhysicalDisk::init(raw, pool_id, pd_id, 0, 1, vec![], 5, vec![]).unwrap();
+        let pd = PhysicalDisk::init(raw, pool_id, pd_id, 0, 1, vec![], 5, vec![], vec![]).unwrap();
         let info = pd.info();
         assert_eq!(info.pool_id, pool_id);
         assert_eq!(info.pd_id, pd_id);
@@ -564,6 +567,7 @@ mod tests {
             1,
             vec![],
             0,
+            vec![],
             vec![],
         )
         .unwrap();
@@ -600,6 +604,7 @@ mod tests {
             vec![],
             0,
             vec![],
+            vec![],
         )
         .unwrap();
 
@@ -622,6 +627,7 @@ mod tests {
             1,
             vec![],
             0,
+            vec![],
             vec![],
         )
         .err()

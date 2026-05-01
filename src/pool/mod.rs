@@ -18,10 +18,14 @@
 //!   should be identical at rest. Pool::open accepts a quorum mismatch and
 //!   logs a warning; explicit repair is a Phase 7 task.
 
+mod cpg;
+mod drain;
 mod ld_ops;
 mod rebuild;
 mod scrub;
 
+pub use cpg::{CpgDescriptor, CpgList, CpgSpec};
+pub use drain::DrainReport;
 pub use ld_ops::LdSpec;
 pub use rebuild::RebuildReport;
 pub use scrub::{ScrubMismatch, ScrubMismatchKind, ScrubReport};
@@ -65,10 +69,13 @@ pub(crate) struct PoolState {
     /// Health status keyed by PdId. Every PD declared in pool's pd_list has
     /// an entry. Set to `Healthy` if the PD is in `pds`, `Failed` otherwise.
     pub pd_health: BTreeMap<PdId, PdHealth>,
-    /// Authoritative LD list, mirrored on every PD's manifest. Pool::open picks
-    /// the view from the PD with the highest manifest_gen and writes the same
-    /// list to every PD on every LD-list mutation (create / drop).
+    /// PDs currently being drained (P7). Treated like Failed PDs by
+    /// `Pool::rebuild_ld` / `Pool::drain_pd` so members get migrated off.
+    pub draining: std::collections::BTreeSet<PdId>,
+    /// Authoritative LD list, mirrored on every PD's manifest.
     pub ld_list: LdList,
+    /// Authoritative CPG list, mirrored on every PD's manifest.
+    pub cpg_list: cpg::CpgList,
 }
 
 /// Per-PD health enum. Phase 5 only distinguishes Healthy / Failed (PD-level).
@@ -114,6 +121,7 @@ impl Pool {
                 pd_list.clone(),
                 cfg.spare_pct,
                 vec![], // fresh pool: empty LD list
+                vec![], // fresh pool: empty CPG list
             )?;
             pds.insert(pd_id, pd);
             pd_seq_to_id.insert(i as u32, pd_id);
@@ -125,7 +133,9 @@ impl Pool {
                 pd_health: pds.keys().map(|id| (*id, PdHealth::Healthy)).collect(),
                 pds,
                 pd_seq_to_id,
+                draining: std::collections::BTreeSet::new(),
                 ld_list: LdList::default(),
+                cpg_list: cpg::CpgList::default(),
             }),
             manifest_lock: Mutex::new(()),
         }))
@@ -152,10 +162,8 @@ impl Pool {
         let mut seqs = BTreeSet::new();
         let mut pd_seq_to_id = BTreeMap::new();
         let mut declared_count: Option<u32> = None;
-        // Pick the LD list from the PD with the highest manifest_gen. If
-        // multiple PDs tie at the highest gen with different LD lists, we
-        // log a warning and pick the first encountered.
-        let mut best_ld_view: Option<(u64, Vec<u8>)> = None;
+        // Pick the LD/CPG view from the PD with the highest manifest_gen.
+        let mut best_view: Option<(u64, Vec<u8>, Vec<u8>)> = None;
 
         for pd in opened {
             if pd.pool_id() != pool_id {
@@ -184,9 +192,15 @@ impl Pool {
                     info.pd_seq_in_pool, info.pd_id
                 )));
             }
-            match &best_ld_view {
-                Some((best_gen, _)) if *best_gen >= gen => {}
-                _ => best_ld_view = Some((gen, body.ld_list_bytes.clone())),
+            match &best_view {
+                Some((best_gen, _, _)) if *best_gen >= gen => {}
+                _ => {
+                    best_view = Some((
+                        gen,
+                        body.ld_list_bytes.clone(),
+                        body.cpg_list_bytes.clone(),
+                    ))
+                }
             }
             pd_seq_to_id.insert(info.pd_seq_in_pool, info.pd_id);
             pds.insert(info.pd_id, pd);
@@ -210,9 +224,11 @@ impl Pool {
             }
         }
 
-        let ld_list = match best_ld_view {
-            Some((_, bytes)) => LdList::decode(&bytes)?,
-            None => LdList::default(),
+        let (ld_list, cpg_list) = match best_view {
+            Some((_, ld_bytes, cpg_bytes)) => {
+                (LdList::decode(&ld_bytes)?, cpg::CpgList::decode(&cpg_bytes)?)
+            }
+            None => (LdList::default(), cpg::CpgList::default()),
         };
 
         Ok(Arc::new(Self {
@@ -221,7 +237,9 @@ impl Pool {
                 pd_health: pds.keys().map(|id| (*id, PdHealth::Healthy)).collect(),
                 pds,
                 pd_seq_to_id,
+                draining: std::collections::BTreeSet::new(),
                 ld_list,
+                cpg_list,
             }),
             manifest_lock: Mutex::new(()),
         }))
@@ -254,8 +272,8 @@ impl Pool {
         let mut pds = BTreeMap::new();
         let mut declared_count: Option<u32> = None;
         let mut declared_pd_list: Option<Vec<PoolPdEntry>> = None;
-        let mut best_ld_view: Option<(u64, Vec<u8>)> = None;
-        let mut best_ld_view_gen: u64 = 0;
+        let mut best_view: Option<(u64, Vec<u8>, Vec<u8>)> = None;
+        let mut best_view_gen: u64 = 0;
 
         for pd in opened {
             if pd.pool_id() != pool_id {
@@ -281,9 +299,13 @@ impl Pool {
                 }
                 _ => {}
             }
-            if best_ld_view.is_none() || gen > best_ld_view_gen {
-                best_ld_view = Some((gen, body.ld_list_bytes.clone()));
-                best_ld_view_gen = gen;
+            if best_view.is_none() || gen > best_view_gen {
+                best_view = Some((
+                    gen,
+                    body.ld_list_bytes.clone(),
+                    body.cpg_list_bytes.clone(),
+                ));
+                best_view_gen = gen;
             }
             pds.insert(info.pd_id, pd);
         }
@@ -315,9 +337,11 @@ impl Pool {
             }
         }
 
-        let ld_list = match best_ld_view {
-            Some((_, bytes)) => LdList::decode(&bytes)?,
-            None => LdList::default(),
+        let (ld_list, cpg_list) = match best_view {
+            Some((_, ld_bytes, cpg_bytes)) => {
+                (LdList::decode(&ld_bytes)?, cpg::CpgList::decode(&cpg_bytes)?)
+            }
+            None => (LdList::default(), cpg::CpgList::default()),
         };
 
         Ok(Arc::new(Self {
@@ -326,7 +350,9 @@ impl Pool {
                 pds,
                 pd_seq_to_id,
                 pd_health,
+                draining: std::collections::BTreeSet::new(),
                 ld_list,
+                cpg_list,
             }),
             manifest_lock: Mutex::new(()),
         }))
@@ -375,9 +401,9 @@ impl Pool {
 
         let new_pd_count = new_pd_list.len() as u32;
 
-        let current_ld_bytes = {
+        let (current_ld_bytes, current_cpg_bytes) = {
             let s = self.state.read();
-            s.ld_list.encode()?
+            (s.ld_list.encode()?, s.cpg_list.encode()?)
         };
 
         let new_pd = PhysicalDisk::init(
@@ -389,6 +415,7 @@ impl Pool {
             new_pd_list.clone(),
             cfg.spare_pct,
             current_ld_bytes,
+            current_cpg_bytes,
         )?;
 
         let existing: Vec<Arc<PhysicalDisk>> = {

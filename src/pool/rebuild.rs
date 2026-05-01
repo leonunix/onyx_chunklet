@@ -56,10 +56,16 @@ impl Pool {
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", ld_id)))?;
         let pd_health = self.state.read().pd_health.clone();
         let pds_snapshot = self.state.read().pds.clone();
+        let draining = self.state.read().draining.clone();
 
-        // A member needs rebuild when EITHER its PD is Failed OR its
-        // chunklet is bitmap-Bad on its (Healthy) PD.
+        // A member needs rebuild when ANY of:
+        //   - its PD is Failed
+        //   - its PD is currently draining (P7)
+        //   - its chunklet is bitmap-Bad on its (Healthy) PD (P6)
         let member_needs_rebuild = |m: &crate::types::LdMember| -> ChunkletResult<bool> {
+            if draining.contains(&m.pd) {
+                return Ok(true);
+            }
             match pd_health.get(&m.pd) {
                 Some(PdHealth::Failed) => Ok(true),
                 Some(PdHealth::Healthy) => {
@@ -148,6 +154,11 @@ impl Pool {
         // the free pool deterministically (we mutate a working copy of
         // per-PD free indices as we plan).
         let mut working_free = self.snapshot_working_free(&pds_snapshot)?;
+        // Draining PDs are excluded from rebuild targets (drain is moving
+        // chunklets OFF them, not onto them).
+        for pd in &draining {
+            working_free.remove(pd);
+        }
         // For each set, build the new placement.
         let mut new_alloc_by_pd: BTreeMap<PdId, Vec<(u32, LdRole)>> = BTreeMap::new();
         for (set_idx, failed) in failed_per_set.iter().enumerate() {

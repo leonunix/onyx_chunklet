@@ -11,12 +11,13 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use onyx_chunklet::io::{AlignedBuf, RawDevice};
-use onyx_chunklet::pool::LdSpec;
+use onyx_chunklet::pool::{CpgSpec, LdSpec};
 use onyx_chunklet::superblock::{SuperblockSlot, SLOT_BYTES};
 use onyx_chunklet::types::{
-    LdId, PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET, SUPERBLOCK_SLOT_B_OFFSET,
+    HaDomain, LdId, PdId, RaidLevel, PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET,
+    SUPERBLOCK_SLOT_B_OFFSET,
 };
-use onyx_chunklet::{ChunkletResult, Pool, PoolConfig};
+use onyx_chunklet::{ChunkletResult, CpgId, Pool, PoolConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "chunkletctl", version, about = "onyx-chunklet operator CLI")]
@@ -33,6 +34,8 @@ enum Command {
     Pd(PdCmd),
     /// Logical disk operations (create / list / drop).
     Ld(LdCmd),
+    /// Common Provisioning Group operations (declarative LD policy templates).
+    Cpg(CpgCmd),
 }
 
 #[derive(Parser, Debug)]
@@ -56,6 +59,13 @@ enum PoolOp {
     Open { devices: Vec<PathBuf> },
     /// Alias for `open`.
     List { devices: Vec<PathBuf> },
+    /// Drain a PD (migrate all LD members onto other PDs, then mark DRAINED).
+    Drain {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// PD uuid to drain.
+        pd_id: String,
+    },
     /// Add a new blank device to an existing pool.
     Admit {
         /// Devices already in the pool (comma-separated).
@@ -85,6 +95,52 @@ enum PdOp {
 struct LdCmd {
     #[command(subcommand)]
     op: LdOp,
+}
+
+#[derive(Parser, Debug)]
+struct CpgCmd {
+    #[command(subcommand)]
+    op: CpgOp,
+}
+
+#[derive(Subcommand, Debug)]
+enum CpgOp {
+    /// Create a new CPG.
+    Create {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        #[arg(long)]
+        name: String,
+        /// raid level: plain | mirror | raid0 | raid5 | raid6
+        #[arg(long)]
+        raid: String,
+        /// set_size (mirror copies, raid5 K+1, raid6 K+2, etc.)
+        #[arg(long)]
+        set_size: u8,
+        #[arg(long, default_value_t = 1)]
+        row_size: u16,
+        #[arg(long, default_value_t = 0)]
+        strip_log2: u8,
+    },
+    /// List all CPGs.
+    List {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+    },
+    /// Drop a CPG by uuid.
+    Drop {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        cpg_id: String,
+    },
+    /// Create an LD using a CPG's policy.
+    CreateLd {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        cpg_id: String,
+        #[arg(long, default_value_t = 1)]
+        rows: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -208,6 +264,7 @@ fn run(cli: Cli) -> ChunkletResult<()> {
         Command::Pool(p) => run_pool(p),
         Command::Pd(p) => run_pd(p),
         Command::Ld(p) => run_ld(p),
+        Command::Cpg(p) => run_cpg(p),
     }
 }
 
@@ -238,6 +295,21 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             for info in pool.list_pds() {
                 print_pd_line(&info);
             }
+            Ok(())
+        }
+        PoolOp::Drain { pool, pd_id } => {
+            let parsed = uuid::Uuid::parse_str(&pd_id)
+                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
+            let id = PdId::from_bytes(*parsed.as_bytes());
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let report = pool.drain_pd(id)?;
+            println!(
+                "drained PD {}: {} LDs affected, {} members migrated",
+                report.pd_id,
+                report.lds_affected.len(),
+                report.members_migrated
+            );
             Ok(())
         }
         PoolOp::Admit {
@@ -406,6 +478,87 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
                     report.rebuilt_members, id
                 );
             }
+            print_ld_table(&pool);
+            Ok(())
+        }
+    }
+}
+
+fn run_cpg(cmd: CpgCmd) -> ChunkletResult<()> {
+    match cmd.op {
+        CpgOp::Create {
+            pool,
+            name,
+            raid,
+            set_size,
+            row_size,
+            strip_log2,
+        } => {
+            let raid_level = match raid.as_str() {
+                "plain" => RaidLevel::Plain,
+                "mirror" => RaidLevel::Mirror,
+                "raid0" => RaidLevel::Raid0,
+                "raid5" => RaidLevel::Raid5,
+                "raid6" => RaidLevel::Raid6,
+                other => {
+                    return Err(onyx_chunklet::ChunkletError::Config(format!(
+                        "unknown raid level '{}'; expected plain|mirror|raid0|raid5|raid6",
+                        other
+                    )))
+                }
+            };
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let id = pool.create_cpg(CpgSpec {
+                name: name.clone(),
+                raid_level,
+                set_size,
+                row_size,
+                strip_size_log2: strip_log2,
+                ha_domain: HaDomain::Pd,
+            })?;
+            println!("created CPG {} ({})", id, name);
+            Ok(())
+        }
+        CpgOp::List { pool } => {
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let cpgs = pool.list_cpgs();
+            if cpgs.is_empty() {
+                println!("no CPGs");
+                return Ok(());
+            }
+            println!("CPGs ({}):", cpgs.len());
+            for c in cpgs {
+                println!(
+                    "  id={} name={} raid={:?} set={} row={} strip_log2={}",
+                    c.id, c.name, c.raid_level, c.set_size, c.row_size, c.strip_size_log2
+                );
+            }
+            Ok(())
+        }
+        CpgOp::Drop { pool, cpg_id } => {
+            let parsed = uuid::Uuid::parse_str(&cpg_id)
+                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
+            let id = CpgId::from_bytes(*parsed.as_bytes());
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            pool.drop_cpg(id)?;
+            println!("dropped CPG {}", id);
+            Ok(())
+        }
+        CpgOp::CreateLd {
+            pool,
+            cpg_id,
+            rows,
+        } => {
+            let parsed = uuid::Uuid::parse_str(&cpg_id)
+                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
+            let id = CpgId::from_bytes(*parsed.as_bytes());
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let ld_id = pool.create_ld_in_cpg(id, rows)?;
+            println!("created LD {} in CPG {} ({} rows)", ld_id, id, rows);
             print_ld_table(&pool);
             Ok(())
         }

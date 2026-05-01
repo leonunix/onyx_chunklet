@@ -80,8 +80,11 @@ pub struct SuperblockBody {
     /// Updated by every manifest commit so readers can locate the live bitmap.
     pub bitmap_slot_id: u8,
     pub pd_list: Vec<PoolPdEntry>,
-    /// Reserved for P1+: opaque LD descriptor bytes.
+    /// Opaque LD descriptor bytes (decoded by `ld::descriptor::LdList`).
     pub ld_list_bytes: Vec<u8>,
+    /// Opaque CPG descriptor bytes (decoded by `pool::cpg::CpgList`). Empty
+    /// for v1-only PDs that predate CPGs (P7+).
+    pub cpg_list_bytes: Vec<u8>,
 }
 
 /// One entry per PD in the pool, recorded inside every PD's slot for
@@ -210,6 +213,7 @@ impl SuperblockBody {
             bitmap_slot_id: 0,
             pd_list: Vec::new(),
             ld_list_bytes: Vec::new(),
+            cpg_list_bytes: Vec::new(),
         }
     }
 
@@ -231,13 +235,18 @@ impl SuperblockBody {
         let pd_list_offset = 64u32;
         let pd_list_bytes = self.pd_list.len() * PD_LIST_ENTRY_BYTES;
         let ld_list_offset = pd_list_offset + pd_list_bytes as u32;
+        let cpg_list_offset = ld_list_offset + self.ld_list_bytes.len() as u32;
         header[36..40].copy_from_slice(&pd_list_offset.to_le_bytes());
         header[40..44].copy_from_slice(&(self.pd_list.len() as u32).to_le_bytes());
         header[44..48].copy_from_slice(&ld_list_offset.to_le_bytes());
         header[48..52].copy_from_slice(&(self.ld_list_bytes.len() as u32).to_le_bytes());
-        // [52..64] reserved.
+        header[52..56].copy_from_slice(&cpg_list_offset.to_le_bytes());
+        header[56..60].copy_from_slice(&(self.cpg_list_bytes.len() as u32).to_le_bytes());
+        // [60..64] reserved.
 
-        let mut out = Vec::with_capacity(64 + pd_list_bytes + self.ld_list_bytes.len());
+        let mut out = Vec::with_capacity(
+            64 + pd_list_bytes + self.ld_list_bytes.len() + self.cpg_list_bytes.len(),
+        );
         out.extend_from_slice(&header);
         for entry in &self.pd_list {
             let mut buf = [0u8; PD_LIST_ENTRY_BYTES];
@@ -247,6 +256,7 @@ impl SuperblockBody {
             out.extend_from_slice(&buf);
         }
         out.extend_from_slice(&self.ld_list_bytes);
+        out.extend_from_slice(&self.cpg_list_bytes);
         Ok(out)
     }
 
@@ -284,6 +294,8 @@ impl SuperblockBody {
         let pd_list_len = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
         let ld_list_offset = u32::from_le_bytes(bytes[44..48].try_into().unwrap()) as usize;
         let ld_list_bytes_len = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) as usize;
+        let cpg_list_offset = u32::from_le_bytes(bytes[52..56].try_into().unwrap()) as usize;
+        let cpg_list_bytes_len = u32::from_le_bytes(bytes[56..60].try_into().unwrap()) as usize;
 
         let pd_list_end = pd_list_offset
             .checked_add(pd_list_len.checked_mul(PD_LIST_ENTRY_BYTES).ok_or_else(|| {
@@ -320,6 +332,24 @@ impl SuperblockBody {
         }
         let ld_list_bytes = bytes[ld_list_offset..ld_list_end].to_vec();
 
+        // CPG list section is optional for backwards compatibility — body
+        // header pre-P7 has 0 in [52..60].
+        let cpg_list_bytes = if cpg_list_offset == 0 && cpg_list_bytes_len == 0 {
+            Vec::new()
+        } else {
+            let end = cpg_list_offset.checked_add(cpg_list_bytes_len).ok_or_else(|| {
+                ChunkletError::Format("cpg_list end overflow".into())
+            })?;
+            if end > bytes.len() {
+                return Err(ChunkletError::Format(format!(
+                    "cpg_list out of bounds: end={} body_len={}",
+                    end,
+                    bytes.len()
+                )));
+            }
+            bytes[cpg_list_offset..end].to_vec()
+        };
+
         Ok(Self {
             chunklet_size_log2,
             spare_pct,
@@ -333,6 +363,7 @@ impl SuperblockBody {
             bitmap_crc32c,
             pd_list,
             ld_list_bytes,
+            cpg_list_bytes,
         })
     }
 }
