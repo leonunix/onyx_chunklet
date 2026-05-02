@@ -1,8 +1,8 @@
 //! `IoBackend` trait + cross-PD batched-write op type.
 //!
-//! All chunklet writes that fan out across multiple PDs (full-stripe / RW
-//! / RMW dispatchers in `LdRaid5` and `LdRaid6`) build a `Vec<StripWrite>`
-//! and hand it to `IoBackend::submit_writes`. The trait gives us two
+//! All chunklet IOs that fan out across multiple PDs (full-stripe / RW
+//! / PDW dispatchers in `LdRaid5` and `LdRaid6`) build strip-level ops
+//! and hand them to `IoBackend`. The trait gives us two
 //! interchangeable implementations:
 //!
 //! - **`SyncBackend`** (`src/io/sync_backend.rs`): one `std::thread::scope`
@@ -35,6 +35,15 @@ pub struct StripWrite<'a> {
     pub data: &'a [u8],
 }
 
+/// One PD-level read prepared by an LD. Backends issue + wait before
+/// returning, so the mutable borrow only needs to live for one call.
+pub struct StripRead<'a> {
+    pub pd: Arc<PhysicalDisk>,
+    pub chunklet_index: u32,
+    pub in_chunklet_off: u64,
+    pub data: &'a mut [u8],
+}
+
 /// Cross-PD batched IO backend. Backends MUST block until every write in
 /// `ops` is durable on its respective PD (or short-circuit on the first
 /// error and report it).
@@ -42,6 +51,10 @@ pub struct StripWrite<'a> {
 /// Backends are stored as `Arc<dyn IoBackend>` on each `PhysicalDisk`;
 /// see `PhysicalDisk::backend`.
 pub trait IoBackend: Send + Sync {
+    /// Issue every read in `ops`, blocking until all complete. Returns
+    /// the first error seen.
+    fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()>;
+
     /// Issue every write in `ops`, blocking until all complete. Returns
     /// the first error seen (others are dropped). Implementations should
     /// short-circuit on `len <= 1` to avoid backend-specific ceremony.
@@ -81,6 +94,16 @@ pub fn submit_strip_writes(ops: Vec<StripWrite<'_>>) -> ChunkletResult<()> {
     backend.submit_writes(&ops)
 }
 
+/// LD-side entry point for batched reads. Picks the backend off the
+/// first op's PD, matching `submit_strip_writes`.
+pub fn submit_strip_reads(ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let backend = ops[0].pd.backend();
+    backend.submit_reads(ops)
+}
+
 /// Build the concrete backend that matches `kind`. On non-Linux, a
 /// `Uring` request silently downgrades to `Sync` because `io_uring` only
 /// links on Linux targets.
@@ -91,10 +114,7 @@ pub fn make_backend(kind: IoBackendKind) -> Arc<dyn IoBackend> {
         IoBackendKind::Uring => match crate::io::uring_backend::UringBackend::new() {
             Ok(b) => Arc::new(b),
             Err(e) => {
-                tracing::warn!(
-                    "io_uring init failed ({}); falling back to SyncBackend",
-                    e
-                );
+                tracing::warn!("io_uring init failed ({}); falling back to SyncBackend", e);
                 Arc::new(crate::io::sync_backend::SyncBackend)
             }
         },

@@ -7,13 +7,47 @@
 //! straight through.
 
 use crate::error::{ChunkletError, ChunkletResult};
-use crate::io::backend::{IoBackend, StripWrite};
+use crate::io::backend::{IoBackend, StripRead, StripWrite};
 
 pub struct SyncBackend;
 
 impl IoBackend for SyncBackend {
     fn name(&self) -> &'static str {
         "sync"
+    }
+
+    fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        if ops.len() == 1 {
+            let r = &mut ops[0];
+            return r
+                .pd
+                .read_chunklet_user(r.chunklet_index, r.in_chunklet_off, r.data);
+        }
+        std::thread::scope(|s| -> ChunkletResult<()> {
+            let handles: Vec<_> = ops
+                .iter_mut()
+                .map(|r| {
+                    s.spawn(move || {
+                        r.pd.read_chunklet_user(r.chunklet_index, r.in_chunklet_off, r.data)
+                    })
+                })
+                .collect();
+            let mut first_err: Option<ChunkletError> = None;
+            for h in handles {
+                match h.join().expect("strip-read worker panicked") {
+                    Ok(()) => {}
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            first_err.map_or(Ok(()), Err)
+        })
     }
 
     fn submit_writes(&self, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {

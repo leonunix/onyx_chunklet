@@ -42,7 +42,10 @@ const STRIPE_LOCK_BUCKETS: usize = 1024;
 // `src/io/backend.rs` now (selectable between SyncBackend and
 // UringBackend per Pool). Re-export so existing `use crate::ld::{...,
 // StripWrite}` import sites keep working.
-pub(crate) use crate::io::backend::{submit_strip_writes as parallel_strip_writes, StripWrite};
+pub(crate) use crate::io::backend::{
+    submit_strip_reads as parallel_strip_reads, submit_strip_writes as parallel_strip_writes,
+    StripRead, StripWrite,
+};
 
 pub fn healthy_pd_map(
     pds: &std::collections::BTreeMap<crate::types::PdId, Arc<PhysicalDisk>>,

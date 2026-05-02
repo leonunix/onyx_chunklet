@@ -20,5 +20,5 @@ pub mod sync_backend;
 pub mod uring_backend;
 
 pub use aligned::{round_up, AlignedBuf};
-pub use backend::{make_backend, IoBackend, IoBackendKind, StripWrite};
+pub use backend::{make_backend, IoBackend, IoBackendKind, StripRead, StripWrite};
 pub use raw::RawDevice;

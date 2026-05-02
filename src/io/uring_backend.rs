@@ -25,7 +25,8 @@ use io_uring::{opcode, types, IoUring};
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::aligned::AlignedBuf;
-use crate::io::backend::{IoBackend, StripWrite};
+use crate::io::backend::{IoBackend, StripRead, StripWrite};
+use crate::types::BLOCK_SIZE;
 
 const URING_DEPTH: u32 = 64;
 
@@ -50,6 +51,25 @@ impl IoBackend for UringBackend {
         "uring"
     }
 
+    fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        URING.with(|cell| -> ChunkletResult<()> {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(IoUring::new(URING_DEPTH).map_err(|e| {
+                    ChunkletError::Io(std::io::Error::other(format!("io_uring init: {}", e)))
+                })?);
+            }
+            let ring = slot.as_mut().expect("ring just initialized");
+            for chunk in ops.chunks_mut(URING_DEPTH as usize) {
+                submit_read_chunk(ring, chunk)?;
+            }
+            Ok(())
+        })
+    }
+
     fn submit_writes(&self, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
         if ops.is_empty() {
             return Ok(());
@@ -70,18 +90,101 @@ impl IoBackend for UringBackend {
     }
 }
 
-fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
-    // SQEs reference these bounce buffers by raw pointer; the Vec is
-    // held until the end of the function so the kernel sees them live
-    // through `submit_and_wait`.
-    let mut bounces: Vec<AlignedBuf> = Vec::with_capacity(ops.len());
-    let mut ptrs: Vec<(*const u8, u32)> = Vec::with_capacity(ops.len());
-    for op in ops {
-        let buf = AlignedBuf::from_slice(op.data)?;
-        ptrs.push((buf.as_slice().as_ptr(), op.data.len() as u32));
-        bounces.push(buf);
+fn submit_read_chunk(ring: &mut IoUring, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+    let mut targets: Vec<(i32, u64)> = Vec::with_capacity(ops.len());
+    for op in ops.iter() {
+        let abs = op.pd.chunklet_user_abs_offset(
+            op.chunklet_index,
+            op.in_chunklet_off,
+            op.data.len() as u64,
+        )?;
+        targets.push((op.pd.raw_fd(), abs));
     }
 
+    let mut bounces: Vec<Option<AlignedBuf>> = Vec::with_capacity(ops.len());
+    let mut ptrs: Vec<(*mut u8, u32)> = Vec::with_capacity(ops.len());
+    for (op, (_fd, abs)) in ops.iter_mut().zip(targets.iter()) {
+        let ptr = op.data.as_mut_ptr();
+        let len = op.data.len();
+        if is_direct_aligned(*abs, len, ptr as usize) {
+            ptrs.push((ptr, len as u32));
+            bounces.push(None);
+        } else {
+            let mut buf = AlignedBuf::new(len)?;
+            ptrs.push((buf.as_mut_slice().as_mut_ptr(), len as u32));
+            bounces.push(Some(buf));
+        }
+    }
+
+    {
+        let mut sq = ring.submission();
+        for i in 0..ops.len() {
+            let (fd, abs) = targets[i];
+            let (ptr, len) = ptrs[i];
+            let entry = opcode::Read::new(types::Fd(fd), ptr, len)
+                .offset(abs)
+                .build()
+                .user_data(i as u64);
+            // SAFETY: direct buffers and bounce buffers outlive this function;
+            // `submit_and_wait` waits for every submitted SQE.
+            unsafe {
+                sq.push(&entry).map_err(|e| {
+                    ChunkletError::Io(std::io::Error::other(format!(
+                        "io_uring read sq push: {}",
+                        e
+                    )))
+                })?;
+            }
+        }
+    }
+
+    ring.submit_and_wait(ops.len()).map_err(|e| {
+        ChunkletError::Io(std::io::Error::other(format!(
+            "io_uring read submit_and_wait: {}",
+            e
+        )))
+    })?;
+
+    let mut first_err: Option<ChunkletError> = None;
+    let mut completed = 0;
+    for cqe in ring.completion() {
+        completed += 1;
+        let idx = cqe.user_data() as usize;
+        let res = cqe.result();
+        if res < 0 {
+            let errno = -res;
+            if first_err.is_none() {
+                first_err = Some(ChunkletError::Io(std::io::Error::from_raw_os_error(errno)));
+            }
+        } else if (res as u32) < ptrs[idx].1 {
+            if first_err.is_none() {
+                first_err = Some(ChunkletError::Io(std::io::Error::other(format!(
+                    "io_uring short read op_idx={}: {} of {}",
+                    idx, res, ptrs[idx].1
+                ))));
+            }
+        }
+    }
+    if completed < ops.len() {
+        return Err(ChunkletError::Io(std::io::Error::other(format!(
+            "io_uring expected {} read cqes, got {}",
+            ops.len(),
+            completed
+        ))));
+    }
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+
+    for (op, bounce) in ops.iter_mut().zip(bounces.iter()) {
+        if let Some(buf) = bounce {
+            op.data.copy_from_slice(&buf.as_slice()[..op.data.len()]);
+        }
+    }
+    Ok(())
+}
+
+fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
     // Resolve absolute offsets + fds while we still hold &op (PD borrow
     // outlives the submit because `ops` is borrowed for the function).
     let mut targets: Vec<(i32, u64)> = Vec::with_capacity(ops.len());
@@ -92,6 +195,22 @@ fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()
             op.data.len() as u64,
         )?;
         targets.push((op.pd.raw_fd(), abs));
+    }
+
+    // SQEs reference either the caller's already O_DIRECT-safe buffer or
+    // one of these bounce buffers. The Vec is held until every CQE arrives.
+    let mut bounces: Vec<AlignedBuf> = Vec::with_capacity(ops.len());
+    let mut ptrs: Vec<(*const u8, u32)> = Vec::with_capacity(ops.len());
+    for (op, (_fd, abs)) in ops.iter().zip(targets.iter()) {
+        let ptr = op.data.as_ptr();
+        let len = op.data.len();
+        if is_direct_aligned(*abs, len, ptr as usize) {
+            ptrs.push((ptr, len as u32));
+        } else {
+            let buf = AlignedBuf::from_slice(op.data)?;
+            ptrs.push((buf.as_slice().as_ptr(), len as u32));
+            bounces.push(buf);
+        }
     }
 
     {
@@ -108,10 +227,7 @@ fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()
             // every SQE this loop pushed.
             unsafe {
                 sq.push(&entry).map_err(|e| {
-                    ChunkletError::Io(std::io::Error::other(format!(
-                        "io_uring sq push: {}",
-                        e
-                    )))
+                    ChunkletError::Io(std::io::Error::other(format!("io_uring sq push: {}", e)))
                 })?;
             }
         }
@@ -133,9 +249,7 @@ fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()
         if res < 0 {
             let errno = -res;
             if first_err.is_none() {
-                first_err = Some(ChunkletError::Io(std::io::Error::from_raw_os_error(
-                    errno,
-                )));
+                first_err = Some(ChunkletError::Io(std::io::Error::from_raw_os_error(errno)));
             }
         } else if (res as u32) < ptrs[idx].1 {
             if first_err.is_none() {
@@ -155,4 +269,9 @@ fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()
     }
     drop(bounces);
     first_err.map_or(Ok(()), Err)
+}
+
+fn is_direct_aligned(offset: u64, len: usize, ptr: usize) -> bool {
+    let bs = BLOCK_SIZE as u64;
+    offset % bs == 0 && (len as u64) % bs == 0 && (ptr as u64) % bs == 0
 }

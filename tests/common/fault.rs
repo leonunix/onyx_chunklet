@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use onyx_chunklet::error::ChunkletError;
-use onyx_chunklet::io::{IoBackend, StripWrite};
+use onyx_chunklet::io::{IoBackend, StripRead, StripWrite};
 use onyx_chunklet::types::PdId;
 
 pub struct FaultInjectingBackend {
@@ -83,6 +83,10 @@ impl IoBackend for FaultInjectingBackend {
         "fault-injecting"
     }
 
+    fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> Result<(), ChunkletError> {
+        self.inner.submit_reads(ops)
+    }
+
     fn submit_writes(&self, ops: &[StripWrite<'_>]) -> Result<(), ChunkletError> {
         let other: Vec<StripWrite<'_>> = ops
             .iter()
@@ -105,11 +109,15 @@ impl IoBackend for FaultInjectingBackend {
         if target.is_empty() {
             return Ok(());
         }
-        let prev = self.succeed_remaining.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| if v == 0 { None } else { Some(v - 1) },
-        );
+        let prev = self
+            .succeed_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v == 0 {
+                    None
+                } else {
+                    Some(v - 1)
+                }
+            });
         match prev {
             Ok(_remaining_before_decrement) => {
                 // We had budget; let target writes through.

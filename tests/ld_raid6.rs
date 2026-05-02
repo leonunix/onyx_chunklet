@@ -191,6 +191,61 @@ fn raid6_partial_rmw_preserves_other_data_and_parity() {
 }
 
 #[test]
+fn raid6_wide_partial_uses_parity_delta_and_updates_pq() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 8);
+    let id = pool.create_ld(LdSpec::raid6(6, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+
+    let strip = BLOCK_SIZE as usize;
+    let k = 6usize;
+    let mut payload = vec![0u8; k * strip];
+    for pos in 0..k {
+        payload[pos * strip..(pos + 1) * strip].fill(0x10 + pos as u8);
+    }
+    ld.write_at(0, &payload).unwrap();
+
+    let new_d4 = vec![0xebu8; strip];
+    ld.write_at((4 * strip) as u64, &new_d4).unwrap();
+
+    let mut readback = vec![0u8; k * strip];
+    ld.read_at(0, &mut readback).unwrap();
+    for pos in 0..k {
+        let expected = if pos == 4 { 0xeb } else { 0x10 + pos as u8 };
+        assert!(
+            readback[pos * strip..(pos + 1) * strip]
+                .iter()
+                .all(|&b| b == expected),
+            "data position {} drifted",
+            pos
+        );
+    }
+
+    let desc = pool.find_ld(id).unwrap();
+    let p_member = &desc.members[k];
+    let q_member = &desc.members[k + 1];
+    let p_pd = pool.pd(p_member.pd).unwrap();
+    let q_pd = pool.pd(q_member.pd).unwrap();
+    let mut p_buf = vec![0u8; strip];
+    let mut q_buf = vec![0u8; strip];
+    p_pd.read_chunklet_user(p_member.chunklet_index, 0, &mut p_buf)
+        .unwrap();
+    q_pd.read_chunklet_user(q_member.chunklet_index, 0, &mut q_buf)
+        .unwrap();
+
+    use onyx_chunklet::ld::gf256::{g_pow, mul};
+    let mut expected_p = 0u8;
+    let mut expected_q = 0u8;
+    for pos in 0..k {
+        let data = if pos == 4 { 0xeb } else { 0x10 + pos as u8 };
+        expected_p ^= data;
+        expected_q ^= mul(g_pow(pos), data);
+    }
+    assert!(p_buf.iter().all(|&b| b == expected_p));
+    assert!(q_buf.iter().all(|&b| b == expected_q));
+}
+
+#[test]
 fn raid6_reconstruct_one_data_via_p() {
     let dir = TempDir::new().unwrap();
     let (pool, _) = make_pool(&dir, 5);

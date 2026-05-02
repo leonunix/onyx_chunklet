@@ -20,18 +20,19 @@
 //!
 //! - **Full-stripe**: P + Q encoded directly from new data; up to K+2
 //!   writes (skips writes to failed PDs in degraded mode). No reads.
-//! - **Partial RMW**: `delta_P ⊕= old_D_i ⊕ new_D_i`,
-//!   `delta_Q ⊕= g^i · (old_D_i ⊕ new_D_i)`; new P/Q = old XOR delta.
-//!   Costs M+2 reads, M+2 writes. Healthy-set only — degraded sets always
-//!   take RW because RMW can't compute correct parity when a modified
-//!   position sits on a failed PD, and can't read old P/Q when a parity is
-//!   gone.
+//! - **Parity-delta write (PDW)**: Ceph FastEC-style overwrite:
+//!   `delta = old_D_i ⊕ new_D_i`,
+//!   `P' = P ⊕ delta`, `Q' = Q ⊕ g^i·delta`. Costs M+2 reads,
+//!   M+2 writes. Healthy-set only — degraded sets always take RW because
+//!   PDW can't compute correct parity when a modified position sits on a
+//!   failed PD, and can't read old P/Q when a parity is gone.
 //! - **Partial RW** (reconstruct-write): materialize all K new strips
 //!   (read unmodified, reconstruct unmodified-failed via available parity,
 //!   copy modified bytes), recompute P + Q from scratch, write modified
-//!   data + parities. Costs K-M reads + M+2 writes. Used when:
-//!     * `(K-M) < (M+2)` and all modified positions are full-strip aligned
-//!       (the threshold where RW beats RMW), OR
+//!   data + parities. Costs K-M full-strip reads plus any partial gap-fill
+//!   reads, then M+2 writes. Used when:
+//!     * its read cost is lower than PDW (for example 3+2 single-strip
+//!       writes, where reading two untouched data strips beats old data+P+Q), OR
 //!     * the set is degraded with at least one data position failed.
 //!
 //! Degraded write tolerates **F ≤ 2** failed members (any combination of
@@ -69,8 +70,8 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256;
 use crate::ld::{
-    compute_strip_bytes, parallel_strip_writes, resolve_members, LogicalDisk, StripWrite,
-    StripeLockTable,
+    compute_strip_bytes, parallel_strip_reads, parallel_strip_writes, resolve_members, LogicalDisk,
+    StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::pool::PdHealth;
@@ -551,6 +552,23 @@ impl LdRaid6 {
     }
 }
 
+fn parity_delta_read_cost(positions: &[(usize, u64, std::ops::Range<usize>)]) -> usize {
+    positions.len() + 2
+}
+
+fn reconstruct_write_read_cost(
+    data_per_set: usize,
+    strip_bytes: u64,
+    positions: &[(usize, u64, std::ops::Range<usize>)],
+) -> usize {
+    let modified_full_strips = positions
+        .iter()
+        .filter(|(_pos, off, range)| *off == 0 && (range.end - range.start) as u64 == strip_bytes)
+        .count();
+    let modified_partial_strips = positions.len() - modified_full_strips;
+    data_per_set - modified_full_strips + modified_partial_strips
+}
+
 #[derive(Clone, Copy, Debug)]
 struct StripeAddr {
     set_idx: usize,
@@ -691,17 +709,16 @@ impl LdRaid6 {
 
         let healthy = f_data == 0 && !p_failed && !q_failed;
         if healthy {
-            // RMW vs RW based on M-vs-K threshold (RW only when all
-            // modifications are full-strip; sub-strip mods make RW pay
-            // for gap-fill reads that wipe out the win).
-            let m = positions.len();
-            let all_full_strip = positions
-                .iter()
-                .all(|(_p, off, range)| *off == 0 && (range.end - range.start) as u64 == strip);
-            if all_full_strip && (k - m) < (m + 2) {
+            // Pick between Ceph FastEC-style parity-delta write (PDW)
+            // and reconstruct-write (RW) by the number of strip reads
+            // each path needs. RW wins for narrow 3+2 single-strip writes;
+            // PDW wins as K grows or partial gap-fill makes RW expensive.
+            let pdw_reads = parity_delta_read_cost(&positions);
+            let rw_reads = reconstruct_write_read_cost(k, strip, &positions);
+            if rw_reads < pdw_reads {
                 self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
             } else {
-                self.write_partial_stripe_rmw(start.set_idx, strip_base, &positions, buf)
+                self.write_partial_stripe_pdw(start.set_idx, strip_base, &positions, buf)
             }
         } else {
             // Any failure: unified RW handles all sub-cases (single
@@ -790,13 +807,13 @@ impl LdRaid6 {
         parallel_strip_writes(ops)
     }
 
-    /// Read-modify-write: per touched data position compute deltas for P
+    /// Parity-delta write: per touched data position compute deltas for P
     /// and Q, apply to old P/Q, write modified data + new P + new Q.
     /// Healthy-set only (needs old data, P, Q all readable).
     ///
     /// Each position's old data is read at `strip_base + off`. P and Q are
     /// full-strip reads/writes at `strip_base`.
-    fn write_partial_stripe_rmw(
+    fn write_partial_stripe_pdw(
         &self,
         set_idx: usize,
         strip_base: u64,
@@ -806,11 +823,53 @@ impl LdRaid6 {
         let strip = self.strip_bytes as usize;
         let mut delta_p = vec![0u8; strip];
         let mut delta_q = vec![0u8; strip];
-        for (pos, off, range) in positions {
+
+        let mut old_data: Vec<Vec<u8>> = positions
+            .iter()
+            .map(|(_pos, _off, range)| vec![0u8; range.end - range.start])
+            .collect();
+        let mut p = vec![0u8; strip];
+        let mut q = vec![0u8; strip];
+
+        let mut read_ops: Vec<StripRead> = Vec::with_capacity(positions.len() + 2);
+        for ((pos, off, _range), old) in positions.iter().zip(old_data.iter_mut()) {
+            let m = self.member_idx_data(set_idx, *pos);
+            let pd = self.members[m]
+                .as_ref()
+                .expect("PDW path requires all data PDs healthy");
+            read_ops.push(StripRead {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[m].chunklet_index,
+                in_chunklet_off: strip_base + off,
+                data: old,
+            });
+        }
+        let pm = self.member_idx_p(set_idx);
+        let pd_p = self.members[pm]
+            .as_ref()
+            .expect("PDW path requires P healthy");
+        read_ops.push(StripRead {
+            pd: pd_p.clone(),
+            chunklet_index: self.desc.members[pm].chunklet_index,
+            in_chunklet_off: strip_base,
+            data: &mut p,
+        });
+        let qm = self.member_idx_q(set_idx);
+        let pd_q = self.members[qm]
+            .as_ref()
+            .expect("PDW path requires Q healthy");
+        read_ops.push(StripRead {
+            pd: pd_q.clone(),
+            chunklet_index: self.desc.members[qm].chunklet_index,
+            in_chunklet_off: strip_base,
+            data: &mut q,
+        });
+        parallel_strip_reads(&mut read_ops)?;
+        drop(read_ops);
+
+        for ((pos, off, range), old_data) in positions.iter().zip(old_data.iter()) {
             let new_data = &buf[range.clone()];
             let len = new_data.len();
-            let mut old_data = vec![0u8; len];
-            self.read_data_strip(set_idx, *pos, strip_base + off, &mut old_data)?;
             let g_i = gf256::g_pow(*pos);
             let dst_p = &mut delta_p[(*off as usize)..(*off as usize) + len];
             let dst_q = &mut delta_q[(*off as usize)..(*off as usize) + len];
@@ -820,10 +879,6 @@ impl LdRaid6 {
                 dst_q[i] ^= gf256::mul(g_i, d);
             }
         }
-        let mut p = vec![0u8; strip];
-        let mut q = vec![0u8; strip];
-        self.read_p(set_idx, strip_base, &mut p)?;
-        self.read_q(set_idx, strip_base, &mut q)?;
         gf256::xor_into(&mut p, &delta_p);
         gf256::xor_into(&mut q, &delta_q);
 
@@ -832,7 +887,7 @@ impl LdRaid6 {
             let m = self.member_idx_data(set_idx, *pos);
             let pd = self.members[m]
                 .as_ref()
-                .expect("RMW path requires all data PDs healthy");
+                .expect("PDW path requires all data PDs healthy");
             ops.push(StripWrite {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[m].chunklet_index,
@@ -840,20 +895,12 @@ impl LdRaid6 {
                 data: &buf[range.clone()],
             });
         }
-        let pm = self.member_idx_p(set_idx);
-        let pd_p = self.members[pm]
-            .as_ref()
-            .expect("RMW path requires P healthy");
         ops.push(StripWrite {
             pd: pd_p.clone(),
             chunklet_index: self.desc.members[pm].chunklet_index,
             in_chunklet_off: strip_base,
             data: &p,
         });
-        let qm = self.member_idx_q(set_idx);
-        let pd_q = self.members[qm]
-            .as_ref()
-            .expect("RMW path requires Q healthy");
         ops.push(StripWrite {
             pd: pd_q.clone(),
             chunklet_index: self.desc.members[qm].chunklet_index,
@@ -891,7 +938,9 @@ impl LdRaid6 {
             .collect();
 
         let mut new_strips: Vec<Vec<u8>> = (0..k).map(|_| vec![0u8; strip]).collect();
-        for pos in 0..k {
+        let mut copy_after_reads: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
+        let mut read_ops: Vec<StripRead> = Vec::with_capacity(k);
+        for (pos, strip_buf) in new_strips.iter_mut().enumerate() {
             let pd_failed = self.members[self.member_idx_data(set_idx, pos)].is_none();
             match modified_map.get(&pos) {
                 Some((off, range)) => {
@@ -899,34 +948,49 @@ impl LdRaid6 {
                     let off = *off as usize;
                     let len = new_data.len();
                     if off == 0 && len == strip {
-                        new_strips[pos].copy_from_slice(new_data);
+                        strip_buf.copy_from_slice(new_data);
                     } else {
                         if pd_failed {
-                            self.reconstruct_unmodified_data(
-                                set_idx,
-                                pos,
-                                strip_base,
-                                &mut new_strips[pos],
-                            )?;
+                            self.reconstruct_unmodified_data(set_idx, pos, strip_base, strip_buf)?;
+                            strip_buf[off..off + len].copy_from_slice(new_data);
                         } else {
-                            self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos])?;
+                            let m = self.member_idx_data(set_idx, pos);
+                            let pd = self.members[m]
+                                .as_ref()
+                                .expect("RW direct-read path requires data PD healthy");
+                            read_ops.push(StripRead {
+                                pd: pd.clone(),
+                                chunklet_index: self.desc.members[m].chunklet_index,
+                                in_chunklet_off: strip_base,
+                                data: strip_buf,
+                            });
+                            copy_after_reads.push((pos, off, range.clone()));
                         }
-                        new_strips[pos][off..off + len].copy_from_slice(new_data);
                     }
                 }
                 None => {
                     if pd_failed {
-                        self.reconstruct_unmodified_data(
-                            set_idx,
-                            pos,
-                            strip_base,
-                            &mut new_strips[pos],
-                        )?;
+                        self.reconstruct_unmodified_data(set_idx, pos, strip_base, strip_buf)?;
                     } else {
-                        self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos])?;
+                        let m = self.member_idx_data(set_idx, pos);
+                        let pd = self.members[m]
+                            .as_ref()
+                            .expect("RW direct-read path requires data PD healthy");
+                        read_ops.push(StripRead {
+                            pd: pd.clone(),
+                            chunklet_index: self.desc.members[m].chunklet_index,
+                            in_chunklet_off: strip_base,
+                            data: strip_buf,
+                        });
                     }
                 }
             }
+        }
+        parallel_strip_reads(&mut read_ops)?;
+        drop(read_ops);
+        for (pos, off, range) in copy_after_reads {
+            let new_data = &buf[range];
+            new_strips[pos][off..off + new_data.len()].copy_from_slice(new_data);
         }
 
         let mut p = vec![0u8; strip];
