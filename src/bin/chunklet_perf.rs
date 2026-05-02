@@ -110,6 +110,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = RandomDist::Uniform)]
     random_dist: RandomDist,
 
+    /// Random offset alignment in 4 KiB blocks. 0 means use io_blocks.
+    #[arg(long, default_value_t = 0)]
+    random_align_blocks: usize,
+
     /// Percent of random IOs sent to the hot region when random-dist=hotspot.
     #[arg(long, default_value_t = 80)]
     hot_pct: u8,
@@ -200,6 +204,7 @@ struct FileJob {
     working_set_bytes: Option<u64>,
     offset_bytes: Option<u64>,
     random_dist: Option<RandomDist>,
+    random_align_blocks: Option<usize>,
     hot_pct: Option<u8>,
     hotset_pct: Option<u8>,
     verify: Option<bool>,
@@ -219,6 +224,7 @@ struct BenchJob {
     offset_bytes: u64,
     work_bytes: u64,
     random_dist: RandomDist,
+    random_align: u64,
     hot_pct: u8,
     hotset_pct: u8,
     verify: bool,
@@ -335,12 +341,13 @@ fn run(cli: Cli) -> ChunkletResult<()> {
     );
     for job in &jobs {
         eprintln!(
-            "  job={} ld={} work={} offset={} io={} workers={} iodepth={} workload={:?} read_pct={} dist={:?} verify={}",
+            "  job={} ld={} work={} offset={} io={} random_align={} workers={} iodepth={} workload={:?} read_pct={} dist={:?} verify={}",
             job.name,
             job.ld_id,
             job.work_bytes,
             job.offset_bytes,
             job.io_len,
+            job.random_align,
             job.workers,
             job.iodepth,
             job.workload,
@@ -402,6 +409,7 @@ fn build_jobs(
             working_set_bytes: Some(cli.working_set_bytes),
             offset_bytes: Some(cli.offset_bytes),
             random_dist: Some(cli.random_dist),
+            random_align_blocks: Some(cli.random_align_blocks),
             hot_pct: Some(cli.hot_pct),
             hotset_pct: Some(cli.hotset_pct),
             verify: Some(cli.verify),
@@ -439,6 +447,14 @@ fn build_jobs(
         let iodepth = job.iodepth.unwrap_or(cli.iodepth);
         let hot_pct = job.hot_pct.unwrap_or(cli.hot_pct);
         let hotset_pct = job.hotset_pct.unwrap_or(cli.hotset_pct);
+        let random_align_blocks = job
+            .random_align_blocks
+            .unwrap_or(cli.random_align_blocks);
+        let random_align = if random_align_blocks == 0 {
+            io_len as u64
+        } else {
+            random_align_blocks as u64 * BLOCK_SIZE
+        };
         let seed = job
             .seed
             .unwrap_or(global_seed.wrapping_add((idx as u64) << 32));
@@ -454,6 +470,7 @@ fn build_jobs(
             offset_bytes,
             work_bytes,
             random_dist: job.random_dist.unwrap_or(cli.random_dist),
+            random_align,
             hot_pct,
             hotset_pct,
             verify: job.verify.unwrap_or(cli.verify),
@@ -626,25 +643,26 @@ fn choose_offset(job: &BenchJob, rng: &mut StdRng, seq: &mut u64) -> u64 {
 }
 
 fn choose_random_rel(job: &BenchJob, rng: &mut StdRng) -> u64 {
-    let blocks = ((job.work_bytes - job.io_len as u64) / BLOCK_SIZE) + 1;
-    let block = match job.random_dist {
-        RandomDist::Uniform => rng.gen_range(0..blocks),
+    let align = job.random_align.max(BLOCK_SIZE);
+    let slots = ((job.work_bytes - job.io_len as u64) / align) + 1;
+    let slot = match job.random_dist {
+        RandomDist::Uniform => rng.gen_range(0..slots),
         RandomDist::Hotspot => {
-            let hot_blocks = ((blocks * job.hotset_pct.max(1) as u64) / 100).max(1);
+            let hot_slots = ((slots * job.hotset_pct.max(1) as u64) / 100).max(1);
             if rng.gen_range(0..100) < job.hot_pct {
-                rng.gen_range(0..hot_blocks)
-            } else if hot_blocks >= blocks {
-                rng.gen_range(0..blocks)
+                rng.gen_range(0..hot_slots)
+            } else if hot_slots >= slots {
+                rng.gen_range(0..slots)
             } else {
-                rng.gen_range(hot_blocks..blocks)
+                rng.gen_range(hot_slots..slots)
             }
         }
         RandomDist::Zipf => {
             let u: f64 = rng.gen_range(0.0..1.0);
-            ((u * u * blocks as f64).floor() as u64).min(blocks - 1)
+            ((u * u * slots as f64).floor() as u64).min(slots - 1)
         }
     };
-    block * BLOCK_SIZE
+    slot * align
 }
 
 fn prefill_verify_jobs(jobs: &[BenchJob]) -> ChunkletResult<()> {
@@ -827,6 +845,12 @@ fn validate_job(job: &BenchJob, _warmup_secs: u64) -> ChunkletResult<()> {
         return Err(onyx_chunklet::ChunkletError::Config(format!(
             "job {} io size must be > 0",
             job.name
+        )));
+    }
+    if job.random_align == 0 || job.random_align % BLOCK_SIZE != 0 {
+        return Err(onyx_chunklet::ChunkletError::Config(format!(
+            "job {} random alignment must be a non-zero multiple of {}",
+            job.name, BLOCK_SIZE
         )));
     }
     if job.read_pct > 100 || job.hot_pct > 100 || job.hotset_pct > 100 {
