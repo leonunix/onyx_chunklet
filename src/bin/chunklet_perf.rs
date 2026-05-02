@@ -447,9 +447,7 @@ fn build_jobs(
         let iodepth = job.iodepth.unwrap_or(cli.iodepth);
         let hot_pct = job.hot_pct.unwrap_or(cli.hot_pct);
         let hotset_pct = job.hotset_pct.unwrap_or(cli.hotset_pct);
-        let random_align_blocks = job
-            .random_align_blocks
-            .unwrap_or(cli.random_align_blocks);
+        let random_align_blocks = job.random_align_blocks.unwrap_or(cli.random_align_blocks);
         let random_align = if random_align_blocks == 0 {
             io_len as u64
         } else {
@@ -495,13 +493,21 @@ fn run_phase(
     let mut handles = Vec::new();
 
     for job in jobs {
-        let lanes = job.workers * job.iodepth;
+        let lanes = if job.workload == WorkloadKind::Read && !job.verify {
+            job.workers
+        } else {
+            job.workers * job.iodepth
+        };
         for lane in 0..lanes {
             let stop = stop.clone();
             let counters = counters.clone();
             let job = job.clone();
             handles.push(std::thread::spawn(move || {
-                worker_loop(job, lane, stop, counters)
+                if job.workload == WorkloadKind::Read && !job.verify {
+                    read_batch_worker_loop(job, lane, stop, counters)
+                } else {
+                    worker_loop(job, lane, stop, counters)
+                }
             }));
         }
     }
@@ -526,6 +532,64 @@ fn run_phase(
         );
     }
     Ok(stats)
+}
+
+fn read_batch_worker_loop(
+    job: BenchJob,
+    lane: usize,
+    stop: Arc<AtomicBool>,
+    counters: SharedCounters,
+) -> WorkerStats {
+    let mut rng = StdRng::seed_from_u64(job.seed.wrapping_add(lane as u64));
+    let mut bufs: Vec<Vec<u8>> = (0..job.iodepth).map(|_| vec![0u8; job.io_len]).collect();
+    let mut offsets = vec![0u64; job.iodepth];
+    let mut seq = job.offset_bytes + ((lane as u64 * job.io_len as u64) % job.work_bytes);
+    let mut stats = WorkerStats {
+        job: job.name.clone(),
+        ..Default::default()
+    };
+
+    while !stop.load(Ordering::Relaxed) {
+        for offset in &mut offsets {
+            *offset = choose_offset(&job, &mut rng, &mut seq);
+        }
+        let t0 = Instant::now();
+        let mut ops: Vec<(u64, &mut [u8])> = offsets
+            .iter()
+            .copied()
+            .zip(bufs.iter_mut().map(|buf| buf.as_mut_slice()))
+            .collect();
+        let result = job.ld.read_many_at(&mut ops);
+        let elapsed = t0.elapsed().as_micros() as u64;
+        let per_io_latency = (elapsed / job.iodepth.max(1) as u64).max(1);
+        match result {
+            Ok(()) => {
+                for _ in 0..job.iodepth {
+                    stats.ops += 1;
+                    stats.read_ops += 1;
+                    stats.bytes += job.io_len as u64;
+                    stats.latency_us.push(per_io_latency);
+                }
+                counters
+                    .ops
+                    .fetch_add(job.iodepth as u64, Ordering::Relaxed);
+                counters
+                    .read_ops
+                    .fetch_add(job.iodepth as u64, Ordering::Relaxed);
+                counters
+                    .bytes
+                    .fetch_add(job.iodepth as u64 * job.io_len as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                stats.errors += job.iodepth as u64;
+                counters
+                    .errors
+                    .fetch_add(job.iodepth as u64, Ordering::Relaxed);
+                eprintln!("job={} lane={} batch read error: {}", job.name, lane, e);
+            }
+        }
+    }
+    stats
 }
 
 fn worker_loop(

@@ -49,8 +49,8 @@ use std::sync::Arc;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{
-    compute_strip_bytes, parallel_strip_writes, resolve_members, LogicalDisk, StripWrite,
-    StripeLockTable,
+    compute_strip_bytes, parallel_strip_reads, parallel_strip_writes, resolve_members, LogicalDisk,
+    StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::pool::PdHealth;
@@ -293,6 +293,57 @@ impl LogicalDisk for LdMirror {
                 row, set
             )))
         })
+    }
+
+    fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> ChunkletResult<()> {
+        for (offset, buf) in ops.iter() {
+            self.ensure_aligned(*offset, buf.len())?;
+        }
+        let row_size = self.desc.row_size as usize;
+        let mut reads = Vec::with_capacity(ops.len());
+        for (offset, buf) in ops.iter_mut() {
+            if buf.len() != self.strip_bytes as usize {
+                self.read_at(*offset, buf)?;
+                continue;
+            }
+            let mut chosen = None;
+            self.for_each_segment(*offset, buf.len(), |row, set, off_in_c, range| {
+                if range.start != 0 || range.end != buf.len() {
+                    return Err(ChunkletError::Invariant(
+                        "mirror read_many split unexpected range".into(),
+                    ));
+                }
+                let copies = self.member_indices_for(row, set);
+                let n = copies.end - copies.start;
+                let cursor_idx = row * row_size + set;
+                let start = self.read_cursors[cursor_idx].fetch_add(1, Ordering::Relaxed) % n;
+                for offset_pick in 0..n {
+                    let pick = (start + offset_pick) % n;
+                    let member_idx = copies.start + pick;
+                    if let Some(pd) = self.members[member_idx].as_ref() {
+                        chosen = Some((
+                            pd.clone(),
+                            self.desc.members[member_idx].chunklet_index,
+                            off_in_c,
+                        ));
+                        return Ok(());
+                    }
+                }
+                Err(ChunkletError::Invariant(format!(
+                    "Mirror set (row={}, set={}) has no live copy",
+                    row, set
+                )))
+            })?;
+            let (pd, chunklet_index, in_chunklet_off) =
+                chosen.expect("for_each_segment selected one mirror read");
+            reads.push(StripRead {
+                pd,
+                chunklet_index,
+                in_chunklet_off,
+                data: *buf,
+            });
+        }
+        parallel_strip_reads(&mut reads)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {

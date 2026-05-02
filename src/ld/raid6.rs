@@ -636,6 +636,36 @@ impl LogicalDisk for LdRaid6 {
         Ok(())
     }
 
+    fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> ChunkletResult<()> {
+        for (offset, buf) in ops.iter() {
+            self.ensure_aligned(*offset, buf.len())?;
+        }
+        let mut reads = Vec::with_capacity(ops.len());
+        for (offset, buf) in ops.iter_mut() {
+            if buf.len() != self.strip_bytes as usize {
+                self.read_at(*offset, buf)?;
+                continue;
+            }
+            let addr = self.locate(*offset);
+            let failed = self.failed_data_positions(addr.set_idx);
+            if addr.in_strip_off != 0 || failed.contains(&addr.data_pos) {
+                self.read_at(*offset, buf)?;
+                continue;
+            }
+            let m = self.member_idx_data(addr.set_idx, addr.data_pos);
+            let pd = self.members[m]
+                .as_ref()
+                .expect("healthy read_many path requires data PD healthy");
+            reads.push(StripRead {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[m].chunklet_index,
+                in_chunklet_off: addr.in_chunklet_off,
+                data: &mut **buf,
+            });
+        }
+        parallel_strip_reads(&mut reads)
+    }
+
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
         let mut remaining = buf.len();

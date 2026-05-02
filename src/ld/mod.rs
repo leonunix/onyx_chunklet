@@ -75,6 +75,15 @@ pub trait LogicalDisk: Send + Sync {
     /// must be `block_size()`-aligned.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()>;
 
+    /// Read multiple independent aligned buffers. Default fallback is a
+    /// simple loop; LDs/backends with real batching can override it.
+    fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> ChunkletResult<()> {
+        for (offset, buf) in ops {
+            self.read_at(*offset, buf)?;
+        }
+        Ok(())
+    }
+
     /// Write exactly `buf.len()` bytes at `offset`. Same alignment rules.
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()>;
 }

@@ -76,8 +76,8 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256::xor_into;
 use crate::ld::{
-    compute_strip_bytes, parallel_strip_writes, resolve_members, LogicalDisk, StripWrite,
-    StripeLockTable,
+    compute_strip_bytes, parallel_strip_reads, parallel_strip_writes, resolve_members, LogicalDisk,
+    StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::pool::PdHealth;
@@ -445,6 +445,35 @@ impl LogicalDisk for LdRaid5 {
             remaining -= take;
         }
         Ok(())
+    }
+
+    fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> ChunkletResult<()> {
+        for (offset, buf) in ops.iter() {
+            self.ensure_aligned(*offset, buf.len())?;
+        }
+        let mut reads = Vec::with_capacity(ops.len());
+        for (offset, buf) in ops.iter_mut() {
+            if buf.len() != self.strip_bytes as usize {
+                self.read_at(*offset, buf)?;
+                continue;
+            }
+            let addr = self.locate(*offset);
+            if addr.in_strip_off != 0 || self.data_position_failed(addr.set_idx, addr.data_pos) {
+                self.read_at(*offset, buf)?;
+                continue;
+            }
+            let m = self.member_idx_data(addr.set_idx, addr.data_pos);
+            let pd = self.members[m]
+                .as_ref()
+                .expect("healthy read_many path requires data PD healthy");
+            reads.push(StripRead {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[m].chunklet_index,
+                in_chunklet_off: addr.in_chunklet_off,
+                data: &mut **buf,
+            });
+        }
+        parallel_strip_reads(&mut reads)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
