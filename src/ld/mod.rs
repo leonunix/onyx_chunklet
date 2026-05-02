@@ -86,6 +86,16 @@ pub trait LogicalDisk: Send + Sync {
 
     /// Write exactly `buf.len()` bytes at `offset`. Same alignment rules.
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()>;
+
+    /// Write multiple independent aligned buffers. Default fallback is a
+    /// simple loop; mirror/striped LDs can override to fan out one backend
+    /// batch across many user writes.
+    fn write_many_at(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
+        for (offset, buf) in ops {
+            self.write_at(*offset, buf)?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct StripeLockTable {
@@ -115,6 +125,16 @@ impl StripeLockTable {
 
     pub(crate) fn write_key_range(&self, first: u64, last: u64) -> Vec<RwLockWriteGuard<'_, ()>> {
         let mut buckets: Vec<usize> = (first..=last).map(lock_bucket).collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        buckets
+            .into_iter()
+            .map(|bucket| self.buckets[bucket].write())
+            .collect()
+    }
+
+    pub(crate) fn write_keys(&self, keys: &[u64]) -> Vec<RwLockWriteGuard<'_, ()>> {
+        let mut buckets: Vec<usize> = keys.iter().copied().map(lock_bucket).collect();
         buckets.sort_unstable();
         buckets.dedup();
         buckets

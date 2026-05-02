@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use onyx_chunklet::io::{IoBackendKind, RawDevice};
+use onyx_chunklet::io::{AlignedBuf, IoBackendKind, RawDevice};
 use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{LdId, BLOCK_SIZE};
@@ -126,6 +126,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     verify: bool,
 
+    /// Batch pure-write IOs through LogicalDisk::write_many_at.
+    #[arg(long, default_value_t = false)]
+    batch_writes: bool,
+
     /// Seed for deterministic random workloads.
     #[arg(long, default_value_t = 0xc0ffee)]
     seed: u64,
@@ -208,6 +212,7 @@ struct FileJob {
     hot_pct: Option<u8>,
     hotset_pct: Option<u8>,
     verify: Option<bool>,
+    batch_writes: Option<bool>,
     seed: Option<u64>,
 }
 
@@ -228,6 +233,7 @@ struct BenchJob {
     hot_pct: u8,
     hotset_pct: u8,
     verify: bool,
+    batch_writes: bool,
     seed: u64,
 }
 
@@ -341,7 +347,7 @@ fn run(cli: Cli) -> ChunkletResult<()> {
     );
     for job in &jobs {
         eprintln!(
-            "  job={} ld={} work={} offset={} io={} random_align={} workers={} iodepth={} workload={:?} read_pct={} dist={:?} verify={}",
+            "  job={} ld={} work={} offset={} io={} random_align={} workers={} iodepth={} workload={:?} read_pct={} dist={:?} verify={} batch_writes={}",
             job.name,
             job.ld_id,
             job.work_bytes,
@@ -353,7 +359,8 @@ fn run(cli: Cli) -> ChunkletResult<()> {
             job.workload,
             job.read_pct,
             job.random_dist,
-            job.verify
+            job.verify,
+            job.batch_writes
         );
     }
 
@@ -413,6 +420,7 @@ fn build_jobs(
             hot_pct: Some(cli.hot_pct),
             hotset_pct: Some(cli.hotset_pct),
             verify: Some(cli.verify),
+            batch_writes: Some(cli.batch_writes),
             seed: Some(cli.seed),
         }];
         synthetic.as_slice()
@@ -472,6 +480,7 @@ fn build_jobs(
             hot_pct,
             hotset_pct,
             verify: job.verify.unwrap_or(cli.verify),
+            batch_writes: job.batch_writes.unwrap_or(cli.batch_writes),
             seed,
         };
         validate_job(&bench, warmup_secs)?;
@@ -493,7 +502,9 @@ fn run_phase(
     let mut handles = Vec::new();
 
     for job in jobs {
-        let lanes = if job.workload == WorkloadKind::Read && !job.verify {
+        let use_batch_writes =
+            job.workload == WorkloadKind::Write && !job.verify && job.batch_writes;
+        let lanes = if (job.workload == WorkloadKind::Read && !job.verify) || use_batch_writes {
             job.workers
         } else {
             job.workers * job.iodepth
@@ -505,6 +516,8 @@ fn run_phase(
             handles.push(std::thread::spawn(move || {
                 if job.workload == WorkloadKind::Read && !job.verify {
                     read_batch_worker_loop(job, lane, stop, counters)
+                } else if job.workload == WorkloadKind::Write && !job.verify && job.batch_writes {
+                    write_batch_worker_loop(job, lane, stop, counters)
                 } else {
                     worker_loop(job, lane, stop, counters)
                 }
@@ -541,7 +554,10 @@ fn read_batch_worker_loop(
     counters: SharedCounters,
 ) -> WorkerStats {
     let mut rng = StdRng::seed_from_u64(job.seed.wrapping_add(lane as u64));
-    let mut bufs: Vec<Vec<u8>> = (0..job.iodepth).map(|_| vec![0u8; job.io_len]).collect();
+    let mut bufs: Vec<AlignedBuf> = match alloc_aligned_batch(job.iodepth, job.io_len) {
+        Ok(bufs) => bufs,
+        Err(e) => return worker_init_error(job, lane, counters, "aligned read buffers", e),
+    };
     let mut offsets = vec![0u64; job.iodepth];
     let mut seq = job.offset_bytes + ((lane as u64 * job.io_len as u64) % job.work_bytes);
     let mut stats = WorkerStats {
@@ -557,7 +573,10 @@ fn read_batch_worker_loop(
         let mut ops: Vec<(u64, &mut [u8])> = offsets
             .iter()
             .copied()
-            .zip(bufs.iter_mut().map(|buf| buf.as_mut_slice()))
+            .zip(
+                bufs.iter_mut()
+                    .map(|buf| &mut buf.as_mut_slice()[..job.io_len]),
+            )
             .collect();
         let result = job.ld.read_many_at(&mut ops);
         let elapsed = t0.elapsed().as_micros() as u64;
@@ -592,6 +611,68 @@ fn read_batch_worker_loop(
     stats
 }
 
+fn write_batch_worker_loop(
+    job: BenchJob,
+    lane: usize,
+    stop: Arc<AtomicBool>,
+    counters: SharedCounters,
+) -> WorkerStats {
+    let mut rng = StdRng::seed_from_u64(job.seed.wrapping_add(lane as u64));
+    let mut bufs: Vec<AlignedBuf> = match alloc_aligned_batch(job.iodepth, job.io_len) {
+        Ok(bufs) => bufs,
+        Err(e) => return worker_init_error(job, lane, counters, "aligned write buffers", e),
+    };
+    let mut offsets = vec![0u64; job.iodepth];
+    let mut seq = job.offset_bytes + ((lane as u64 * job.io_len as u64) % job.work_bytes);
+    let mut stats = WorkerStats {
+        job: job.name.clone(),
+        ..Default::default()
+    };
+
+    while !stop.load(Ordering::Relaxed) {
+        for (i, offset) in offsets.iter_mut().enumerate() {
+            *offset = choose_offset(&job, &mut rng, &mut seq);
+            fill_verify_pattern(&mut bufs[i].as_mut_slice()[..job.io_len], *offset);
+        }
+        let t0 = Instant::now();
+        let ops: Vec<(u64, &[u8])> = offsets
+            .iter()
+            .copied()
+            .zip(bufs.iter().map(|buf| &buf.as_slice()[..job.io_len]))
+            .collect();
+        let result = job.ld.write_many_at(&ops);
+        let elapsed = t0.elapsed().as_micros() as u64;
+        let per_io_latency = (elapsed / job.iodepth.max(1) as u64).max(1);
+        match result {
+            Ok(()) => {
+                for _ in 0..job.iodepth {
+                    stats.ops += 1;
+                    stats.write_ops += 1;
+                    stats.bytes += job.io_len as u64;
+                    stats.latency_us.push(per_io_latency);
+                }
+                counters
+                    .ops
+                    .fetch_add(job.iodepth as u64, Ordering::Relaxed);
+                counters
+                    .write_ops
+                    .fetch_add(job.iodepth as u64, Ordering::Relaxed);
+                counters
+                    .bytes
+                    .fetch_add(job.iodepth as u64 * job.io_len as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                stats.errors += job.iodepth as u64;
+                counters
+                    .errors
+                    .fetch_add(job.iodepth as u64, Ordering::Relaxed);
+                eprintln!("job={} lane={} batch write error: {}", job.name, lane, e);
+            }
+        }
+    }
+    stats
+}
+
 fn worker_loop(
     job: BenchJob,
     lane: usize,
@@ -599,9 +680,18 @@ fn worker_loop(
     counters: SharedCounters,
 ) -> WorkerStats {
     let mut rng = StdRng::seed_from_u64(job.seed.wrapping_add(lane as u64));
-    let mut read_buf = vec![0u8; job.io_len];
-    let mut write_buf = vec![0u8; job.io_len];
-    let mut verify_buf = vec![0u8; job.io_len];
+    let mut read_buf = match AlignedBuf::new(job.io_len) {
+        Ok(buf) => buf,
+        Err(e) => return worker_init_error(job, lane, counters, "aligned read buffer", e),
+    };
+    let mut write_buf = match AlignedBuf::new(job.io_len) {
+        Ok(buf) => buf,
+        Err(e) => return worker_init_error(job, lane, counters, "aligned write buffer", e),
+    };
+    let mut verify_buf = match AlignedBuf::new(job.io_len) {
+        Ok(buf) => buf,
+        Err(e) => return worker_init_error(job, lane, counters, "aligned verify buffer", e),
+    };
     let mut seq = job.offset_bytes + ((lane as u64 * job.io_len as u64) % job.work_bytes);
     let mut stats = WorkerStats {
         job: job.name.clone(),
@@ -612,15 +702,17 @@ fn worker_loop(
         let is_read = choose_read(job.workload, job.read_pct, &mut rng);
         let offset = choose_offset(&job, &mut rng, &mut seq);
         if !is_read {
-            fill_verify_pattern(&mut write_buf, offset);
+            fill_verify_pattern(&mut write_buf.as_mut_slice()[..job.io_len], offset);
         }
 
         let t0 = Instant::now();
         let result = if is_read {
-            let result = job.ld.read_at(offset, &mut read_buf);
+            let result = job
+                .ld
+                .read_at(offset, &mut read_buf.as_mut_slice()[..job.io_len]);
             if result.is_ok() && job.verify {
-                fill_verify_pattern(&mut verify_buf, offset);
-                if read_buf != verify_buf {
+                fill_verify_pattern(&mut verify_buf.as_mut_slice()[..job.io_len], offset);
+                if read_buf.as_slice()[..job.io_len] != verify_buf.as_slice()[..job.io_len] {
                     Err(onyx_chunklet::ChunkletError::Invariant(format!(
                         "verify mismatch job={} offset={}",
                         job.name, offset
@@ -632,10 +724,18 @@ fn worker_loop(
                 result
             }
         } else {
-            let result = job.ld.write_at(offset, &write_buf);
+            let result = job.ld.write_at(offset, &write_buf.as_slice()[..job.io_len]);
             if result.is_ok() && job.verify {
-                match job.ld.read_at(offset, &mut verify_buf) {
-                    Ok(()) if verify_buf == write_buf => Ok(()),
+                match job
+                    .ld
+                    .read_at(offset, &mut verify_buf.as_mut_slice()[..job.io_len])
+                {
+                    Ok(())
+                        if verify_buf.as_slice()[..job.io_len]
+                            == write_buf.as_slice()[..job.io_len] =>
+                    {
+                        Ok(())
+                    }
                     Ok(()) => Err(onyx_chunklet::ChunkletError::Invariant(format!(
                         "write verify mismatch job={} offset={}",
                         job.name, offset
@@ -679,6 +779,29 @@ fn worker_loop(
         }
     }
     stats
+}
+
+fn alloc_aligned_batch(count: usize, len: usize) -> ChunkletResult<Vec<AlignedBuf>> {
+    (0..count).map(|_| AlignedBuf::new(len)).collect()
+}
+
+fn worker_init_error(
+    job: BenchJob,
+    lane: usize,
+    counters: SharedCounters,
+    what: &str,
+    error: onyx_chunklet::ChunkletError,
+) -> WorkerStats {
+    counters.errors.fetch_add(1, Ordering::Relaxed);
+    eprintln!(
+        "job={} lane={} init error allocating {}: {}",
+        job.name, lane, what, error
+    );
+    WorkerStats {
+        job: job.name,
+        errors: 1,
+        ..Default::default()
+    }
 }
 
 fn choose_read(workload: WorkloadKind, read_pct: u8, rng: &mut StdRng) -> bool {

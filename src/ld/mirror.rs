@@ -42,7 +42,7 @@
 //!   self-heal via `Pool::scrub_ld` (majority vote); 2-way mirrors require
 //!   `Pool::mark_chunklet_bad` to identify the bad copy explicitly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -376,4 +376,67 @@ impl LogicalDisk for LdMirror {
             parallel_strip_writes(ops)
         })
     }
+
+    fn write_many_at(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
+        for (offset, buf) in ops {
+            self.ensure_aligned(*offset, buf.len())?;
+            if buf.len() != self.strip_bytes as usize {
+                return self.write_many_fallback(ops);
+            }
+        }
+        if has_duplicate_offsets(ops) {
+            return self.write_many_fallback(ops);
+        }
+
+        let mut stripe_keys = Vec::with_capacity(ops.len());
+        let mut writes = Vec::with_capacity(ops.len() * self.desc.set_size as usize);
+        for (offset, buf) in ops {
+            let mut prepared = Vec::new();
+            self.for_each_segment(*offset, buf.len(), |row, set, off_in_c, range| {
+                if range.start != 0 || range.end != buf.len() {
+                    return Err(ChunkletError::Invariant(
+                        "mirror write_many split unexpected range".into(),
+                    ));
+                }
+                stripe_keys.push(self.stripe_key(row, set, off_in_c));
+                let copies = self.member_indices_for(row, set);
+                for member_idx in copies.clone() {
+                    if let Some(pd) = self.members[member_idx].as_ref() {
+                        prepared.push(StripWrite {
+                            pd: pd.clone(),
+                            chunklet_index: self.desc.members[member_idx].chunklet_index,
+                            in_chunklet_off: off_in_c,
+                            data: *buf,
+                        });
+                    }
+                }
+                if prepared.is_empty() {
+                    return Err(ChunkletError::Invariant(format!(
+                        "Mirror set (row={}, set={}) write_many: no live copy",
+                        row, set
+                    )));
+                }
+                Ok(())
+            })?;
+            writes.extend(prepared);
+        }
+        let stripe_guards = self.stripe_locks.write_keys(&stripe_keys);
+        let result = parallel_strip_writes(writes);
+        drop(stripe_guards);
+        result
+    }
+}
+
+impl LdMirror {
+    fn write_many_fallback(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
+        for (offset, buf) in ops {
+            self.write_at(*offset, buf)?;
+        }
+        Ok(())
+    }
+}
+
+fn has_duplicate_offsets(ops: &[(u64, &[u8])]) -> bool {
+    let mut seen = HashSet::with_capacity(ops.len());
+    ops.iter().any(|(offset, _)| !seen.insert(*offset))
 }

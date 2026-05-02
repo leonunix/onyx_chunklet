@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::thread;
 
 use onyx_chunklet::io::RawDevice;
-use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
 use onyx_chunklet::{Pool, PoolConfig};
@@ -96,6 +95,35 @@ fn raid10_round_trip_with_strip_alignment() {
     let mut readback = vec![0u8; payload.len()];
     ld.read_at(0, &mut readback).unwrap();
     assert_eq!(readback, payload);
+}
+
+#[test]
+fn raid10_write_many_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, &["pd0", "pd1", "pd2", "pd3"]);
+    let id = pool.create_ld(LdSpec::mirror(2, 2, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+
+    let payloads: Vec<Vec<u8>> = (0..16)
+        .map(|i| {
+            (0..strip)
+                .map(|j| ((i * 31 + j * 7 + 13) % 251) as u8)
+                .collect()
+        })
+        .collect();
+    let ops: Vec<(u64, &[u8])> = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, payload)| ((i * strip) as u64, payload.as_slice()))
+        .collect();
+    ld.write_many_at(&ops).unwrap();
+
+    for (i, payload) in payloads.iter().enumerate() {
+        let mut readback = vec![0u8; strip];
+        ld.read_at((i * strip) as u64, &mut readback).unwrap();
+        assert_eq!(&readback, payload, "strip {}", i);
+    }
 }
 
 #[test]

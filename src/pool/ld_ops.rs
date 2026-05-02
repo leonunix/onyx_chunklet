@@ -92,6 +92,21 @@ impl LogicalDisk for RuntimeLogicalDisk {
         self.runtime.check_open(self.id(), self.opened_epoch)?;
         self.inner.write_at(offset, buf)
     }
+
+    fn write_many_at(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
+        self.runtime.check_open(self.id(), self.opened_epoch)?;
+        let _lifecycle = self.runtime.io_lock.read();
+        let mut keys = Vec::new();
+        for (offset, buf) in ops {
+            let (first, last) = self.range_keys(*offset, buf.len());
+            keys.extend(first..=last);
+        }
+        let range_guards = self.runtime.range_locks.write_keys(&keys);
+        self.runtime.check_open(self.id(), self.opened_epoch)?;
+        self.inner.write_many_at(ops)?;
+        drop(range_guards);
+        Ok(())
+    }
 }
 
 /// Caller-supplied LD-creation spec.
