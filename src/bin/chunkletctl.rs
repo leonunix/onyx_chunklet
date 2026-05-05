@@ -264,6 +264,18 @@ enum LdOp {
         /// LD uuid.
         ld_id: String,
     },
+    /// Append `rows` rows of capacity to an existing LD. Cheap on every
+    /// RAID level — no parity recompute, no rebuild — but the pool needs
+    /// enough free chunklets across distinct PDs.
+    Extend {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// LD uuid.
+        ld_id: String,
+        /// Number of rows to append.
+        #[arg(long)]
+        rows: u16,
+    },
     /// Run a scrub pass: verify parity / mirror copies, mark culprit
     /// chunklets Bad. Run `rebuild` afterwards to swap them onto fresh
     /// chunklets.
@@ -534,9 +546,7 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             Ok(())
         }
         LdOp::Drop { pool, ld_id } => {
-            let parsed = uuid::Uuid::parse_str(&ld_id)
-                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
-            let id = LdId::from_bytes(*parsed.as_bytes());
+            let id = parse_ld_id(&ld_id)?;
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
             pool.drop_ld(id)?;
@@ -544,10 +554,20 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             print_ld_table(&pool);
             Ok(())
         }
+        LdOp::Extend { pool, ld_id, rows } => {
+            let id = parse_ld_id(&ld_id)?;
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let new_capacity = pool.extend_ld(id, rows)?;
+            println!(
+                "extended LD {} by {} row(s); new capacity = {} bytes",
+                id, rows, new_capacity
+            );
+            print_ld_table(&pool);
+            Ok(())
+        }
         LdOp::Scrub { pool, ld_id } => {
-            let parsed = uuid::Uuid::parse_str(&ld_id)
-                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
-            let id = LdId::from_bytes(*parsed.as_bytes());
+            let id = parse_ld_id(&ld_id)?;
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
             let report = pool.scrub_ld(id)?;
@@ -571,9 +591,7 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             ld_id,
             allow_missing,
         } => {
-            let parsed = uuid::Uuid::parse_str(&ld_id)
-                .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
-            let id = LdId::from_bytes(*parsed.as_bytes());
+            let id = parse_ld_id(&ld_id)?;
             let raws = open_devices(&pool)?;
             let pool = if allow_missing {
                 Pool::open_with_missing(raws)?
@@ -696,6 +714,12 @@ fn parse_pd_id(s: &str) -> ChunkletResult<PdId> {
     let parsed = uuid::Uuid::parse_str(s)
         .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
     Ok(PdId::from_bytes(*parsed.as_bytes()))
+}
+
+fn parse_ld_id(s: &str) -> ChunkletResult<LdId> {
+    let parsed = uuid::Uuid::parse_str(s)
+        .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
+    Ok(LdId::from_bytes(*parsed.as_bytes()))
 }
 
 fn print_spare_rebalance(report: &SpareRebalanceReport) {

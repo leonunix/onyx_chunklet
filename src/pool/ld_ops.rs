@@ -293,23 +293,7 @@ impl Pool {
         let pd_views = self.snapshot_free_views()?;
         let total_members =
             (spec.set_size as usize) * (spec.row_size as usize) * (spec.num_rows as usize);
-        // Build per-set role pattern, then repeat for every set in the LD.
-        let role_per_set: Vec<LdRole> = match spec.raid_level {
-            RaidLevel::Plain | RaidLevel::Mirror | RaidLevel::Raid0 => {
-                vec![LdRole::Data; spec.set_size as usize]
-            }
-            RaidLevel::Raid5 => {
-                let mut v = vec![LdRole::Data; (spec.set_size - 1) as usize];
-                v.push(LdRole::ParityP);
-                v
-            }
-            RaidLevel::Raid6 => {
-                let mut v = vec![LdRole::Data; (spec.set_size - 2) as usize];
-                v.push(LdRole::ParityP);
-                v.push(LdRole::ParityQ);
-                v
-            }
-        };
+        let role_per_set = role_pattern_for(spec.raid_level, spec.set_size);
         let mut role_assignments = Vec::with_capacity(total_members);
         for _ in 0..((spec.row_size as usize) * (spec.num_rows as usize)) {
             role_assignments.extend_from_slice(&role_per_set);
@@ -438,6 +422,113 @@ impl Pool {
         Ok(())
     }
 
+    /// Append `additional_rows` rows of capacity to an existing LD.
+    ///
+    /// Cheap for every RAID level because the descriptor stores members
+    /// row-major and each row's parity (R5/R6) depends only on data within
+    /// that row's sets — appending rows leaves existing rows' data and
+    /// parity untouched.
+    ///
+    /// Returns the new total capacity in bytes. `additional_rows = 0` is a
+    /// no-op that returns the current capacity.
+    ///
+    /// Extend is additive and does not bump `LdRuntime` epoch: handles
+    /// opened before the extend stay valid at their old capacity. Callers
+    /// that want to address the new range must call `Pool::open_ld` to
+    /// get a fresh handle.
+    pub fn extend_ld(&self, id: LdId, additional_rows: u16) -> ChunkletResult<u64> {
+        // Lock order matches `drop_ld`: manifest_lock first, then the LD's
+        // io_lock. We take `read` on io_lock so concurrent user IO can run,
+        // but blocks against rebuild/scrub/drop/drain (which take `write`).
+        // Rebuild bumps existing members' `generation`, and we must not
+        // regress those between cloning and re-encoding the descriptor.
+        let _commit = self.manifest_lock.lock();
+        let (runtime, existing, ld_list_snapshot, pds_snapshot) = {
+            let s = self.state.read();
+            let runtime = s
+                .ld_runtime
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", id)))?;
+            let existing = s
+                .ld_list
+                .find(id)
+                .cloned()
+                .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", id)))?;
+            (runtime, existing, s.ld_list.clone(), s.pds.clone())
+        };
+        let _io = runtime.io_lock.read();
+
+        if additional_rows == 0 {
+            return existing.capacity_bytes();
+        }
+
+        let new_num_rows = existing
+            .num_rows
+            .checked_add(additional_rows)
+            .ok_or_else(|| {
+                ChunkletError::Invariant(format!(
+                    "extend_ld: num_rows overflow ({} + {})",
+                    existing.num_rows, additional_rows
+                ))
+            })?;
+
+        // HaDomain is not stored on the descriptor; only `Pd` is supported
+        // by the allocator today, so reconstruct that on extend.
+        let role_per_set = role_pattern_for(existing.raid_level, existing.set_size);
+        let new_set_count = (existing.row_size as usize) * (additional_rows as usize);
+        let mut role_assignments = Vec::with_capacity(role_per_set.len() * new_set_count);
+        for _ in 0..new_set_count {
+            role_assignments.extend_from_slice(&role_per_set);
+        }
+
+        let pd_views = self.snapshot_free_views()?;
+        let plan = plan_alloc(
+            &AllocRequest {
+                set_size: existing.set_size,
+                row_size: existing.row_size,
+                num_rows: additional_rows,
+                role_assignments,
+                ha_domain: HaDomain::Pd,
+            },
+            pd_views,
+        )?;
+
+        let mut new_desc = existing.clone();
+        new_desc.num_rows = new_num_rows;
+        new_desc.members.extend(plan.members);
+
+        // `next.encode()` enforces the descriptor's u16 size limit and
+        // returns ChunkletError::Format on overflow.
+        let mut next = ld_list_snapshot;
+        next.upsert(new_desc.clone());
+        let new_ld_bytes = next.encode()?;
+
+        // Only freshly-allocated members get header writes + bitmap flips.
+        // Touching old members would clobber their rebuild `generation`.
+        let mut new_chunklets_by_pd: BTreeMap<PdId, Vec<(u32, LdRole)>> = BTreeMap::new();
+        for m in &new_desc.members[existing.members.len()..] {
+            new_chunklets_by_pd
+                .entry(m.pd)
+                .or_default()
+                .push((m.chunklet_index, m.role));
+        }
+
+        if let Err(e) =
+            self.do_per_pd_commits(&new_desc, &new_chunklets_by_pd, &pds_snapshot, &new_ld_bytes)
+        {
+            tracing::error!(
+                "extend_ld failed mid-commit; in-memory was not published, on-disk may be inconsistent: {}",
+                e
+            );
+            return Err(e);
+        }
+
+        let new_capacity = new_desc.capacity_bytes()?;
+        self.state.write().ld_list.upsert(new_desc);
+        Ok(new_capacity)
+    }
+
     pub(crate) fn snapshot_free_views(&self) -> ChunkletResult<Vec<PdFreeView>> {
         let s = self.state.read();
         let pds = s
@@ -528,5 +619,24 @@ impl Pool {
             })?;
         }
         Ok(())
+    }
+}
+
+fn role_pattern_for(raid_level: RaidLevel, set_size: u8) -> Vec<LdRole> {
+    match raid_level {
+        RaidLevel::Plain | RaidLevel::Mirror | RaidLevel::Raid0 => {
+            vec![LdRole::Data; set_size as usize]
+        }
+        RaidLevel::Raid5 => {
+            let mut v = vec![LdRole::Data; (set_size - 1) as usize];
+            v.push(LdRole::ParityP);
+            v
+        }
+        RaidLevel::Raid6 => {
+            let mut v = vec![LdRole::Data; (set_size - 2) as usize];
+            v.push(LdRole::ParityP);
+            v.push(LdRole::ParityQ);
+            v
+        }
     }
 }

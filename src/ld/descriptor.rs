@@ -31,10 +31,11 @@
 use std::convert::TryInto;
 
 use crate::error::{ChunkletError, ChunkletResult};
-use crate::types::{LdId, LdMember, LdRole, PdId, RaidLevel};
+use crate::types::{LdId, LdMember, LdRole, PdId, RaidLevel, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
 
 const DESC_HEADER_BYTES: usize = 32;
 const MEMBER_BYTES: usize = 24;
+const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LdDescriptor {
@@ -50,6 +51,36 @@ pub struct LdDescriptor {
 impl LdDescriptor {
     pub fn encoded_len(&self) -> usize {
         DESC_HEADER_BYTES + self.members.len() * MEMBER_BYTES
+    }
+
+    /// Logical user-addressable capacity (bytes), derived purely from the
+    /// descriptor — no PD resolution required. Each LD impl computes this
+    /// at `open_with_health` time, but the formula is determined entirely
+    /// by `(raid_level, set_size, row_size, num_rows, strip_size_log2)`,
+    /// so any caller holding a descriptor can ask without opening the LD.
+    pub fn capacity_bytes(&self) -> ChunkletResult<u64> {
+        let strip_bytes = super::compute_strip_bytes(self.strip_size_log2)?;
+        if strip_bytes > CHUNKLET_USER_BYTES {
+            return Err(ChunkletError::Invariant(format!(
+                "strip_bytes {} > chunklet_user_size {}",
+                strip_bytes, CHUNKLET_USER_BYTES
+            )));
+        }
+        let usable_per_chunklet = (CHUNKLET_USER_BYTES / strip_bytes) * strip_bytes;
+        let row_size = self.row_size as u64;
+        let num_rows = self.num_rows as u64;
+        Ok(match self.raid_level {
+            RaidLevel::Plain => (self.members.len() as u64) * CHUNKLET_USER_BYTES,
+            RaidLevel::Mirror | RaidLevel::Raid0 => row_size * num_rows * usable_per_chunklet,
+            RaidLevel::Raid5 => {
+                let data_per_set = (self.set_size - 1) as u64;
+                row_size * num_rows * data_per_set * usable_per_chunklet
+            }
+            RaidLevel::Raid6 => {
+                let data_per_set = (self.set_size - 2) as u64;
+                row_size * num_rows * data_per_set * usable_per_chunklet
+            }
+        })
     }
 
     pub fn encode(&self) -> ChunkletResult<Vec<u8>> {
