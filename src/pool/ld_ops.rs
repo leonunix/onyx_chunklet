@@ -445,11 +445,10 @@ impl Pool {
         let _commit = self.manifest_lock.lock();
         let (runtime, existing, ld_list_snapshot, pds_snapshot) = {
             let s = self.state.read();
-            let runtime = s
-                .ld_runtime
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", id)))?;
+            let runtime =
+                s.ld_runtime.get(&id).cloned().ok_or_else(|| {
+                    ChunkletError::Invariant(format!("LD {} runtime not found", id))
+                })?;
             let existing = s
                 .ld_list
                 .find(id)
@@ -514,9 +513,12 @@ impl Pool {
                 .push((m.chunklet_index, m.role));
         }
 
-        if let Err(e) =
-            self.do_per_pd_commits(&new_desc, &new_chunklets_by_pd, &pds_snapshot, &new_ld_bytes)
-        {
+        if let Err(e) = self.do_per_pd_commits(
+            &new_desc,
+            &new_chunklets_by_pd,
+            &pds_snapshot,
+            &new_ld_bytes,
+        ) {
             tracing::error!(
                 "extend_ld failed mid-commit; in-memory was not published, on-disk may be inconsistent: {}",
                 e

@@ -41,7 +41,10 @@ use rand::{Rng, SeedableRng};
 use std::convert::TryInto;
 
 #[derive(Parser, Debug)]
-#[command(name = "chunklet-soak", about = "Standalone chunklet fault-injection + verify harness")]
+#[command(
+    name = "chunklet-soak",
+    about = "Standalone chunklet fault-injection + verify harness"
+)]
 struct Cli {
     /// Pool device paths (>= 2). Comma-separated.
     #[arg(long, value_delimiter = ',')]
@@ -112,7 +115,11 @@ fn run(cli: Cli) -> ChunkletResult<()> {
     }
     let raws = open_or_create_devices(&cli.devices, cli.sparse_size_bytes)?;
     let pool = if cli.init {
-        eprintln!("init pool with {} PDs (spare_pct={})", raws.len(), cli.spare_pct);
+        eprintln!(
+            "init pool with {} PDs (spare_pct={})",
+            raws.len(),
+            cli.spare_pct
+        );
         Pool::create(
             raws,
             PoolConfig {
@@ -163,7 +170,10 @@ fn provision_lds(pool: &Arc<Pool>, pd_count: usize, rows: u16) -> ChunkletResult
     ];
     for (name, raid, set_size, row_size, min_pds) in cases {
         if pd_count < min_pds {
-            eprintln!("skipping {} (needs {} PDs, pool has {})", name, min_pds, pd_count);
+            eprintln!(
+                "skipping {} (needs {} PDs, pool has {})",
+                name, min_pds, pd_count
+            );
             continue;
         }
         let cpg = pool.create_cpg(CpgSpec {
@@ -295,10 +305,7 @@ fn verify_loop(
                 }
                 fill_pattern(&mut expected, *ld_id, off);
                 if buf != expected {
-                    eprintln!(
-                        "worker {} LD {} MISMATCH at offset {}",
-                        w, ld_id, off
-                    );
+                    eprintln!("worker {} LD {} MISMATCH at offset {}", w, ld_id, off);
                     errors.fetch_add(1, Ordering::Relaxed);
                 } else {
                     ops.fetch_add(1, Ordering::Relaxed);

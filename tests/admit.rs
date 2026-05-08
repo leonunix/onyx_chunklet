@@ -24,14 +24,22 @@ fn admit_then_existing_ld_io_round_trips() {
     let (pool, _paths) = make_pool(&dir, 4);
     let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
     let ld = pool.open_ld(id).unwrap();
-    let payload: Vec<u8> = (0..(36 << 10)).map(|i| ((i * 31 + 5) % 251) as u8).collect();
+    let payload: Vec<u8> = (0..(36 << 10))
+        .map(|i| ((i * 31 + 5) % 251) as u8)
+        .collect();
     ld.write_at(0, &payload).unwrap();
 
     // Admit a 5th PD into the running pool.
     let new_path = dir.path().join("pd_admit");
     let new_raw = RawDevice::open_or_create(&new_path, PD_SIZE).unwrap();
     let new_pd_id = pool
-        .admit(new_raw, PoolConfig { spare_pct: 0, ..Default::default() })
+        .admit(
+            new_raw,
+            PoolConfig {
+                spare_pct: 0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(pool.pd_count(), 5);
 
@@ -75,8 +83,14 @@ fn admit_persists_then_full_reopen_serves_io() {
 
     let new_path = dir.path().join("pd_admit");
     let new_raw = RawDevice::open_or_create(&new_path, PD_SIZE).unwrap();
-    pool.admit(new_raw, PoolConfig { spare_pct: 0, ..Default::default() })
-        .unwrap();
+    pool.admit(
+        new_raw,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     drop(pool);
 
     let mut all_paths = paths;

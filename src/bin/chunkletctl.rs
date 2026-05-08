@@ -8,6 +8,8 @@
 //!   - `pd scan <dev>`         — scan all 4 superblock slots, print decoded info
 
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use onyx_chunklet::io::{AlignedBuf, RawDevice};
@@ -117,6 +119,24 @@ enum PoolOp {
         /// Run scrub before rebuild so identifiable corrupt copies become Bad.
         #[arg(long, default_value_t = false)]
         scrub_first: bool,
+    },
+    /// Periodically open a pool with whatever devices are present and run auto-recover.
+    RecoverLoop {
+        /// Full pool device list. Missing/unopenable paths are skipped each cycle.
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// Run scrub before rebuild so identifiable corrupt copies become Bad.
+        #[arg(long, default_value_t = false)]
+        scrub_first: bool,
+        /// Seconds between recovery cycles.
+        #[arg(long, default_value_t = 30)]
+        interval_secs: u64,
+        /// Stop after this many cycles. 0 means run forever.
+        #[arg(long, default_value_t = 0)]
+        max_cycles: u64,
+        /// Return non-zero if a recovery cycle reports failed LDs.
+        #[arg(long, default_value_t = false)]
+        fail_on_error: bool,
     },
 }
 
@@ -450,6 +470,63 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             }
             Ok(())
         }
+        PoolOp::RecoverLoop {
+            pool,
+            scrub_first,
+            interval_secs,
+            max_cycles,
+            fail_on_error,
+        } => run_recover_loop(&pool, scrub_first, interval_secs, max_cycles, fail_on_error),
+    }
+}
+
+fn run_recover_loop(
+    pool_paths: &[PathBuf],
+    scrub_first: bool,
+    interval_secs: u64,
+    max_cycles: u64,
+    fail_on_error: bool,
+) -> ChunkletResult<()> {
+    if pool_paths.is_empty() {
+        return Err(onyx_chunklet::ChunkletError::Config(
+            "--pool requires at least one device".into(),
+        ));
+    }
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let mut cycle = 0u64;
+    loop {
+        cycle += 1;
+        println!("recover-loop: cycle={} opening pool", cycle);
+        match open_available_devices(pool_paths) {
+            Ok(raws) => {
+                println!(
+                    "recover-loop: opened {}/{} devices",
+                    raws.len(),
+                    pool_paths.len()
+                );
+                let pool = Pool::open_with_missing(raws)?;
+                let report = pool.auto_recover(scrub_first);
+                print_auto_recover(&report);
+                print_pool_status(&pool.metrics()?);
+                if fail_on_error && report.failed > 0 {
+                    return Err(onyx_chunklet::ChunkletError::Invariant(format!(
+                        "recover-loop cycle {} failed on {} LDs",
+                        cycle, report.failed
+                    )));
+                }
+            }
+            Err(e) => {
+                eprintln!("recover-loop: open failed: {}", e);
+                if fail_on_error {
+                    return Err(e);
+                }
+            }
+        }
+
+        if max_cycles != 0 && cycle >= max_cycles {
+            return Ok(());
+        }
+        thread::sleep(interval);
     }
 }
 
@@ -903,6 +980,22 @@ fn open_devices(paths: &[PathBuf]) -> ChunkletResult<Vec<RawDevice>> {
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
         out.push(RawDevice::open(p)?);
+    }
+    Ok(out)
+}
+
+fn open_available_devices(paths: &[PathBuf]) -> ChunkletResult<Vec<RawDevice>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        match RawDevice::open(p) {
+            Ok(raw) => out.push(raw),
+            Err(e) => eprintln!("recover-loop: skipping {}: {}", p.display(), e),
+        }
+    }
+    if out.is_empty() {
+        return Err(onyx_chunklet::ChunkletError::Config(
+            "no pool devices could be opened".into(),
+        ));
     }
     Ok(out)
 }

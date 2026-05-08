@@ -150,9 +150,7 @@ impl LdDescriptor {
             let off = DESC_HEADER_BYTES + i * MEMBER_BYTES;
             members.push(LdMember {
                 pd: PdId::from_bytes(bytes[off..off + 16].try_into().unwrap()),
-                chunklet_index: u32::from_le_bytes(
-                    bytes[off + 16..off + 20].try_into().unwrap(),
-                ),
+                chunklet_index: u32::from_le_bytes(bytes[off + 16..off + 20].try_into().unwrap()),
                 role: LdRole::from_u8(bytes[off + 20])?,
                 // Old (pre-Commit-3) descriptors wrote 0 into the reserved
                 // byte at [21]; new descriptors stamp the rebuild counter
@@ -185,7 +183,8 @@ pub struct LdList {
 
 impl LdList {
     pub fn encode(&self) -> ChunkletResult<Vec<u8>> {
-        let mut out = Vec::with_capacity(4 + self.lds.iter().map(|d| d.encoded_len()).sum::<usize>());
+        let mut out =
+            Vec::with_capacity(4 + self.lds.iter().map(|d| d.encoded_len()).sum::<usize>());
         out.extend_from_slice(&(self.lds.len() as u32).to_le_bytes());
         for d in &self.lds {
             out.extend_from_slice(&d.encode()?);

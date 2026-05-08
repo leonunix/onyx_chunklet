@@ -179,8 +179,7 @@ impl SuperblockSlot {
             )));
         }
         let body_start = SLOT_HEADER_BYTES;
-        let body =
-            SuperblockBody::decode(&bytes[body_start..body_start + body_len])?;
+        let body = SuperblockBody::decode(&bytes[body_start..body_start + body_len])?;
         Ok(Self {
             pool_id,
             pd_id,
@@ -298,9 +297,11 @@ impl SuperblockBody {
         let cpg_list_bytes_len = u32::from_le_bytes(bytes[56..60].try_into().unwrap()) as usize;
 
         let pd_list_end = pd_list_offset
-            .checked_add(pd_list_len.checked_mul(PD_LIST_ENTRY_BYTES).ok_or_else(|| {
-                ChunkletError::Format("pd_list size overflow".into())
-            })?)
+            .checked_add(
+                pd_list_len
+                    .checked_mul(PD_LIST_ENTRY_BYTES)
+                    .ok_or_else(|| ChunkletError::Format("pd_list size overflow".into()))?,
+            )
             .ok_or_else(|| ChunkletError::Format("pd_list end overflow".into()))?;
         if pd_list_end > bytes.len() {
             return Err(ChunkletError::Format(format!(
@@ -320,9 +321,9 @@ impl SuperblockBody {
             pd_list.push(entry);
         }
 
-        let ld_list_end = ld_list_offset.checked_add(ld_list_bytes_len).ok_or_else(|| {
-            ChunkletError::Format("ld_list end overflow".into())
-        })?;
+        let ld_list_end = ld_list_offset
+            .checked_add(ld_list_bytes_len)
+            .ok_or_else(|| ChunkletError::Format("ld_list end overflow".into()))?;
         if ld_list_end > bytes.len() {
             return Err(ChunkletError::Format(format!(
                 "ld_list out of bounds: end={} body_len={}",
@@ -337,9 +338,9 @@ impl SuperblockBody {
         let cpg_list_bytes = if cpg_list_offset == 0 && cpg_list_bytes_len == 0 {
             Vec::new()
         } else {
-            let end = cpg_list_offset.checked_add(cpg_list_bytes_len).ok_or_else(|| {
-                ChunkletError::Format("cpg_list end overflow".into())
-            })?;
+            let end = cpg_list_offset
+                .checked_add(cpg_list_bytes_len)
+                .ok_or_else(|| ChunkletError::Format("cpg_list end overflow".into()))?;
             if end > bytes.len() {
                 return Err(ChunkletError::Format(format!(
                     "cpg_list out of bounds: end={} body_len={}",
@@ -375,17 +376,26 @@ mod tests {
 
     fn sample_body() -> SuperblockBody {
         let mut body = SuperblockBody::new_empty(
-            1024 * 1024,    // pd_size_blocks (4 GiB)
-            256, 256,
-            3,              // total_chunklets
-            0,              // pd_seq_in_pool
-            2,              // pool_pd_count
-            5,              // spare_pct
+            1024 * 1024, // pd_size_blocks (4 GiB)
+            256,
+            256,
+            3, // total_chunklets
+            0, // pd_seq_in_pool
+            2, // pool_pd_count
+            5, // spare_pct
         );
         body.bitmap_crc32c = 0xdead_beef;
         body.pd_list = vec![
-            PoolPdEntry { pd_id: PdId::new_v4(), pd_seq: 0, flags: 0 },
-            PoolPdEntry { pd_id: PdId::new_v4(), pd_seq: 1, flags: 0 },
+            PoolPdEntry {
+                pd_id: PdId::new_v4(),
+                pd_seq: 0,
+                flags: 0,
+            },
+            PoolPdEntry {
+                pd_id: PdId::new_v4(),
+                pd_seq: 1,
+                flags: 0,
+            },
         ];
         body
     }

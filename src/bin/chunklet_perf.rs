@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use onyx_chunklet::io::{AlignedBuf, IoBackendKind, RawDevice};
-use onyx_chunklet::ld::LogicalDisk;
+use onyx_chunklet::ld::{gf256, LogicalDisk};
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{LdId, BLOCK_SIZE};
 use onyx_chunklet::{ChunkletResult, Pool, PoolConfig};
@@ -375,6 +375,7 @@ fn run(cli: Cli) -> ChunkletResult<()> {
     eprintln!("measure: {}s", runtime_secs);
     let stats = run_phase(&jobs, runtime_secs, report_secs, true)?;
     print_summary(&stats, runtime_secs);
+    print_gf256_summary();
     if stats.iter().any(|s| s.errors > 0) {
         let errors: u64 = stats.iter().map(|s| s.errors).sum();
         return Err(onyx_chunklet::ChunkletError::Invariant(format!(
@@ -383,6 +384,22 @@ fn run(cli: Cli) -> ChunkletResult<()> {
         )));
     }
     Ok(())
+}
+
+fn print_gf256_summary() {
+    let s = gf256::stats_snapshot();
+    println!("gf256.xor_avx512_calls={}", s.xor_avx512_calls);
+    println!("gf256.xor_avx512_bytes={}", s.xor_avx512_bytes);
+    println!("gf256.xor_avx2_calls={}", s.xor_avx2_calls);
+    println!("gf256.xor_avx2_bytes={}", s.xor_avx2_bytes);
+    println!("gf256.xor_scalar_calls={}", s.xor_scalar_calls);
+    println!("gf256.xor_scalar_bytes={}", s.xor_scalar_bytes);
+    println!("gf256.mul_avx512_calls={}", s.mul_avx512_calls);
+    println!("gf256.mul_avx512_bytes={}", s.mul_avx512_bytes);
+    println!("gf256.mul_avx2_calls={}", s.mul_avx2_calls);
+    println!("gf256.mul_avx2_bytes={}", s.mul_avx2_bytes);
+    println!("gf256.mul_scalar_calls={}", s.mul_scalar_calls);
+    println!("gf256.mul_scalar_bytes={}", s.mul_scalar_bytes);
 }
 
 fn build_jobs(

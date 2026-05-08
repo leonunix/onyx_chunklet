@@ -23,7 +23,14 @@ fn make_pool(dir: &TempDir, names: &[&str]) -> (Arc<Pool>, Vec<PathBuf>) {
         raws.push(RawDevice::open_or_create(&p, PD_SIZE).unwrap());
         paths.push(p);
     }
-    let pool = Pool::create(raws, PoolConfig { spare_pct: 0, ..Default::default() }).unwrap();
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (pool, paths)
 }
 
@@ -124,7 +131,11 @@ fn rejects_when_pool_too_small() {
     let (pool, _paths) = make_pool(&dir, &["pd0", "pd1"]);
     let err = pool.create_ld(LdSpec::plain(100)).err().unwrap();
     let s = format!("{}", err);
-    assert!(s.contains("free"), "expected NoSpace-like error, got: {}", s);
+    assert!(
+        s.contains("free"),
+        "expected NoSpace-like error, got: {}",
+        s
+    );
 }
 
 #[test]

@@ -14,7 +14,7 @@ use onyx_chunklet::io::{AlignedBuf, RawDevice};
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::superblock::SLOT_BYTES;
 use onyx_chunklet::types::{
-    ChunkletState, BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_B_OFFSET, BITMAP_SLOT_BYTES,
+    ChunkletState, BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_BYTES, BITMAP_SLOT_B_OFFSET,
     PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET, SUPERBLOCK_SLOT_B_OFFSET,
 };
 use onyx_chunklet::{Pool, PoolConfig};
@@ -96,16 +96,8 @@ fn survives_bitmap_head_slot_corruption_via_tail() {
     let dir = TempDir::new().unwrap();
     let paths = make_pool(&dir, &["pd0", "pd1"]);
     // Trash both bitmap slots on the head of pd0 — must fall back to tail.
-    corrupt(
-        &paths[0],
-        BITMAP_SLOT_A_OFFSET,
-        BITMAP_SLOT_BYTES as usize,
-    );
-    corrupt(
-        &paths[0],
-        BITMAP_SLOT_B_OFFSET,
-        BITMAP_SLOT_BYTES as usize,
-    );
+    corrupt(&paths[0], BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_BYTES as usize);
+    corrupt(&paths[0], BITMAP_SLOT_B_OFFSET, BITMAP_SLOT_BYTES as usize);
     let pool = Pool::open(open_paths(&paths)).unwrap();
     assert_eq!(pool.pd_count(), 2);
 }
@@ -146,7 +138,10 @@ fn forward_reconciles_descriptor_to_bitmap_on_open() {
         .unwrap();
     {
         let (_, bitmap, _) = pd.snapshot();
-        assert_eq!(bitmap.get(target.chunklet_index).unwrap(), ChunkletState::Free);
+        assert_eq!(
+            bitmap.get(target.chunklet_index).unwrap(),
+            ChunkletState::Free
+        );
     }
 
     drop(pool);

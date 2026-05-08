@@ -74,9 +74,8 @@ impl Bitmap {
         let states = slot_bytes[..total_chunklets as usize].to_vec();
         // Validate each byte.
         for (i, &b) in states.iter().enumerate() {
-            ChunkletState::from_byte(b).map_err(|e| {
-                crate::ChunkletError::Format(format!("bitmap[{}]: {}", i, e))
-            })?;
+            ChunkletState::from_byte(b)
+                .map_err(|e| crate::ChunkletError::Format(format!("bitmap[{}]: {}", i, e)))?;
         }
         // Tail bytes (padding) must be zero across the FULL slot region.
         // Earlier code took only the first 64 bytes of padding which let

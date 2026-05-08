@@ -42,7 +42,10 @@ fn r5_degraded_write_parity_failed_round_trip() {
     ld.write_at(0, &payload).unwrap();
     let mut readback = vec![0u8; payload.len()];
     ld.read_at(0, &mut readback).unwrap();
-    assert_eq!(readback, payload, "data lost on parity-failed degraded write");
+    assert_eq!(
+        readback, payload,
+        "data lost on parity-failed degraded write"
+    );
 }
 
 /// R5: drop one data PD, do a partial write that touches the failed
@@ -127,9 +130,17 @@ fn r5_two_failures_reject_write() {
     let pool = open_subset(&paths, &[d0_idx, d1_idx]);
     let ld = pool.open_ld(ld_id).unwrap();
     let buf = vec![0u8; STRIP];
-    let err = ld.write_at(0, &buf).err().expect("write should fail with F=2");
+    let err = ld
+        .write_at(0, &buf)
+        .err()
+        .expect("write should fail with F=2");
     match err {
-        ChunkletError::WriteRedundancyExceeded { raid, failed, budget, .. } => {
+        ChunkletError::WriteRedundancyExceeded {
+            raid,
+            failed,
+            budget,
+            ..
+        } => {
             assert_eq!(raid, RaidLevel::Raid5);
             assert_eq!(failed, 2);
             assert_eq!(budget, 1);
@@ -315,9 +326,17 @@ fn r6_three_failures_reject_write() {
     let pool = open_subset(&paths, &[d0, p, q]);
     let ld = pool.open_ld(ld_id).unwrap();
     let buf = vec![0u8; STRIP];
-    let err = ld.write_at(0, &buf).err().expect("write should fail with F=3");
+    let err = ld
+        .write_at(0, &buf)
+        .err()
+        .expect("write should fail with F=3");
     match err {
-        ChunkletError::WriteRedundancyExceeded { raid, failed, budget, .. } => {
+        ChunkletError::WriteRedundancyExceeded {
+            raid,
+            failed,
+            budget,
+            ..
+        } => {
             assert_eq!(raid, RaidLevel::Raid6);
             assert_eq!(failed, 3);
             assert_eq!(budget, 2);

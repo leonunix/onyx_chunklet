@@ -80,10 +80,7 @@ pub struct Plan {
     pub members: Vec<LdMember>,
 }
 
-pub fn plan_alloc(
-    request: &AllocRequest,
-    pd_views: Vec<PdFreeView>,
-) -> ChunkletResult<Plan> {
+pub fn plan_alloc(request: &AllocRequest, pd_views: Vec<PdFreeView>) -> ChunkletResult<Plan> {
     request.validate()?;
 
     // Working state: per-PD free index list (mutable), index by PD.
@@ -117,8 +114,7 @@ pub fn plan_alloc(
     let mut role_iter = request.role_assignments.iter().copied();
     for _row in 0..request.num_rows {
         for _set in 0..request.row_size {
-            let set_members =
-                pick_set(&mut state, request.set_size as usize, &mut role_iter)?;
+            let set_members = pick_set(&mut state, request.set_size as usize, &mut role_iter)?;
             members.extend(set_members);
         }
     }
@@ -155,9 +151,9 @@ fn pick_set(
             .unwrap()
             .pop_front()
             .expect("filter above guarantees at least one free index");
-        let role = role_iter.next().ok_or_else(|| {
-            ChunkletError::Invariant("role_assignments exhausted".into())
-        })?;
+        let role = role_iter
+            .next()
+            .ok_or_else(|| ChunkletError::Invariant("role_assignments exhausted".into()))?;
         picks.push(LdMember {
             pd: chosen,
             chunklet_index,
@@ -218,8 +214,14 @@ mod tests {
             row_size: 2,
             num_rows: 1,
             role_assignments: vec![
-                LdRole::Data, LdRole::Data, LdRole::Data, LdRole::ParityP,
-                LdRole::Data, LdRole::Data, LdRole::Data, LdRole::ParityP,
+                LdRole::Data,
+                LdRole::Data,
+                LdRole::Data,
+                LdRole::ParityP,
+                LdRole::Data,
+                LdRole::Data,
+                LdRole::Data,
+                LdRole::ParityP,
             ],
             ha_domain: HaDomain::Pd,
         };

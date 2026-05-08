@@ -65,7 +65,9 @@ fn raid5_degraded_read_then_rebuild() {
     let (pool, paths) = make_pool(&dir, 5);
     let ld_id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
     let ld = pool.open_ld(ld_id).unwrap();
-    let payload: Vec<u8> = (0..(48 << 10)).map(|i| ((i * 13 + 5) % 251) as u8).collect();
+    let payload: Vec<u8> = (0..(48 << 10))
+        .map(|i| ((i * 13 + 5) % 251) as u8)
+        .collect();
     ld.write_at(0, &payload).unwrap();
     drop((ld, pool));
 
@@ -141,7 +143,9 @@ fn raid6_degraded_read_one_failure_then_rebuild() {
     let (pool, paths) = make_pool(&dir, 6);
     let ld_id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
     let ld = pool.open_ld(ld_id).unwrap();
-    let payload: Vec<u8> = (0..(48 << 10)).map(|i| ((i * 17 + 3) % 251) as u8).collect();
+    let payload: Vec<u8> = (0..(48 << 10))
+        .map(|i| ((i * 17 + 3) % 251) as u8)
+        .collect();
     ld.write_at(0, &payload).unwrap();
     drop((ld, pool));
 
@@ -175,7 +179,9 @@ fn raid6_degraded_read_two_data_failures_then_rebuild() {
     let (pool, paths) = make_pool(&dir, 7);
     let ld_id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
     let ld = pool.open_ld(ld_id).unwrap();
-    let payload: Vec<u8> = (0..(36 << 10)).map(|i| ((i * 23 + 7) % 251) as u8).collect();
+    let payload: Vec<u8> = (0..(36 << 10))
+        .map(|i| ((i * 23 + 7) % 251) as u8)
+        .collect();
     ld.write_at(0, &payload).unwrap();
     drop((ld, pool));
 
@@ -199,7 +205,10 @@ fn raid6_degraded_read_two_data_failures_then_rebuild() {
     let ld_deg = pool_deg.open_ld(ld_id).unwrap();
     let mut readback = vec![0u8; payload.len()];
     ld_deg.read_at(0, &mut readback).unwrap();
-    assert_eq!(readback, payload, "raid6 2-data-failure degraded read mismatch");
+    assert_eq!(
+        readback, payload,
+        "raid6 2-data-failure degraded read mismatch"
+    );
     drop(ld_deg);
 
     let report = pool_deg.rebuild_ld(ld_id).unwrap();
@@ -281,8 +290,14 @@ fn rebuild_bumps_member_generation() {
     let pool_deg = open_subset(&paths, &[drop_idx]);
     pool_deg.rebuild_ld(ld_id).unwrap();
     let desc1 = pool_deg.find_ld(ld_id).unwrap();
-    assert_eq!(desc1.members[0].generation, 1, "rebuilt member should bump to 1");
-    assert_eq!(desc1.members[1].generation, 0, "untouched member stays at 0");
+    assert_eq!(
+        desc1.members[0].generation, 1,
+        "rebuilt member should bump to 1"
+    );
+    assert_eq!(
+        desc1.members[1].generation, 0,
+        "untouched member stays at 0"
+    );
 
     // Chunklet header on the freshly-allocated chunklet must carry the
     // same generation (low 8 bits) as the descriptor.
@@ -365,7 +380,10 @@ fn rebuild_marks_target_chunklets_used() {
     let pool_full = open_full(&paths);
     let desc = pool_full.list_lds().into_iter().next().unwrap();
     let drop_pd = desc.members[0].pd;
-    let drop_idx = paths.iter().position(|p| pool_full.pd(drop_pd).unwrap().path() == p).unwrap();
+    let drop_idx = paths
+        .iter()
+        .position(|p| pool_full.pd(drop_pd).unwrap().path() == p)
+        .unwrap();
     drop(pool_full);
 
     let pool_deg = open_subset(&paths, &[drop_idx]);

@@ -50,15 +50,16 @@ fn mirror_partial_write_torn_state_then_scrub_recovers() {
     // The mirror write fan-out goes through whichever PD's backend is
     // attached to ops[0]; install on every PD so coverage is uniform.
     for info in pool.list_pds() {
-        pool.pd(info.pd_id)
-            .unwrap()
-            .set_backend(injector.clone());
+        pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
     }
 
     let new_payload = vec![0xc7u8; 4096];
     let ld = pool.open_ld(id).unwrap();
     let err = ld.write_at(0, &new_payload).err();
-    assert!(err.is_some(), "mirror write must surface the injected fault");
+    assert!(
+        err.is_some(),
+        "mirror write must surface the injected fault"
+    );
 
     // copy 0 + copy 2 should be on healthy PDs and have new data.
     let pd0 = pool.pd(desc.members[0].pd).unwrap();
@@ -134,9 +135,7 @@ fn raid5_full_stripe_fault_on_parity_pd_detected_by_scrub() {
     let inner = parity_pd_handle.backend();
     let injector = Arc::new(FaultInjectingBackend::new(inner, parity_pd, 0));
     for info in pool.list_pds() {
-        pool.pd(info.pd_id)
-            .unwrap()
-            .set_backend(injector.clone());
+        pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
     }
 
     let ld = pool.open_ld(id).unwrap();

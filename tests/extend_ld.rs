@@ -64,7 +64,9 @@ fn extend_mirror_doubles_capacity_and_persists() {
 
     // Write a known pattern to the very start of the old range — easy to
     // verify after extend + reopen.
-    let old_payload: Vec<u8> = (0..(8 * strip)).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+    let old_payload: Vec<u8> = (0..(8 * strip))
+        .map(|i| ((i * 7 + 3) % 251) as u8)
+        .collect();
     ld.write_at(0, &old_payload).unwrap();
     drop(ld);
 
@@ -80,7 +82,9 @@ fn extend_mirror_doubles_capacity_and_persists() {
     ld2.read_at(0, &mut readback).unwrap();
     assert_eq!(readback, old_payload);
 
-    let new_payload: Vec<u8> = (0..(8 * strip)).map(|i| ((i * 11 + 17) % 251) as u8).collect();
+    let new_payload: Vec<u8> = (0..(8 * strip))
+        .map(|i| ((i * 11 + 17) % 251) as u8)
+        .collect();
     ld2.write_at(2 * CHUNKLET_USER, &new_payload).unwrap();
     drop((ld2, pool));
 
@@ -123,7 +127,10 @@ fn extend_zero_rows_is_noop() {
     assert_eq!(cap_after, cap_before);
 
     let after = pool.find_ld(id).unwrap();
-    assert_eq!(before, after, "descriptor must not change on zero-row extend");
+    assert_eq!(
+        before, after,
+        "descriptor must not change on zero-row extend"
+    );
 }
 
 #[test]
@@ -191,7 +198,9 @@ fn extend_raid0_appends() {
     assert_eq!(ld.capacity_bytes(), 2 * CHUNKLET_USER);
 
     let strip = BLOCK_SIZE as usize;
-    let old_payload: Vec<u8> = (0..(4 * strip)).map(|i| ((i * 5 + 9) % 251) as u8).collect();
+    let old_payload: Vec<u8> = (0..(4 * strip))
+        .map(|i| ((i * 5 + 9) % 251) as u8)
+        .collect();
     ld.write_at(0, &old_payload).unwrap();
     drop(ld);
 

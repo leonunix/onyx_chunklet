@@ -271,10 +271,7 @@ impl Pool {
         let new_bytes = {
             let mut s = self.state.write();
             if s.cpg_list.remove(id).is_none() {
-                return Err(ChunkletError::Invariant(format!(
-                    "CPG {} not found",
-                    id
-                )));
+                return Err(ChunkletError::Invariant(format!("CPG {} not found", id)));
             }
             s.cpg_list.encode()?
         };
