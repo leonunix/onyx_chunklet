@@ -22,6 +22,7 @@ pub mod error;
 pub mod io;
 pub mod ld;
 pub mod metrics;
+pub mod ops;
 pub mod pd;
 pub mod pool;
 pub mod superblock;

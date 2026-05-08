@@ -14,6 +14,9 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use onyx_chunklet::io::{AlignedBuf, RawDevice};
 use onyx_chunklet::metrics::{PdOperationalState, PoolMetrics};
+use onyx_chunklet::ops::{
+    self, AutoRecoverSnapshot, PoolSnapshot, RecoveryCycleOptions, RecoveryCycleSnapshot,
+};
 use onyx_chunklet::pool::{AutoRecoverReport, CpgSpec, LdSpec, SpareRebalanceReport};
 use onyx_chunklet::superblock::{SuperblockSlot, SLOT_BYTES};
 use onyx_chunklet::types::{
@@ -67,6 +70,16 @@ enum PoolOp {
         /// Allow opening a degraded pool with missing devices.
         #[arg(long, default_value_t = false)]
         allow_missing: bool,
+        /// Emit dashboard-friendly JSON instead of human text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        devices: Vec<PathBuf>,
+    },
+    /// Probe device paths and print pool superblock ownership.
+    Probe {
+        /// Emit dashboard-friendly JSON instead of human text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
         devices: Vec<PathBuf>,
     },
     /// Drain a PD (migrate all LD members onto other PDs, then mark DRAINED).
@@ -119,6 +132,9 @@ enum PoolOp {
         /// Run scrub before rebuild so identifiable corrupt copies become Bad.
         #[arg(long, default_value_t = false)]
         scrub_first: bool,
+        /// Emit dashboard-friendly JSON instead of human text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Periodically open a pool with whatever devices are present and run auto-recover.
     RecoverLoop {
@@ -137,6 +153,9 @@ enum PoolOp {
         /// Return non-zero if a recovery cycle reports failed LDs.
         #[arg(long, default_value_t = false)]
         fail_on_error: bool,
+        /// Emit one JSON object per recovery cycle.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -375,6 +394,7 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
         }
         PoolOp::Status {
             allow_missing,
+            json,
             devices,
         } => {
             let raws = open_devices(&devices)?;
@@ -383,7 +403,21 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             } else {
                 Pool::open(raws)?
             };
-            print_pool_status(&pool.metrics()?);
+            let metrics = pool.metrics()?;
+            if json {
+                print_json(&PoolSnapshot::from_metrics(&metrics))?;
+            } else {
+                print_pool_status(&metrics);
+            }
+            Ok(())
+        }
+        PoolOp::Probe { json, devices } => {
+            let probes = ops::probe_devices(&devices);
+            if json {
+                print_json(&probes)?;
+            } else {
+                print_device_probes(&probes);
+            }
             Ok(())
         }
         PoolOp::Drain { pool, pd_id } => {
@@ -452,6 +486,7 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             pool,
             allow_missing,
             scrub_first,
+            json,
         } => {
             let raws = open_devices(&pool)?;
             let pool = if allow_missing {
@@ -460,8 +495,16 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
                 Pool::open(raws)?
             };
             let report = pool.auto_recover(scrub_first);
-            print_auto_recover(&report);
-            print_pool_status(&pool.metrics()?);
+            let metrics = pool.metrics()?;
+            if json {
+                print_json(&serde_json::json!({
+                    "recovery": AutoRecoverSnapshot::from_report(&report),
+                    "pool": PoolSnapshot::from_metrics(&metrics),
+                }))?;
+            } else {
+                print_auto_recover(&report);
+                print_pool_status(&metrics);
+            }
             if report.failed > 0 {
                 return Err(onyx_chunklet::ChunkletError::Invariant(format!(
                     "auto-recover failed on {} LDs",
@@ -476,7 +519,15 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
             interval_secs,
             max_cycles,
             fail_on_error,
-        } => run_recover_loop(&pool, scrub_first, interval_secs, max_cycles, fail_on_error),
+            json,
+        } => run_recover_loop(
+            &pool,
+            scrub_first,
+            interval_secs,
+            max_cycles,
+            fail_on_error,
+            json,
+        ),
     }
 }
 
@@ -486,6 +537,7 @@ fn run_recover_loop(
     interval_secs: u64,
     max_cycles: u64,
     fail_on_error: bool,
+    json: bool,
 ) -> ChunkletResult<()> {
     if pool_paths.is_empty() {
         return Err(onyx_chunklet::ChunkletError::Config(
@@ -496,30 +548,36 @@ fn run_recover_loop(
     let mut cycle = 0u64;
     loop {
         cycle += 1;
-        println!("recover-loop: cycle={} opening pool", cycle);
-        match open_available_devices(pool_paths) {
-            Ok(raws) => {
-                println!(
-                    "recover-loop: opened {}/{} devices",
-                    raws.len(),
-                    pool_paths.len()
-                );
-                let pool = Pool::open_with_missing(raws)?;
-                let report = pool.auto_recover(scrub_first);
-                print_auto_recover(&report);
-                print_pool_status(&pool.metrics()?);
-                if fail_on_error && report.failed > 0 {
-                    return Err(onyx_chunklet::ChunkletError::Invariant(format!(
-                        "recover-loop cycle {} failed on {} LDs",
-                        cycle, report.failed
-                    )));
-                }
+        let snapshot = ops::run_recovery_cycle(
+            cycle,
+            pool_paths,
+            &RecoveryCycleOptions {
+                scrub_first,
+                fail_on_recovery_error: fail_on_error,
+            },
+        )?;
+        if json {
+            print_json_line(&snapshot)?;
+        } else {
+            print_recovery_cycle(&snapshot);
+        }
+        if fail_on_error {
+            if let Some(err) = &snapshot.error {
+                return Err(onyx_chunklet::ChunkletError::Invariant(format!(
+                    "recover-loop cycle {} failed: {}",
+                    cycle, err
+                )));
             }
-            Err(e) => {
-                eprintln!("recover-loop: open failed: {}", e);
-                if fail_on_error {
-                    return Err(e);
-                }
+            if snapshot
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.failed > 0)
+                .unwrap_or(false)
+            {
+                return Err(onyx_chunklet::ChunkletError::Invariant(format!(
+                    "recover-loop cycle {} reported failed LDs",
+                    cycle
+                )));
             }
         }
 
@@ -788,15 +846,11 @@ fn print_ld_table(pool: &Pool) {
 }
 
 fn parse_pd_id(s: &str) -> ChunkletResult<PdId> {
-    let parsed = uuid::Uuid::parse_str(s)
-        .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
-    Ok(PdId::from_bytes(*parsed.as_bytes()))
+    ops::parse_pd_id(s)
 }
 
 fn parse_ld_id(s: &str) -> ChunkletResult<LdId> {
-    let parsed = uuid::Uuid::parse_str(s)
-        .map_err(|e| onyx_chunklet::ChunkletError::Config(format!("bad uuid: {}", e)))?;
-    Ok(LdId::from_bytes(*parsed.as_bytes()))
+    ops::parse_ld_id(s)
 }
 
 fn print_spare_rebalance(report: &SpareRebalanceReport) {
@@ -914,6 +968,79 @@ fn print_pool_status(m: &PoolMetrics) {
     }
 }
 
+fn print_device_probes(probes: &[ops::DeviceProbe]) {
+    println!("devices:");
+    for probe in probes {
+        println!(
+            "  opened={} pool={} error={} path={}",
+            probe.opened,
+            probe.pool_id.as_deref().unwrap_or("-"),
+            probe.error.as_deref().unwrap_or("-"),
+            probe.path
+        );
+    }
+}
+
+fn print_recovery_cycle(snapshot: &RecoveryCycleSnapshot) {
+    println!(
+        "recover-loop: cycle={} opened={}/{} pool={} error={}",
+        snapshot.cycle,
+        snapshot.opened_devices,
+        snapshot.configured_devices,
+        snapshot.selected_pool_id.as_deref().unwrap_or("-"),
+        snapshot.error.as_deref().unwrap_or("-")
+    );
+    print_device_probes(&snapshot.probes);
+    if let Some(recovery) = &snapshot.recovery {
+        print_auto_recover_snapshot(recovery);
+    }
+    if let Some(pool) = &snapshot.pool {
+        println!(
+            "pool: {} pds={} healthy={} failed={} draining={} drained={} lds={} cpgs={}",
+            pool.pool_id,
+            pool.pd_count,
+            pool.healthy_pds,
+            pool.failed_pds,
+            pool.draining_pds,
+            pool.drained_pds,
+            pool.ld_count,
+            pool.cpg_count
+        );
+    }
+}
+
+fn print_auto_recover_snapshot(report: &AutoRecoverSnapshot) {
+    println!(
+        "auto-recover: attempted={} recovered={} failed={}",
+        report.attempted, report.recovered, report.failed
+    );
+    for ld in &report.lds {
+        println!(
+            "  ld={} scrub_mismatches={} marked_bad={} rebuilt={} skipped={} error={}",
+            ld.ld_id,
+            ld.scrub_mismatches,
+            ld.scrub_marked_bad,
+            ld.rebuilt_members,
+            ld.skipped_rebuild,
+            ld.error.as_deref().unwrap_or("-")
+        );
+    }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> ChunkletResult<()> {
+    let s = serde_json::to_string_pretty(value)
+        .map_err(|e| onyx_chunklet::ChunkletError::Invariant(format!("json encode: {}", e)))?;
+    println!("{}", s);
+    Ok(())
+}
+
+fn print_json_line<T: serde::Serialize>(value: &T) -> ChunkletResult<()> {
+    let s = serde_json::to_string(value)
+        .map_err(|e| onyx_chunklet::ChunkletError::Invariant(format!("json encode: {}", e)))?;
+    println!("{}", s);
+    Ok(())
+}
+
 fn pd_state_label(state: PdOperationalState) -> &'static str {
     match state {
         PdOperationalState::Healthy => "healthy",
@@ -980,22 +1107,6 @@ fn open_devices(paths: &[PathBuf]) -> ChunkletResult<Vec<RawDevice>> {
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
         out.push(RawDevice::open(p)?);
-    }
-    Ok(out)
-}
-
-fn open_available_devices(paths: &[PathBuf]) -> ChunkletResult<Vec<RawDevice>> {
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
-        match RawDevice::open(p) {
-            Ok(raw) => out.push(raw),
-            Err(e) => eprintln!("recover-loop: skipping {}: {}", p.display(), e),
-        }
-    }
-    if out.is_empty() {
-        return Err(onyx_chunklet::ChunkletError::Config(
-            "no pool devices could be opened".into(),
-        ));
     }
     Ok(out)
 }
