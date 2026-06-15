@@ -10,7 +10,8 @@
 //! [4..6]     row_size u16 LE          (sets per stripe row)
 //! [6..8]     num_rows u16 LE
 //! [8..9]     strip_size_log2 u8       (0 = block-aligned, no striping inside set)
-//! [9..12]    reserved
+//! [9..10]    ha_domain u8             (0 = Pd; legacy descriptors read as Pd)
+//! [10..12]   reserved
 //! [12..28]   ld_uuid (16 bytes)
 //! [28..32]   member_count u32 LE
 //! [32..]     members[N], 24 bytes each:
@@ -31,7 +32,9 @@
 use std::convert::TryInto;
 
 use crate::error::{ChunkletError, ChunkletResult};
-use crate::types::{LdId, LdMember, LdRole, PdId, RaidLevel, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
+use crate::types::{
+    HaDomain, LdId, LdMember, LdRole, PdId, RaidLevel, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
+};
 
 const DESC_HEADER_BYTES: usize = 32;
 const MEMBER_BYTES: usize = 24;
@@ -45,6 +48,7 @@ pub struct LdDescriptor {
     pub row_size: u16,
     pub num_rows: u16,
     pub strip_size_log2: u8,
+    pub ha_domain: HaDomain,
     pub members: Vec<LdMember>,
 }
 
@@ -98,7 +102,8 @@ impl LdDescriptor {
         out[4..6].copy_from_slice(&self.row_size.to_le_bytes());
         out[6..8].copy_from_slice(&self.num_rows.to_le_bytes());
         out[8] = self.strip_size_log2;
-        // [9..12] reserved.
+        out[9] = self.ha_domain as u8;
+        // [10..12] reserved.
         out[12..28].copy_from_slice(&self.id.to_bytes());
         out[28..32].copy_from_slice(&(self.members.len() as u32).to_le_bytes());
         for (i, m) in self.members.iter().enumerate() {
@@ -135,6 +140,7 @@ impl LdDescriptor {
         let row_size = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let num_rows = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
         let strip_size_log2 = bytes[8];
+        let ha_domain = HaDomain::from_u8(bytes[9])?;
         let id = LdId::from_bytes(bytes[12..28].try_into().unwrap());
         let member_count = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
 
@@ -168,6 +174,7 @@ impl LdDescriptor {
                 row_size,
                 num_rows,
                 strip_size_log2,
+                ha_domain,
                 members,
             },
             total,
@@ -244,6 +251,7 @@ mod tests {
             row_size: 1,
             num_rows: member_count as u16,
             strip_size_log2: 0,
+            ha_domain: HaDomain::Pd,
             members: (0..member_count)
                 .map(|i| LdMember {
                     pd: PdId::new_v4(),

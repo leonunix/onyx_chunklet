@@ -22,6 +22,7 @@ impl IoBackend for SyncBackend {
         }
         if ops.len() == 1 {
             let r = &mut ops[0];
+            crate::numa::bind_current_to_node(r.pd.numa_node());
             return r
                 .pd
                 .read_chunklet_user(r.chunklet_index, r.in_chunklet_off, r.data);
@@ -31,6 +32,7 @@ impl IoBackend for SyncBackend {
                 .iter_mut()
                 .map(|r| {
                     s.spawn(move || {
+                        crate::numa::bind_current_to_node(r.pd.numa_node());
                         r.pd.read_chunklet_user(r.chunklet_index, r.in_chunklet_off, r.data)
                     })
                 })
@@ -56,6 +58,7 @@ impl IoBackend for SyncBackend {
         }
         if ops.len() == 1 {
             let w = &ops[0];
+            crate::numa::bind_current_to_node(w.pd.numa_node());
             return w
                 .pd
                 .write_chunklet_user(w.chunklet_index, w.in_chunklet_off, w.data);
@@ -65,6 +68,7 @@ impl IoBackend for SyncBackend {
                 .iter()
                 .map(|w| {
                     s.spawn(move || {
+                        crate::numa::bind_current_to_node(w.pd.numa_node());
                         w.pd.write_chunklet_user(w.chunklet_index, w.in_chunklet_off, w.data)
                     })
                 })

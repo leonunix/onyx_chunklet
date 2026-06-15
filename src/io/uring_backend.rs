@@ -63,8 +63,19 @@ impl IoBackend for UringBackend {
                 })?);
             }
             let ring = slot.as_mut().expect("ring just initialized");
-            for chunk in ops.chunks_mut(URING_DEPTH as usize) {
-                submit_read_chunk(ring, chunk)?;
+            let mut start = 0usize;
+            while start < ops.len() {
+                let node = ops[start].pd.numa_node();
+                let mut end = start + 1;
+                while end < ops.len()
+                    && end - start < URING_DEPTH as usize
+                    && ops[end].pd.numa_node() == node
+                {
+                    end += 1;
+                }
+                crate::numa::bind_current_to_node(node);
+                submit_read_chunk(ring, &mut ops[start..end])?;
+                start = end;
             }
             Ok(())
         })
@@ -82,8 +93,19 @@ impl IoBackend for UringBackend {
                 })?);
             }
             let ring = slot.as_mut().expect("ring just initialized");
-            for chunk in ops.chunks(URING_DEPTH as usize) {
-                submit_chunk(ring, chunk)?;
+            let mut start = 0usize;
+            while start < ops.len() {
+                let node = ops[start].pd.numa_node();
+                let mut end = start + 1;
+                while end < ops.len()
+                    && end - start < URING_DEPTH as usize
+                    && ops[end].pd.numa_node() == node
+                {
+                    end += 1;
+                }
+                crate::numa::bind_current_to_node(node);
+                submit_chunk(ring, &ops[start..end])?;
+                start = end;
             }
             Ok(())
         })

@@ -316,6 +316,7 @@ impl Pool {
             row_size: spec.row_size,
             num_rows: spec.num_rows,
             strip_size_log2: spec.strip_size_log2,
+            ha_domain: spec.ha_domain,
             members: plan.members,
         };
 
@@ -472,8 +473,6 @@ impl Pool {
                 ))
             })?;
 
-        // HaDomain is not stored on the descriptor; only `Pd` is supported
-        // by the allocator today, so reconstruct that on extend.
         let role_per_set = role_pattern_for(existing.raid_level, existing.set_size);
         let new_set_count = (existing.row_size as usize) * (additional_rows as usize);
         let mut role_assignments = Vec::with_capacity(role_per_set.len() * new_set_count);
@@ -488,7 +487,7 @@ impl Pool {
                 row_size: existing.row_size,
                 num_rows: additional_rows,
                 role_assignments,
-                ha_domain: HaDomain::Pd,
+                ha_domain: existing.ha_domain,
             },
             pd_views,
         )?;
@@ -543,7 +542,14 @@ impl Pool {
         let map = crate::pool::collect_free_indices_per_pd(&pds, /* include_spare */ false)?;
         Ok(map
             .into_iter()
-            .map(|(pd, free_indices)| PdFreeView { pd, free_indices })
+            .map(|(pd, free_indices)| {
+                let numa_node = pds.get(&pd).and_then(|pd| pd.numa_node());
+                PdFreeView {
+                    pd,
+                    numa_node,
+                    free_indices,
+                }
+            })
             .collect())
     }
 

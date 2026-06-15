@@ -3,24 +3,18 @@
 //! # Inputs / outputs
 //!
 //! Pure function: takes a snapshot of free chunklets per PD plus an
-//! allocation request, returns a `Plan` (or an error). It does **not**
-//! mutate state. Callers (`Pool::create_ld`) apply the plan via per-PD
-//! `commit_manifest`.
+//! allocation request, returns a `Plan` (or an error). It does **not** mutate
+//! pool state. Callers apply the plan via per-PD manifest commits.
 //!
 //! # Algorithm
 //!
-//! For each "row" of the LD, for each "set" within the row:
-//!   1. pick `set_size` distinct PDs by descending free-count;
-//!   2. within each chosen PD, take the lowest-index free chunklet.
-//!
-//! "Distinct PDs per set" is the universal RAID invariant — two chunklets
-//! in the same set must not live on the same PD. Across sets within a row
-//! (and across rows) a PD can be reused.
-//!
-//! HA domain `Pd` is the only level wired in P1; `Numa` / `PcieSwitch`
-//! return `Unsupported`.
+//! `HaDomain::Pd` preserves the original global balancing: every RAID set
+//! picks `set_size` distinct PDs by descending free-count. `HaDomain::Numa`
+//! first picks a NUMA node for the whole row, then allocates every set in that
+//! row from PDs on that node. This keeps latency-sensitive stripes from
+//! crossing sockets while still rotating rows across nodes as capacity allows.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::types::{HaDomain, LdMember, LdRole, PdId};
@@ -29,6 +23,7 @@ use crate::types::{HaDomain, LdMember, LdRole, PdId};
 #[derive(Clone, Debug)]
 pub struct PdFreeView {
     pub pd: PdId,
+    pub numa_node: Option<u16>,
     pub free_indices: Vec<u32>,
 }
 
@@ -83,28 +78,19 @@ pub struct Plan {
 pub fn plan_alloc(request: &AllocRequest, pd_views: Vec<PdFreeView>) -> ChunkletResult<Plan> {
     request.validate()?;
 
-    // Working state: per-PD free index list (mutable), index by PD.
-    // VecDeque so `pop_front` (lowest-index-first) is O(1); a Vec would
-    // have made it O(n) per allocation, scaling badly on large pools.
-    let mut state: BTreeMap<PdId, VecDeque<u32>> = pd_views
-        .into_iter()
-        .map(|v| (v.pd, v.free_indices.into_iter().collect()))
-        .collect();
-
+    let mut state = AllocState::new(pd_views);
     let total = request.total_members();
     let mut members = Vec::with_capacity(total);
 
-    // Preflight: ensure we have enough total free chunklets *and* enough
-    // distinct PDs to fill any single set.
-    let total_free: usize = state.values().map(|v| v.len()).sum();
+    let total_free = state.total_free();
     if total_free < total {
         return Err(ChunkletError::Config(format!(
             "alloc: need {} chunklets, pool has only {} free",
             total, total_free
         )));
     }
-    let usable_pds = state.values().filter(|v| !v.is_empty()).count();
-    if (usable_pds as u8) < request.set_size {
+    let usable_pds = state.usable_pds(None);
+    if usable_pds < request.set_size as usize {
         return Err(ChunkletError::Config(format!(
             "alloc: set_size {} requires {} distinct PDs, pool has only {} usable",
             request.set_size, request.set_size, usable_pds
@@ -112,44 +98,154 @@ pub fn plan_alloc(request: &AllocRequest, pd_views: Vec<PdFreeView>) -> Chunklet
     }
 
     let mut role_iter = request.role_assignments.iter().copied();
-    for _row in 0..request.num_rows {
-        for _set in 0..request.row_size {
-            let set_members = pick_set(&mut state, request.set_size as usize, &mut role_iter)?;
-            members.extend(set_members);
+    match request.ha_domain {
+        HaDomain::Pd => {
+            for _row in 0..request.num_rows {
+                for _set in 0..request.row_size {
+                    members.extend(pick_set(
+                        &mut state,
+                        None,
+                        request.set_size as usize,
+                        &mut role_iter,
+                    )?);
+                }
+            }
         }
+        HaDomain::Numa => {
+            if state.nodes_with_free().is_empty() {
+                return Err(ChunkletError::Config(
+                    "alloc: HaDomain::Numa requires PD NUMA node detection".into(),
+                ));
+            }
+            let row_need = (request.set_size as usize) * (request.row_size as usize);
+            for _row in 0..request.num_rows {
+                let node = state.pick_numa_node(request.set_size as usize, row_need)?;
+                for _set in 0..request.row_size {
+                    members.extend(pick_set(
+                        &mut state,
+                        Some(node),
+                        request.set_size as usize,
+                        &mut role_iter,
+                    )?);
+                }
+            }
+        }
+        HaDomain::PcieSwitch => unreachable!("validate rejects unsupported HA domains"),
     }
 
     Ok(Plan { members })
 }
 
-/// Pick one set: `set_size` distinct PDs by descending free-count, lowest
-/// chunklet index from each.
+struct AllocState {
+    free_by_pd: BTreeMap<PdId, VecDeque<u32>>,
+    node_by_pd: BTreeMap<PdId, Option<u16>>,
+}
+
+impl AllocState {
+    fn new(pd_views: Vec<PdFreeView>) -> Self {
+        let mut free_by_pd = BTreeMap::new();
+        let mut node_by_pd = BTreeMap::new();
+        for view in pd_views {
+            node_by_pd.insert(view.pd, view.numa_node);
+            free_by_pd.insert(view.pd, view.free_indices.into_iter().collect());
+        }
+        Self {
+            free_by_pd,
+            node_by_pd,
+        }
+    }
+
+    fn total_free(&self) -> usize {
+        self.free_by_pd.values().map(|v| v.len()).sum()
+    }
+
+    fn usable_pds(&self, node: Option<u16>) -> usize {
+        self.free_by_pd
+            .iter()
+            .filter(|(pd, free)| {
+                !free.is_empty()
+                    && node.map_or(true, |n| {
+                        self.node_by_pd.get(pd).copied().flatten() == Some(n)
+                    })
+            })
+            .count()
+    }
+
+    fn free_on_node(&self, node: u16) -> usize {
+        self.free_by_pd
+            .iter()
+            .filter(|(pd, _)| self.node_by_pd.get(pd).copied().flatten() == Some(node))
+            .map(|(_, free)| free.len())
+            .sum()
+    }
+
+    fn nodes_with_free(&self) -> Vec<u16> {
+        let mut nodes = BTreeSet::new();
+        for (pd, free) in &self.free_by_pd {
+            if !free.is_empty() {
+                if let Some(node) = self.node_by_pd.get(pd).copied().flatten() {
+                    nodes.insert(node);
+                }
+            }
+        }
+        nodes.into_iter().collect()
+    }
+
+    fn pick_numa_node(&self, set_size: usize, row_need: usize) -> ChunkletResult<u16> {
+        self.nodes_with_free()
+            .into_iter()
+            .filter(|&node| {
+                self.usable_pds(Some(node)) >= set_size && self.free_on_node(node) >= row_need
+            })
+            .max_by_key(|&node| (self.free_on_node(node), std::cmp::Reverse(node)))
+            .ok_or_else(|| {
+                ChunkletError::Config(format!(
+                    "alloc: HaDomain::Numa cannot place a row locally: need {} chunklets and {} distinct PDs on one NUMA node",
+                    row_need, set_size
+                ))
+            })
+    }
+
+    fn candidate_pds(&self, node: Option<u16>) -> impl Iterator<Item = (&PdId, &VecDeque<u32>)> {
+        self.free_by_pd.iter().filter(move |(pd, free)| {
+            !free.is_empty()
+                && node.map_or(true, |n| {
+                    self.node_by_pd.get(pd).copied().flatten() == Some(n)
+                })
+        })
+    }
+
+    fn pop_front(&mut self, pd: &PdId) -> Option<u32> {
+        self.free_by_pd.get_mut(pd)?.pop_front()
+    }
+}
+
 fn pick_set(
-    state: &mut BTreeMap<PdId, VecDeque<u32>>,
+    state: &mut AllocState,
+    node: Option<u16>,
     set_size: usize,
     role_iter: &mut impl Iterator<Item = LdRole>,
 ) -> ChunkletResult<Vec<LdMember>> {
     let mut picks = Vec::with_capacity(set_size);
     let mut used_pds: Vec<PdId> = Vec::with_capacity(set_size);
     for _ in 0..set_size {
-        // Find the PD with the most free chunklets that we haven't used in
-        // this set. Tie-break by PdId for determinism.
         let chosen = state
-            .iter()
-            .filter(|(pd, free)| !free.is_empty() && !used_pds.contains(pd))
-            .max_by_key(|(pd, free)| (free.len(), std::cmp::Reverse(*pd)))
+            .candidate_pds(node)
+            .filter(|(pd, _)| !used_pds.contains(pd))
+            .max_by_key(|(pd, free)| (free.len(), std::cmp::Reverse(**pd)))
             .map(|(pd, _)| *pd)
             .ok_or_else(|| {
+                let where_clause = node
+                    .map(|n| format!(" on NUMA node {}", n))
+                    .unwrap_or_default();
                 ChunkletError::Config(format!(
-                    "alloc: not enough distinct PDs for set_size {}",
-                    set_size
+                    "alloc: not enough distinct PDs for set_size {}{}",
+                    set_size, where_clause
                 ))
             })?;
 
         let chunklet_index = state
-            .get_mut(&chosen)
-            .unwrap()
-            .pop_front()
+            .pop_front(&chosen)
             .expect("filter above guarantees at least one free index");
         let role = role_iter
             .next()
@@ -179,6 +275,17 @@ mod tests {
         spec.iter()
             .map(|(seed, indices)| PdFreeView {
                 pd: pd(*seed),
+                numa_node: None,
+                free_indices: indices.to_vec(),
+            })
+            .collect()
+    }
+
+    fn numa_views(spec: &[(u8, u16, &[u32])]) -> Vec<PdFreeView> {
+        spec.iter()
+            .map(|(seed, node, indices)| PdFreeView {
+                pd: pd(*seed),
+                numa_node: Some(*node),
                 free_indices: indices.to_vec(),
             })
             .collect()
@@ -186,7 +293,6 @@ mod tests {
 
     #[test]
     fn plain_lds_spread_across_pds() {
-        // 3 PDs, plenty free, ask for 4 Plain members (set_size=1).
         let req = AllocRequest {
             set_size: 1,
             row_size: 1,
@@ -196,19 +302,16 @@ mod tests {
         };
         let v = views(&[(1, &[0, 1, 2, 3]), (2, &[0, 1, 2, 3]), (3, &[0, 1, 2, 3])]);
         let plan = plan_alloc(&req, v).unwrap();
-        // 4 members: should be spread roundish across the 3 PDs.
         let mut counts: BTreeMap<PdId, u32> = BTreeMap::new();
         for m in &plan.members {
             *counts.entry(m.pd).or_insert(0) += 1;
         }
-        // No single PD takes 4-of-4; tightest packing is (2, 1, 1).
         assert!(counts.values().all(|&c| c <= 2));
         assert_eq!(plan.members.len(), 4);
     }
 
     #[test]
     fn raid5_set_members_distinct_per_set() {
-        // 5 PDs, RAID-5 set_size=4 (3+1), 1 row, 2 sets.
         let req = AllocRequest {
             set_size: 4,
             row_size: 2,
@@ -233,13 +336,58 @@ mod tests {
             (5, &[0, 1, 2]),
         ]);
         let plan = plan_alloc(&req, v).unwrap();
-        // Verify each set has 4 distinct PDs.
         for set in plan.members.chunks(4) {
             let mut seen: Vec<PdId> = set.iter().map(|m| m.pd).collect();
             seen.sort();
             seen.dedup();
             assert_eq!(seen.len(), 4, "set has duplicate PDs: {:?}", set);
         }
+    }
+
+    #[test]
+    fn numa_alloc_keeps_each_row_on_one_node() {
+        let req = AllocRequest {
+            set_size: 2,
+            row_size: 2,
+            num_rows: 2,
+            role_assignments: vec![LdRole::Data; 8],
+            ha_domain: HaDomain::Numa,
+        };
+        let v = numa_views(&[
+            (1, 0, &[0, 1, 2, 3]),
+            (2, 0, &[0, 1, 2, 3]),
+            (3, 1, &[0, 1, 2, 3]),
+            (4, 1, &[0, 1, 2, 3]),
+        ]);
+        let plan = plan_alloc(&req, v).unwrap();
+        let node_by_pd: BTreeMap<PdId, u16> = [(pd(1), 0), (pd(2), 0), (pd(3), 1), (pd(4), 1)]
+            .into_iter()
+            .collect();
+        for row in plan.members.chunks(4) {
+            let mut nodes: Vec<u16> = row.iter().map(|m| node_by_pd[&m.pd]).collect();
+            nodes.sort_unstable();
+            nodes.dedup();
+            assert_eq!(nodes.len(), 1, "row crossed NUMA nodes: {:?}", row);
+        }
+    }
+
+    #[test]
+    fn numa_alloc_rejects_cross_node_sets() {
+        let req = AllocRequest {
+            set_size: 3,
+            row_size: 1,
+            num_rows: 1,
+            role_assignments: vec![LdRole::Data; 3],
+            ha_domain: HaDomain::Numa,
+        };
+        let v = numa_views(&[
+            (1, 0, &[0, 1]),
+            (2, 0, &[0, 1]),
+            (3, 1, &[0, 1]),
+            (4, 1, &[0, 1]),
+        ]);
+        let err = plan_alloc(&req, v).err().unwrap();
+        assert!(matches!(err, ChunkletError::Config(_)));
     }
 
     #[test]
@@ -251,7 +399,6 @@ mod tests {
             role_assignments: vec![LdRole::Data; 4],
             ha_domain: HaDomain::Pd,
         };
-        // Only 3 PDs available — can't form set_size=4.
         let v = views(&[(1, &[0]), (2, &[0]), (3, &[0])]);
         let err = plan_alloc(&req, v).err().unwrap();
         assert!(matches!(err, ChunkletError::Config(_)));
@@ -278,7 +425,7 @@ mod tests {
             row_size: 1,
             num_rows: 1,
             role_assignments: vec![LdRole::Data],
-            ha_domain: HaDomain::Numa,
+            ha_domain: HaDomain::PcieSwitch,
         };
         let v = views(&[(1, &[0])]);
         let err = plan_alloc(&req, v).err().unwrap();

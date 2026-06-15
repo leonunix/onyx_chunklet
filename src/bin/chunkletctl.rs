@@ -201,6 +201,9 @@ enum CpgOp {
         row_size: u16,
         #[arg(long, default_value_t = 0)]
         strip_log2: u8,
+        /// HA/placement domain: pd | numa.
+        #[arg(long, default_value = "pd")]
+        ha_domain: String,
     },
     /// List all CPGs.
     List {
@@ -233,6 +236,9 @@ enum LdOp {
         /// Number of chunklets to claim.
         #[arg(long)]
         chunklets: u16,
+        /// HA/placement domain: pd | numa.
+        #[arg(long, default_value = "pd")]
+        ha_domain: String,
     },
     /// Create a RAID-0 LD (striping, no redundancy).
     CreateRaid0 {
@@ -245,6 +251,9 @@ enum LdOp {
         rows: u16,
         #[arg(long, default_value_t = 0)]
         strip_log2: u8,
+        /// HA/placement domain: pd | numa.
+        #[arg(long, default_value = "pd")]
+        ha_domain: String,
     },
     /// Create a RAID-6 LD (data chunklets per set + P + Q).
     CreateRaid6 {
@@ -259,6 +268,9 @@ enum LdOp {
         rows: u16,
         #[arg(long, default_value_t = 0)]
         strip_log2: u8,
+        /// HA/placement domain: pd | numa.
+        #[arg(long, default_value = "pd")]
+        ha_domain: String,
     },
     /// Create a RAID-5 LD (data chunklets per set + 1 parity).
     CreateRaid5 {
@@ -273,6 +285,9 @@ enum LdOp {
         rows: u16,
         #[arg(long, default_value_t = 0)]
         strip_log2: u8,
+        /// HA/placement domain: pd | numa.
+        #[arg(long, default_value = "pd")]
+        ha_domain: String,
     },
     /// Create a Mirror LD (RAID-1 with copies=N, row=1; RAID-10 with row>1).
     CreateMirror {
@@ -290,6 +305,9 @@ enum LdOp {
         /// Strip size as log2 bytes; 0 = 4 KiB block.
         #[arg(long, default_value_t = 0)]
         strip_log2: u8,
+        /// HA/placement domain: pd | numa.
+        #[arg(long, default_value = "pd")]
+        ha_domain: String,
     },
     /// List all LDs on the pool.
     List {
@@ -599,11 +617,20 @@ fn run_pd(cmd: PdCmd) -> ChunkletResult<()> {
 
 fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
     match cmd.op {
-        LdOp::CreatePlain { pool, chunklets } => {
+        LdOp::CreatePlain {
+            pool,
+            chunklets,
+            ha_domain,
+        } => {
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
-            let id = pool.create_ld(LdSpec::plain(chunklets))?;
-            println!("created LD {} (Plain, {} chunklets)", id, chunklets);
+            let mut spec = LdSpec::plain(chunklets);
+            spec.ha_domain = parse_ha_domain(&ha_domain)?;
+            let id = pool.create_ld(spec)?;
+            println!(
+                "created LD {} (Plain, {} chunklets, ha={})",
+                id, chunklets, ha_domain
+            );
             print_ld_table(&pool);
             Ok(())
         }
@@ -612,13 +639,16 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             stripe_width,
             rows,
             strip_log2,
+            ha_domain,
         } => {
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
-            let id = pool.create_ld(LdSpec::raid0(stripe_width, rows, strip_log2))?;
+            let mut spec = LdSpec::raid0(stripe_width, rows, strip_log2);
+            spec.ha_domain = parse_ha_domain(&ha_domain)?;
+            let id = pool.create_ld(spec)?;
             println!(
-                "created LD {} (Raid0, stripe_width={} rows={} strip_log2={})",
-                id, stripe_width, rows, strip_log2
+                "created LD {} (Raid0, stripe_width={} rows={} strip_log2={} ha={})",
+                id, stripe_width, rows, strip_log2, ha_domain
             );
             print_ld_table(&pool);
             Ok(())
@@ -629,13 +659,16 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             row_size,
             rows,
             strip_log2,
+            ha_domain,
         } => {
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
-            let id = pool.create_ld(LdSpec::raid6(data_per_set, row_size, rows, strip_log2))?;
+            let mut spec = LdSpec::raid6(data_per_set, row_size, rows, strip_log2);
+            spec.ha_domain = parse_ha_domain(&ha_domain)?;
+            let id = pool.create_ld(spec)?;
             println!(
-                "created LD {} (Raid6, K={} +P+Q, row_size={} rows={} strip_log2={})",
-                id, data_per_set, row_size, rows, strip_log2
+                "created LD {} (Raid6, K={} +P+Q, row_size={} rows={} strip_log2={} ha={})",
+                id, data_per_set, row_size, rows, strip_log2, ha_domain
             );
             print_ld_table(&pool);
             Ok(())
@@ -646,13 +679,16 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             row_size,
             rows,
             strip_log2,
+            ha_domain,
         } => {
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
-            let id = pool.create_ld(LdSpec::raid5(data_per_set, row_size, rows, strip_log2))?;
+            let mut spec = LdSpec::raid5(data_per_set, row_size, rows, strip_log2);
+            spec.ha_domain = parse_ha_domain(&ha_domain)?;
+            let id = pool.create_ld(spec)?;
             println!(
-                "created LD {} (Raid5, K={} +1 parity, row_size={} rows={} strip_log2={})",
-                id, data_per_set, row_size, rows, strip_log2
+                "created LD {} (Raid5, K={} +1 parity, row_size={} rows={} strip_log2={} ha={})",
+                id, data_per_set, row_size, rows, strip_log2, ha_domain
             );
             print_ld_table(&pool);
             Ok(())
@@ -663,13 +699,16 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             row_size,
             rows,
             strip_log2,
+            ha_domain,
         } => {
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
-            let id = pool.create_ld(LdSpec::mirror(copies, row_size, rows, strip_log2))?;
+            let mut spec = LdSpec::mirror(copies, row_size, rows, strip_log2);
+            spec.ha_domain = parse_ha_domain(&ha_domain)?;
+            let id = pool.create_ld(spec)?;
             println!(
-                "created LD {} (Mirror, copies={} row_size={} rows={} strip_log2={})",
-                id, copies, row_size, rows, strip_log2
+                "created LD {} (Mirror, copies={} row_size={} rows={} strip_log2={} ha={})",
+                id, copies, row_size, rows, strip_log2, ha_domain
             );
             print_ld_table(&pool);
             Ok(())
@@ -757,6 +796,7 @@ fn run_cpg(cmd: CpgCmd) -> ChunkletResult<()> {
             set_size,
             row_size,
             strip_log2,
+            ha_domain,
         } => {
             let raid_level = match raid.as_str() {
                 "plain" => RaidLevel::Plain,
@@ -773,13 +813,14 @@ fn run_cpg(cmd: CpgCmd) -> ChunkletResult<()> {
             };
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
+            let ha_domain = parse_ha_domain(&ha_domain)?;
             let id = pool.create_cpg(CpgSpec {
                 name: name.clone(),
                 raid_level,
                 set_size,
                 row_size,
                 strip_size_log2: strip_log2,
-                ha_domain: HaDomain::Pd,
+                ha_domain,
             })?;
             println!("created CPG {} ({})", id, name);
             Ok(())
@@ -795,8 +836,14 @@ fn run_cpg(cmd: CpgCmd) -> ChunkletResult<()> {
             println!("CPGs ({}):", cpgs.len());
             for c in cpgs {
                 println!(
-                    "  id={} name={} raid={:?} set={} row={} strip_log2={}",
-                    c.id, c.name, c.raid_level, c.set_size, c.row_size, c.strip_size_log2
+                    "  id={} name={} raid={:?} set={} row={} strip_log2={} ha={:?}",
+                    c.id,
+                    c.name,
+                    c.raid_level,
+                    c.set_size,
+                    c.row_size,
+                    c.strip_size_log2,
+                    c.ha_domain
                 );
             }
             Ok(())
@@ -834,14 +881,26 @@ fn print_ld_table(pool: &Pool) {
     println!("LDs ({}):", lds.len());
     for d in lds {
         println!(
-            "  id={} raid={:?} set={} row={} rows={} members={}",
+            "  id={} raid={:?} set={} row={} rows={} ha={:?} members={}",
             d.id,
             d.raid_level,
             d.set_size,
             d.row_size,
             d.num_rows,
+            d.ha_domain,
             d.members.len()
         );
+    }
+}
+
+fn parse_ha_domain(s: &str) -> ChunkletResult<HaDomain> {
+    match s {
+        "pd" => Ok(HaDomain::Pd),
+        "numa" => Ok(HaDomain::Numa),
+        other => Err(onyx_chunklet::ChunkletError::Config(format!(
+            "unknown ha domain '{}'; expected pd|numa",
+            other
+        ))),
     }
 }
 
@@ -922,12 +981,15 @@ fn print_pool_status(m: &PoolMetrics) {
     println!("PDs:");
     for pd in &m.pds {
         println!(
-            "  seq={:>3} state={:<8} pd={} gen={} backend={} free={}/{} used={} spare={} bad={} alloc={} path={}",
+            "  seq={:>3} state={:<8} pd={} gen={} numa={} backend={} free={}/{} used={} spare={} bad={} alloc={} path={}",
             pd.pd_seq,
             pd_state_label(pd.state),
             pd.pd_id,
             pd.manifest_gen
                 .map(|gen| gen.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            pd.numa_node
+                .map(|node| node.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             pd.backend.unwrap_or("-"),
             pd.free_chunklets,
@@ -949,7 +1011,7 @@ fn print_pool_status(m: &PoolMetrics) {
         println!("LDs:");
         for ld in &m.lds {
             println!(
-                "  id={} raid={:?} cap={} strip={} set={} row={} rows={} members={} unavailable={} failed={} bad={} draining={} drained={}",
+                "  id={} raid={:?} cap={} strip={} set={} row={} rows={} ha={:?} members={} unavailable={} failed={} bad={} draining={} drained={}",
                 ld.ld_id,
                 ld.raid_level,
                 format_bytes(ld.capacity_bytes),
@@ -957,6 +1019,7 @@ fn print_pool_status(m: &PoolMetrics) {
                 ld.set_size,
                 ld.row_size,
                 ld.num_rows,
+                ld.ha_domain,
                 ld.member_count,
                 ld.unavailable_members,
                 ld.failed_members,
@@ -1135,10 +1198,13 @@ fn open_or_create_one(path: &PathBuf) -> ChunkletResult<RawDevice> {
 
 fn print_pd_line(info: &onyx_chunklet::pd::PdInfo) {
     println!(
-        "  seq={:>3} pd={} gen={} chunklets={} size={} path={}",
+        "  seq={:>3} pd={} gen={} numa={} chunklets={} size={} path={}",
         info.pd_seq_in_pool,
         info.pd_id,
         info.manifest_gen,
+        info.numa_node
+            .map(|node| node.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         info.total_chunklets,
         info.size_bytes,
         info.path.display()

@@ -269,10 +269,8 @@ fn drain_marks_target_chunklets_used_on_replacement() {
     );
 }
 
-/// Regression: create_cpg used to accept HaDomain::Numa / PcieSwitch even
-/// though only HaDomain::Pd is wired. The CPG would persist fine but every
-/// subsequent create_ld_in_cpg failed at allocator validation. Reject up
-/// front so operators see the failure immediately.
+/// Regression: create_cpg must reject placement domains the allocator cannot
+/// honor. Numa is wired now; PcieSwitch remains a future topology domain.
 #[test]
 fn create_cpg_rejects_unsupported_ha_domain() {
     let dir = TempDir::new().unwrap();
@@ -283,13 +281,32 @@ fn create_cpg_rejects_unsupported_ha_domain() {
         set_size: 2,
         row_size: 1,
         strip_size_log2: 0,
-        ha_domain: onyx_chunklet::types::HaDomain::Numa,
+        ha_domain: onyx_chunklet::types::HaDomain::PcieSwitch,
     };
     let err = pool.create_cpg(spec).err().unwrap();
-    assert!(format!("{}", err).contains("HaDomain") || format!("{}", err).contains("Numa"));
+    assert!(format!("{}", err).contains("HaDomain") || format!("{}", err).contains("PcieSwitch"));
     assert!(
         pool.list_cpgs().is_empty(),
         "CPG must not persist on rejection"
+    );
+}
+
+#[test]
+fn create_cpg_accepts_numa_domain() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let spec = onyx_chunklet::pool::CpgSpec {
+        name: "numa-local".into(),
+        raid_level: onyx_chunklet::types::RaidLevel::Mirror,
+        set_size: 2,
+        row_size: 1,
+        strip_size_log2: 0,
+        ha_domain: onyx_chunklet::types::HaDomain::Numa,
+    };
+    let id = pool.create_cpg(spec).unwrap();
+    assert_eq!(
+        pool.find_cpg(id).unwrap().ha_domain,
+        onyx_chunklet::types::HaDomain::Numa
     );
 }
 

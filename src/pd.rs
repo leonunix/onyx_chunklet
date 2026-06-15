@@ -41,6 +41,7 @@ use crate::types::{
 pub struct PhysicalDisk {
     raw: RawDevice,
     state: RwLock<PdState>,
+    numa_node: parking_lot::RwLock<Option<u16>>,
     /// Pool-wide backend for fan-out writes. Set at PD construction
     /// (Pool::create / open / open_with_missing / admit) and cloned by
     /// `parallel_strip_writes` from any PD in the batch.
@@ -67,6 +68,7 @@ pub struct PdInfo {
     pub pool_id: PoolId,
     pub pd_id: PdId,
     pub pd_seq_in_pool: u32,
+    pub numa_node: Option<u16>,
     pub total_chunklets: u32,
     pub manifest_gen: u64,
     pub size_bytes: u64,
@@ -130,9 +132,11 @@ impl PhysicalDisk {
             active_bitmap_slot: 0,
         };
 
+        let numa_node = crate::numa::detect_pd_node(raw.path());
         let pd = Arc::new(Self {
             raw,
             state: RwLock::new(state),
+            numa_node: parking_lot::RwLock::new(numa_node),
             backend: parking_lot::RwLock::new(default_backend()),
         });
         // Write initial state to slot A (head + tail).
@@ -183,9 +187,11 @@ impl PhysicalDisk {
             active_sb_slot,
         };
 
+        let numa_node = crate::numa::detect_pd_node(raw.path());
         Ok(Arc::new(Self {
             raw,
             state: RwLock::new(state),
+            numa_node: parking_lot::RwLock::new(numa_node),
             backend: parking_lot::RwLock::new(default_backend()),
         }))
     }
@@ -200,6 +206,10 @@ impl PhysicalDisk {
     /// Current IO backend (cheap clone — `Arc<dyn IoBackend>`).
     pub fn backend(&self) -> std::sync::Arc<dyn crate::io::IoBackend> {
         self.backend.read().clone()
+    }
+
+    pub fn numa_node(&self) -> Option<u16> {
+        *self.numa_node.read()
     }
 
     /// Raw fd of the underlying device. Used by direct-fd IO submission
@@ -242,6 +252,7 @@ impl PhysicalDisk {
             pool_id: s.pool_id,
             pd_id: s.pd_id,
             pd_seq_in_pool: s.pd_seq_in_pool,
+            numa_node: *self.numa_node.read(),
             total_chunklets: s.total_chunklets,
             manifest_gen: s.manifest_gen,
             size_bytes: self.raw.size(),
@@ -362,6 +373,7 @@ impl PhysicalDisk {
         offset: u64,
         buf: &mut [u8],
     ) -> ChunkletResult<()> {
+        self.bind_current_to_local_node();
         let abs = self.chunklet_user_abs_offset(chunklet_index, offset, buf.len() as u64)?;
         self.raw.read_at(buf, abs)
     }
@@ -372,6 +384,7 @@ impl PhysicalDisk {
         offset: u64,
         buf: &[u8],
     ) -> ChunkletResult<()> {
+        self.bind_current_to_local_node();
         let abs = self.chunklet_user_abs_offset(chunklet_index, offset, buf.len() as u64)?;
         self.raw.write_at(buf, abs)
     }
@@ -415,6 +428,10 @@ impl PhysicalDisk {
 
     pub fn sync(&self) -> ChunkletResult<()> {
         self.raw.sync()
+    }
+
+    fn bind_current_to_local_node(&self) {
+        crate::numa::bind_current_to_node(*self.numa_node.read());
     }
 
     /// Resolve a (chunklet, in-chunklet offset, length) into an absolute

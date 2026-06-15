@@ -76,6 +76,7 @@ pub struct PdSnapshot {
     pub draining: bool,
     pub path: Option<String>,
     pub backend: Option<&'static str>,
+    pub numa_node: Option<u16>,
     pub manifest_gen: Option<u64>,
     pub size_bytes: u64,
     pub user_bytes: u64,
@@ -99,6 +100,7 @@ pub struct LdSnapshot {
     pub set_size: u8,
     pub row_size: u16,
     pub num_rows: u16,
+    pub ha_domain: String,
     pub strip_size_bytes: u64,
     pub capacity_bytes: u64,
     pub member_count: usize,
@@ -372,6 +374,7 @@ impl PdSnapshot {
             draining: m.draining,
             path: m.path.as_ref().map(|p| p.display().to_string()),
             backend: m.backend,
+            numa_node: m.numa_node,
             manifest_gen: m.manifest_gen,
             size_bytes: m.size_bytes,
             user_bytes: m.user_bytes,
@@ -398,6 +401,7 @@ impl LdSnapshot {
             set_size: m.set_size,
             row_size: m.row_size,
             num_rows: m.num_rows,
+            ha_domain: ha_label(m.ha_domain).into(),
             strip_size_bytes: m.strip_size_bytes,
             capacity_bytes: m.capacity_bytes,
             member_count: m.member_count,
@@ -454,6 +458,14 @@ pub fn raid_label(raid: RaidLevel) -> &'static str {
         RaidLevel::Raid0 => "raid0",
         RaidLevel::Raid5 => "raid5",
         RaidLevel::Raid6 => "raid6",
+    }
+}
+
+pub fn ha_label(domain: crate::types::HaDomain) -> &'static str {
+    match domain {
+        crate::types::HaDomain::Pd => "pd",
+        crate::types::HaDomain::Numa => "numa",
+        crate::types::HaDomain::PcieSwitch => "pcie-switch",
     }
 }
 

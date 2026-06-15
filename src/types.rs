@@ -142,13 +142,13 @@ impl ChunkletState {
     }
 }
 
-/// HA failure domain (used by allocator to spread RAID set members).
-/// Phase 0 only `Pd` is wired; `Numa` / `PcieSwitch` are placeholders.
+/// Placement/failure domain used by the allocator.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum HaDomain {
     /// One member per PD (default; works for all single-host NVMe pools).
     Pd,
-    /// One member per NUMA node. Not implemented yet.
+    /// NUMA-local row placement: every row is allocated from one NUMA node.
+    /// This avoids cross-socket stripes on dual-socket NVMe hosts.
     Numa,
     /// One member per PCIe switch. Not implemented yet.
     PcieSwitch,
@@ -156,7 +156,7 @@ pub enum HaDomain {
 
 impl HaDomain {
     pub fn is_supported(self) -> bool {
-        matches!(self, HaDomain::Pd)
+        matches!(self, HaDomain::Pd | HaDomain::Numa)
     }
 
     pub fn from_u8(b: u8) -> ChunkletResult<Self> {

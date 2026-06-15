@@ -86,10 +86,11 @@ impl Default for IoBackendKind {
 /// and shares one backend Arc) and forwards. Empty batches short-circuit
 /// without touching the backend. Takes `Vec` by value so call sites can
 /// move the assembled batch without an extra borrow dance.
-pub fn submit_strip_writes(ops: Vec<StripWrite<'_>>) -> ChunkletResult<()> {
+pub fn submit_strip_writes(mut ops: Vec<StripWrite<'_>>) -> ChunkletResult<()> {
     if ops.is_empty() {
         return Ok(());
     }
+    ops.sort_by_key(|op| op.pd.numa_node().unwrap_or(u16::MAX));
     let backend = ops[0].pd.backend();
     backend.submit_writes(&ops)
 }
@@ -100,6 +101,7 @@ pub fn submit_strip_reads(ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
     if ops.is_empty() {
         return Ok(());
     }
+    ops.sort_by_key(|op| op.pd.numa_node().unwrap_or(u16::MAX));
     let backend = ops[0].pd.backend();
     backend.submit_reads(ops)
 }
