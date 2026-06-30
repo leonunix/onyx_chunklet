@@ -29,7 +29,12 @@ pub const MAX_CHUNKLETS_PER_PD: u32 = (BITMAP_SLOT_BYTES) as u32;
 pub const CHUNKLET_HEADER_BYTES: u64 = 4096;
 
 /// On-disk superblock format version. Bumped on any layout change.
-pub const SUPERBLOCK_VERSION: u32 = 1;
+///
+/// v2: LD descriptors use per-position run-length extent encoding (see
+/// `ld::descriptor`) so an LD scales to ~1 PB within the single-slot manifest
+/// body. v1 pools (explicit per-chunklet members) are hard-rejected — recreate
+/// the pool (Phase 0-7 policy: no on-disk migration).
+pub const SUPERBLOCK_VERSION: u32 = 2;
 
 /// Magic for chunklet superblock: ASCII "ONYXCHK1".
 pub const SUPERBLOCK_MAGIC: &[u8; 8] = b"ONYXCHK1";
