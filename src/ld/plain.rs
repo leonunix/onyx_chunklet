@@ -173,6 +173,10 @@ impl LogicalDisk for LdPlain {
             pd.write_chunklet_user(chunklet_idx, off_in_c, &buf[range])
         })
     }
+
+    fn flush(&self) -> ChunkletResult<()> {
+        crate::ld::flush_members(&self.members)
+    }
 }
 
 fn degraded_error(pd: &crate::types::PdId) -> ChunkletError {

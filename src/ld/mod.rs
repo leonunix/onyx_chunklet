@@ -96,6 +96,40 @@ pub trait LogicalDisk: Send + Sync {
         }
         Ok(())
     }
+
+    /// Make every prior `write_at` / `write_many_at` durable.
+    ///
+    /// `write_at` issues O_DIRECT `pwrite`s to the member PDs, which bypasses
+    /// the page cache but does **not** flush each drive's write cache — the
+    /// data is not yet crash-durable when the call returns. `flush` is the
+    /// persistence barrier: upstream durability gates (onyx's LV2
+    /// ack-after-durable, metadb checkpoint sync) call it before treating a
+    /// write as committed. Implementations fan `PhysicalDisk::sync()` out
+    /// across the LD's distinct member PDs; degraded (absent) members are
+    /// skipped, their data being reconstructed on read.
+    fn flush(&self) -> ChunkletResult<()>;
+}
+
+/// Fan `PhysicalDisk::sync()` out across the distinct member PDs of an LD.
+///
+/// Multiple chunklets of one LD can live on the same PD, so each PD is synced
+/// at most once per call. `None` members (failed PD / scrub-quarantined
+/// chunklet) are skipped — a redundant LD reconstructs them on read, and a
+/// non-redundant LD would already have errored on the write that preceded
+/// this flush. Shared by every `LogicalDisk::flush` implementation.
+pub(crate) fn flush_members(
+    members: &[Option<Arc<PhysicalDisk>>],
+) -> ChunkletResult<()> {
+    let mut synced: Vec<crate::types::PdId> = Vec::new();
+    for pd in members.iter().flatten() {
+        let id = pd.pd_id();
+        if synced.contains(&id) {
+            continue;
+        }
+        pd.sync()?;
+        synced.push(id);
+    }
+    Ok(())
 }
 
 pub(crate) struct StripeLockTable {

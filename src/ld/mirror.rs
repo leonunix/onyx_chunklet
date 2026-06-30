@@ -425,6 +425,10 @@ impl LogicalDisk for LdMirror {
         drop(stripe_guards);
         result
     }
+
+    fn flush(&self) -> ChunkletResult<()> {
+        crate::ld::flush_members(&self.members)
+    }
 }
 
 impl LdMirror {

@@ -107,6 +107,16 @@ impl LogicalDisk for RuntimeLogicalDisk {
         drop(range_guards);
         Ok(())
     }
+
+    fn flush(&self) -> ChunkletResult<()> {
+        // A persistence barrier, not an addressed IO: take the lifecycle read
+        // lock so a concurrent rebuild/drop can't swap the member set mid-sync,
+        // but no range lock — flush touches every member PD, not a stripe range.
+        self.runtime.check_open(self.id(), self.opened_epoch)?;
+        let _lifecycle = self.runtime.io_lock.read();
+        self.runtime.check_open(self.id(), self.opened_epoch)?;
+        self.inner.flush()
+    }
 }
 
 /// Caller-supplied LD-creation spec.

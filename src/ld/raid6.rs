@@ -683,6 +683,10 @@ impl LogicalDisk for LdRaid6 {
         }
         Ok(())
     }
+
+    fn flush(&self) -> ChunkletResult<()> {
+        crate::ld::flush_members(&self.members)
+    }
 }
 
 impl LdRaid6 {
