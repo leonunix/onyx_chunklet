@@ -635,11 +635,18 @@ mod tests {
         assert_eq!(rt(&d), d);
     }
 
-    /// The whole point: a 1 PB RAID6 6+2 LD must fit the 4028-byte manifest
-    /// slot. set_size=8, row_size=3, num_rows=58255 → ~1.05 PB usable, P=24
-    /// positions, contiguous → 1 run/position.
+    /// Codec capacity proof: a 1 PB RAID6 6+2 LD (set_size=8, row_size=3,
+    /// num_rows=58255, P=24) with IDEALISED contiguous placement (1 run per
+    /// position) encodes to <1 KB and round-trips 1.4M members losslessly —
+    /// vs the v1 33 MB explicit member list. NOTE: real placement can't be
+    /// 1 run/position at this scale because a PD only holds ~7000 chunklets,
+    /// so a position's 58255-row column spans several PDs (more runs); true
+    /// multi-PB therefore also needs the column-contiguous allocator (S2) to
+    /// minimise runs AND an out-of-line superblock body (the pd_list for
+    /// ~150 PDs alone exceeds the 4028-byte slot). This test pins the codec's
+    /// best case + correctness, not the end-to-end 1 PB feasibility.
     #[test]
-    fn one_petabyte_raid6_fits_manifest_slot() {
+    fn one_petabyte_raid6_idealised_placement_fits_slot() {
         const MAX_BODY_BYTES: usize = 4028;
         let pds: Vec<PdId> = (0..24).map(|_| PdId::new_v4()).collect();
         let num_rows: u16 = 58255;
