@@ -20,18 +20,45 @@
 //! 4 KiB fragment alignment).
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use io_uring::{opcode, types, IoUring};
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::aligned::AlignedBuf;
 use crate::io::backend::{IoBackend, StripRead, StripWrite};
+use crate::io::sync_backend::SyncBackend;
 use crate::types::BLOCK_SIZE;
 
 const URING_DEPTH: u32 = 64;
 
+/// Per-thread ring state. A ring is created lazily on first submit and reused
+/// for the thread's lifetime. If creation hits file-descriptor exhaustion
+/// (EMFILE/ENFILE) or memory pressure (ENOMEM), the thread permanently
+/// downgrades to the syscall path instead of hard-failing every IO — under a
+/// large onyx thread fan-out the default `nofile` can be overrun, and a write
+/// that fails is far worse than a write that runs a bit slower. (P8: this is
+/// the runtime analog of the probe-time fallback in `backend::make_backend`.)
+enum RingState {
+    Uninit,
+    Ready(IoUring),
+    Disabled,
+}
+
 thread_local! {
-    static URING: RefCell<Option<IoUring>> = const { RefCell::new(None) };
+    static URING: RefCell<RingState> = const { RefCell::new(RingState::Uninit) };
+}
+
+/// Process-wide latch so the EMFILE downgrade logs once, not once per thread.
+static FD_EXHAUSTION_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// True when an `IoUring::new` error is fd/memory exhaustion the caller should
+/// gracefully degrade around (vs a genuine "io_uring unsupported" error).
+fn is_resource_exhaustion(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM)
+    )
 }
 
 pub struct UringBackend;
@@ -46,6 +73,51 @@ impl UringBackend {
     }
 }
 
+/// Outcome of trying to get this thread's ring for one submit.
+enum RingAccess<'a> {
+    /// Use this ring.
+    Ready(&'a mut IoUring),
+    /// fd/memory exhaustion — caller must fall back to the syscall path.
+    Degrade,
+}
+
+/// Borrow (lazily creating) this thread's ring, or report that the thread has
+/// degraded to sync. A genuine non-exhaustion init error is returned as `Err`.
+fn with_ring<R>(
+    f: impl FnOnce(RingAccess<'_>) -> ChunkletResult<R>,
+) -> ChunkletResult<R> {
+    URING.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if matches!(&*slot, RingState::Uninit) {
+            match IoUring::new(URING_DEPTH) {
+                Ok(r) => *slot = RingState::Ready(r),
+                Err(e) if is_resource_exhaustion(&e) => {
+                    if !FD_EXHAUSTION_WARNED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            error = %e,
+                            "io_uring init hit fd/memory exhaustion; this thread (and any \
+                             other that hits it) falls back to the syscall backend — raise \
+                             the process nofile limit (LimitNOFILE) to keep the io_uring path"
+                        );
+                    }
+                    *slot = RingState::Disabled;
+                }
+                Err(e) => {
+                    return Err(ChunkletError::Io(std::io::Error::other(format!(
+                        "io_uring init: {}",
+                        e
+                    ))));
+                }
+            }
+        }
+        match &mut *slot {
+            RingState::Ready(ring) => f(RingAccess::Ready(ring)),
+            RingState::Disabled => f(RingAccess::Degrade),
+            RingState::Uninit => unreachable!("ring state resolved above"),
+        }
+    })
+}
+
 impl IoBackend for UringBackend {
     fn name(&self) -> &'static str {
         "uring"
@@ -55,60 +127,61 @@ impl IoBackend for UringBackend {
         if ops.is_empty() {
             return Ok(());
         }
-        URING.with(|cell| -> ChunkletResult<()> {
-            let mut slot = cell.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(IoUring::new(URING_DEPTH).map_err(|e| {
-                    ChunkletError::Io(std::io::Error::other(format!("io_uring init: {}", e)))
-                })?);
-            }
-            let ring = slot.as_mut().expect("ring just initialized");
-            let mut start = 0usize;
-            while start < ops.len() {
-                let node = ops[start].pd.numa_node();
-                let mut end = start + 1;
-                while end < ops.len()
-                    && end - start < URING_DEPTH as usize
-                    && ops[end].pd.numa_node() == node
-                {
-                    end += 1;
+        let degraded = with_ring(|access| match access {
+            RingAccess::Degrade => Ok(true),
+            RingAccess::Ready(ring) => {
+                let mut start = 0usize;
+                while start < ops.len() {
+                    let node = ops[start].pd.numa_node();
+                    let mut end = start + 1;
+                    while end < ops.len()
+                        && end - start < URING_DEPTH as usize
+                        && ops[end].pd.numa_node() == node
+                    {
+                        end += 1;
+                    }
+                    crate::numa::bind_current_to_node(node);
+                    submit_read_chunk(ring, &mut ops[start..end])?;
+                    start = end;
                 }
-                crate::numa::bind_current_to_node(node);
-                submit_read_chunk(ring, &mut ops[start..end])?;
-                start = end;
+                Ok(false)
             }
-            Ok(())
-        })
+        })?;
+        if degraded {
+            // fd exhaustion → run this batch through the syscall fan-out.
+            return SyncBackend.submit_reads(ops);
+        }
+        Ok(())
     }
 
     fn submit_writes(&self, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
         if ops.is_empty() {
             return Ok(());
         }
-        URING.with(|cell| -> ChunkletResult<()> {
-            let mut slot = cell.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(IoUring::new(URING_DEPTH).map_err(|e| {
-                    ChunkletError::Io(std::io::Error::other(format!("io_uring init: {}", e)))
-                })?);
-            }
-            let ring = slot.as_mut().expect("ring just initialized");
-            let mut start = 0usize;
-            while start < ops.len() {
-                let node = ops[start].pd.numa_node();
-                let mut end = start + 1;
-                while end < ops.len()
-                    && end - start < URING_DEPTH as usize
-                    && ops[end].pd.numa_node() == node
-                {
-                    end += 1;
+        let degraded = with_ring(|access| match access {
+            RingAccess::Degrade => Ok(true),
+            RingAccess::Ready(ring) => {
+                let mut start = 0usize;
+                while start < ops.len() {
+                    let node = ops[start].pd.numa_node();
+                    let mut end = start + 1;
+                    while end < ops.len()
+                        && end - start < URING_DEPTH as usize
+                        && ops[end].pd.numa_node() == node
+                    {
+                        end += 1;
+                    }
+                    crate::numa::bind_current_to_node(node);
+                    submit_chunk(ring, &ops[start..end])?;
+                    start = end;
                 }
-                crate::numa::bind_current_to_node(node);
-                submit_chunk(ring, &ops[start..end])?;
-                start = end;
+                Ok(false)
             }
-            Ok(())
-        })
+        })?;
+        if degraded {
+            return SyncBackend.submit_writes(ops);
+        }
+        Ok(())
     }
 }
 
@@ -296,4 +369,75 @@ fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()
 fn is_direct_aligned(offset: u64, len: usize, ptr: usize) -> bool {
     let bs = BLOCK_SIZE as u64;
     offset % bs == 0 && (len as u64) % bs == 0 && (ptr as u64) % bs == 0
+}
+
+/// Force this thread's ring into the `Disabled` state, simulating an
+/// `IoUring::new` EMFILE without actually exhausting the process fd table
+/// (which would destabilise the rest of the suite). Lets a test drive the
+/// runtime degrade-to-sync path deterministically.
+#[cfg(test)]
+fn force_ring_disabled_for_test() {
+    URING.with(|cell| *cell.borrow_mut() = RingState::Disabled);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pd::PhysicalDisk;
+    use crate::types::{PdId, PoolId};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resource_exhaustion_matches_fd_and_mem_errnos() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM] {
+            assert!(is_resource_exhaustion(&std::io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [libc::EINVAL, libc::EIO, libc::EPERM] {
+            assert!(!is_resource_exhaustion(&std::io::Error::from_raw_os_error(errno)));
+        }
+        // A non-OS error (no errno) is not exhaustion.
+        assert!(!is_resource_exhaustion(&std::io::Error::other("nope")));
+    }
+
+    /// When the thread's ring is disabled (the EMFILE outcome), `submit_writes`
+    /// / `submit_reads` must transparently fall back to the syscall backend and
+    /// still land the data correctly — a degraded write, never a failed one.
+    #[test]
+    fn degrades_to_sync_when_ring_disabled() {
+        let dir = TempDir::new().unwrap();
+        let raw = crate::io::RawDevice::open_or_create(
+            &dir.path().join("pd0"),
+            4 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
+        let pd: Arc<PhysicalDisk> =
+            PhysicalDisk::init(raw, PoolId::new_v4(), PdId::new_v4(), 0, 1, vec![], 0, vec![], vec![])
+                .unwrap();
+
+        force_ring_disabled_for_test();
+
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let writes = vec![StripWrite {
+            pd: pd.clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 0,
+            data: &payload,
+        }];
+        // Hard-fails today on a disabled ring; with the degrade fix it returns Ok
+        // via SyncBackend.
+        UringBackend.submit_writes(&writes).unwrap();
+
+        let mut got = vec![0u8; 4096];
+        {
+            let mut reads = vec![StripRead {
+                pd: pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &mut got,
+            }];
+            UringBackend.submit_reads(&mut reads).unwrap();
+        }
+        assert_eq!(got, payload, "degraded read-back must match the degraded write");
+    }
 }
