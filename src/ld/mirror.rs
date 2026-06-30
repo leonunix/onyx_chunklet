@@ -42,7 +42,7 @@
 //!   self-heal via `Pool::scrub_ld` (majority vote); 2-way mirrors require
 //!   `Pool::mark_chunklet_bad` to identify the bad copy explicitly.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -248,6 +248,100 @@ impl LdMirror {
             set_base, failed_member_idx
         )))
     }
+
+    /// Round-robin pick a live copy for the (row, set) segment using that
+    /// set's cursor, then walk the ring skipping missing/Failed copies.
+    /// Errors only when every copy in the set is dead. Mirror "reconstruction"
+    /// is just reading a surviving sibling — no parity math.
+    fn pick_read_copy(&self, row: usize, set: usize) -> ChunkletResult<(Arc<PhysicalDisk>, u32)> {
+        let row_size = self.desc.row_size as usize;
+        let copies = self.member_indices_for(row, set);
+        let n = copies.end - copies.start;
+        let start = self.read_cursors[row * row_size + set].fetch_add(1, Ordering::Relaxed) % n;
+        for off in 0..n {
+            let m = copies.start + (start + off) % n;
+            if let Some(pd) = self.members[m].as_ref() {
+                return Ok((pd.clone(), self.desc.members[m].chunklet_index));
+            }
+        }
+        Err(ChunkletError::Invariant(format!(
+            "Mirror set (row={}, set={}) has no live copy",
+            row, set
+        )))
+    }
+
+    /// Expand a batch of variable-length writes into one `StripWrite` per
+    /// (strip segment × live copy), plus the per-segment stripe keys. Each
+    /// write fans to EVERY live copy of its stripe; a segment with no live copy
+    /// is a hard error. The flat write list + key list feed a single
+    /// `parallel_strip_writes` under one `write_keys` acquisition (see
+    /// `write_many_at`), so the whole coalesced batch is one cross-PD submit
+    /// instead of one submit per 4 KiB strip.
+    fn collect_strip_writes<'a>(
+        &self,
+        ops: &[(u64, &'a [u8])],
+    ) -> ChunkletResult<(Vec<StripWrite<'a>>, Vec<u64>)> {
+        let mut writes: Vec<StripWrite<'a>> =
+            Vec::with_capacity(ops.len() * self.desc.set_size as usize);
+        let mut stripe_keys: Vec<u64> = Vec::new();
+        for (offset, buf) in ops {
+            self.for_each_segment(*offset, buf.len(), |row, set, off_in_c, range| {
+                stripe_keys.push(self.stripe_key(row, set, off_in_c));
+                let before = writes.len();
+                for member_idx in self.member_indices_for(row, set) {
+                    if let Some(pd) = self.members[member_idx].as_ref() {
+                        writes.push(StripWrite {
+                            pd: pd.clone(),
+                            chunklet_index: self.desc.members[member_idx].chunklet_index,
+                            in_chunklet_off: off_in_c,
+                            data: &buf[range.clone()],
+                        });
+                    }
+                }
+                if writes.len() == before {
+                    return Err(ChunkletError::Invariant(format!(
+                        "Mirror set (row={}, set={}) write: no live copy",
+                        row, set
+                    )));
+                }
+                Ok(())
+            })?;
+        }
+        Ok((writes, stripe_keys))
+    }
+
+    /// Carve `buf` into one `StripRead` per strip segment, appended to `out`.
+    /// A single `&mut [u8]` can't be re-sliced by `range` inside the
+    /// `for_each_segment` closure while a moving split cursor also walks it, so
+    /// we collect the layout first (immutable) then peel disjoint `&mut`
+    /// sub-slices with `split_at_mut`. The copy for each segment is chosen here
+    /// (round-robin), so the later `parallel_strip_reads` is one batched submit.
+    fn carve_reads<'b>(
+        &self,
+        offset: u64,
+        buf: &'b mut [u8],
+        out: &mut Vec<StripRead<'b>>,
+    ) -> ChunkletResult<()> {
+        let mut layout: Vec<(u64, Arc<PhysicalDisk>, u32, usize)> = Vec::new();
+        self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
+            let (pd, chunklet_index) = self.pick_read_copy(row, set)?;
+            layout.push((off_in_c, pd, chunklet_index, range.end - range.start));
+            Ok(())
+        })?;
+        let mut rest: &mut [u8] = buf;
+        for (in_chunklet_off, pd, chunklet_index, seg_len) in layout {
+            let (head, tail) = rest.split_at_mut(seg_len);
+            rest = tail;
+            out.push(StripRead {
+                pd,
+                chunklet_index,
+                in_chunklet_off,
+                data: head,
+            });
+        }
+        debug_assert!(rest.is_empty(), "segment lengths must sum to buf.len()");
+        Ok(())
+    }
 }
 
 impl LogicalDisk for LdMirror {
@@ -269,156 +363,52 @@ impl LogicalDisk for LdMirror {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
-        let row_size = self.desc.row_size as usize;
-        self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
-            // Round-robin pick a live copy using THIS set's cursor (so
-            // concurrent reads on different sets don't share a counter
-            // and converge on the same copy). If the chosen copy is
-            // Failed, walk through the rest of the ring; all-N-Failed
-            // returns an error.
-            let copies = self.member_indices_for(row, set);
-            let n = copies.end - copies.start;
-            let cursor_idx = row * row_size + set;
-            let start = self.read_cursors[cursor_idx].fetch_add(1, Ordering::Relaxed) % n;
-            for offset_pick in 0..n {
-                let pick = (start + offset_pick) % n;
-                let member_idx = copies.start + pick;
-                if let Some(pd) = self.members[member_idx].as_ref() {
-                    let chunklet_idx = self.desc.members[member_idx].chunklet_index;
-                    return pd.read_chunklet_user(chunklet_idx, off_in_c, &mut buf[range]);
-                }
-            }
-            Err(ChunkletError::Invariant(format!(
-                "Mirror set (row={}, set={}) has no live copy",
-                row, set
-            )))
-        })
+        let mut reads: Vec<StripRead> = Vec::new();
+        self.carve_reads(offset, buf, &mut reads)?;
+        parallel_strip_reads(&mut reads)
     }
 
     fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> ChunkletResult<()> {
         for (offset, buf) in ops.iter() {
             self.ensure_aligned(*offset, buf.len())?;
         }
-        let row_size = self.desc.row_size as usize;
-        let mut reads = Vec::with_capacity(ops.len());
-        for (offset, buf) in ops.iter_mut() {
-            if buf.len() != self.strip_bytes as usize {
-                self.read_at(*offset, buf)?;
-                continue;
-            }
-            let mut chosen = None;
-            self.for_each_segment(*offset, buf.len(), |row, set, off_in_c, range| {
-                if range.start != 0 || range.end != buf.len() {
-                    return Err(ChunkletError::Invariant(
-                        "mirror read_many split unexpected range".into(),
-                    ));
-                }
-                let copies = self.member_indices_for(row, set);
-                let n = copies.end - copies.start;
-                let cursor_idx = row * row_size + set;
-                let start = self.read_cursors[cursor_idx].fetch_add(1, Ordering::Relaxed) % n;
-                for offset_pick in 0..n {
-                    let pick = (start + offset_pick) % n;
-                    let member_idx = copies.start + pick;
-                    if let Some(pd) = self.members[member_idx].as_ref() {
-                        chosen = Some((
-                            pd.clone(),
-                            self.desc.members[member_idx].chunklet_index,
-                            off_in_c,
-                        ));
-                        return Ok(());
-                    }
-                }
-                Err(ChunkletError::Invariant(format!(
-                    "Mirror set (row={}, set={}) has no live copy",
-                    row, set
-                )))
-            })?;
-            let (pd, chunklet_index, in_chunklet_off) =
-                chosen.expect("for_each_segment selected one mirror read");
-            reads.push(StripRead {
-                pd,
-                chunklet_index,
-                in_chunklet_off,
-                data: *buf,
-            });
+        // Carve every op's buffer into its strip segments and collect all
+        // StripReads across all ops into one batch. `mem::take` lifts each
+        // `&mut [u8]` out of `ops` at its original lifetime so the reads can
+        // outlive the per-op iteration and submit together.
+        let mut reads: Vec<StripRead> = Vec::with_capacity(ops.len());
+        for (offset, buf_ref) in ops.iter_mut() {
+            let buf: &mut [u8] = std::mem::take(buf_ref);
+            self.carve_reads(*offset, buf, &mut reads)?;
         }
         parallel_strip_reads(&mut reads)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
-        self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
-            let _stripe = self
-                .stripe_locks
-                .write_key(self.stripe_key(row, set, off_in_c));
-            // Build a parallel fan-out across every live copy. Failed
-            // copies (PD missing or chunklet Bad) are skipped — caller has
-            // already errored on a fully-dead set during open.
-            let copies = self.member_indices_for(row, set);
-            let mut ops: Vec<StripWrite> = Vec::with_capacity(copies.end - copies.start);
-            for member_idx in copies.clone() {
-                if let Some(pd) = self.members[member_idx].as_ref() {
-                    ops.push(StripWrite {
-                        pd: pd.clone(),
-                        chunklet_index: self.desc.members[member_idx].chunklet_index,
-                        in_chunklet_off: off_in_c,
-                        data: &buf[range.clone()],
-                    });
-                }
-            }
-            if ops.is_empty() {
-                return Err(ChunkletError::Invariant(format!(
-                    "Mirror set (row={}, set={}) write: no live copy",
-                    row, set
-                )));
-            }
-            parallel_strip_writes(ops)
-        })
+        // A single contiguous op walks distinct strips, so its segments never
+        // collide — collect them all, take every stripe lock once, and fan the
+        // whole write to every live copy in one cross-PD submit.
+        let (writes, stripe_keys) = self.collect_strip_writes(&[(offset, buf)])?;
+        let _guards = self.stripe_locks.write_keys(&stripe_keys);
+        parallel_strip_writes(writes)
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
         for (offset, buf) in ops {
             self.ensure_aligned(*offset, buf.len())?;
-            if buf.len() != self.strip_bytes as usize {
-                return self.write_many_fallback(ops);
-            }
         }
-        if has_duplicate_offsets(ops) {
+        // One StripWrite per (segment × live copy) across the whole batch, so
+        // a coalesced multi-strip flush span becomes ONE cross-PD submit
+        // instead of one submit per 4 KiB strip.
+        let (writes, stripe_keys) = self.collect_strip_writes(ops)?;
+        // Two segments hitting the same physical strip must serialize — a
+        // single batched submit would race them. Disjoint ring spans (the
+        // flusher) never collide; this only trips on a misbehaving caller, so
+        // fall back to ordered per-op writes.
+        if has_duplicate_stripes(&stripe_keys) {
+            drop(writes);
             return self.write_many_fallback(ops);
-        }
-
-        let mut stripe_keys = Vec::with_capacity(ops.len());
-        let mut writes = Vec::with_capacity(ops.len() * self.desc.set_size as usize);
-        for (offset, buf) in ops {
-            let mut prepared = Vec::new();
-            self.for_each_segment(*offset, buf.len(), |row, set, off_in_c, range| {
-                if range.start != 0 || range.end != buf.len() {
-                    return Err(ChunkletError::Invariant(
-                        "mirror write_many split unexpected range".into(),
-                    ));
-                }
-                stripe_keys.push(self.stripe_key(row, set, off_in_c));
-                let copies = self.member_indices_for(row, set);
-                for member_idx in copies.clone() {
-                    if let Some(pd) = self.members[member_idx].as_ref() {
-                        prepared.push(StripWrite {
-                            pd: pd.clone(),
-                            chunklet_index: self.desc.members[member_idx].chunklet_index,
-                            in_chunklet_off: off_in_c,
-                            data: *buf,
-                        });
-                    }
-                }
-                if prepared.is_empty() {
-                    return Err(ChunkletError::Invariant(format!(
-                        "Mirror set (row={}, set={}) write_many: no live copy",
-                        row, set
-                    )));
-                }
-                Ok(())
-            })?;
-            writes.extend(prepared);
         }
         let stripe_guards = self.stripe_locks.write_keys(&stripe_keys);
         let result = parallel_strip_writes(writes);
@@ -440,7 +430,11 @@ impl LdMirror {
     }
 }
 
-fn has_duplicate_offsets(ops: &[(u64, &[u8])]) -> bool {
-    let mut seen = HashSet::with_capacity(ops.len());
-    ops.iter().any(|(offset, _)| !seen.insert(*offset))
+/// True if any two segments in the batch target the same physical strip.
+/// `stripe_key` already folds (row, set, strip_in_chunklet) into a unique id,
+/// so this subsumes exact-offset duplicates AND partial multi-strip overlap.
+fn has_duplicate_stripes(keys: &[u64]) -> bool {
+    let mut sorted = keys.to_vec();
+    sorted.sort_unstable();
+    sorted.windows(2).any(|w| w[0] == w[1])
 }

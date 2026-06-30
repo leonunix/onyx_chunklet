@@ -73,15 +73,19 @@ impl LogicalDisk for RuntimeLogicalDisk {
     fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> ChunkletResult<()> {
         self.runtime.check_open(self.id(), self.opened_epoch)?;
         let _lifecycle = self.runtime.io_lock.read();
-        let mut range_guards = Vec::new();
+        // Collect every key across all ops and acquire the read locks in ONE
+        // globally-sorted batch, exactly mirroring `write_many_at`'s
+        // `write_keys`. Acquiring per-op (each `read_key_range` sorted only
+        // within its own range) takes overlapping buckets in a different order
+        // than a concurrent `write_keys`, which deadlocks AB-BA.
+        let mut keys = Vec::new();
         for (offset, buf) in ops.iter() {
             let (first, last) = self.range_keys(*offset, buf.len());
-            range_guards.extend(self.runtime.range_locks.read_key_range(first, last));
+            keys.extend(first..=last);
         }
+        let _range = self.runtime.range_locks.read_keys(&keys);
         self.runtime.check_open(self.id(), self.opened_epoch)?;
-        self.inner.read_many_at(ops)?;
-        drop(range_guards);
-        Ok(())
+        self.inner.read_many_at(ops)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {

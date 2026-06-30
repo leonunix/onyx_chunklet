@@ -111,6 +111,78 @@ fn mirror_partial_write_torn_state_then_scrub_recovers() {
     );
 }
 
+/// Same torn-state + scrub contract as above, but the failing write is a
+/// MULTI-STRIP variable-length span that now fans every strip × copy through
+/// one batched `submit_writes`. Confirms the batched submit still produces a
+/// clean K-1-of-K torn state (survivors fully new, failed copy fully old)
+/// across all strips, and scrub majority-votes the divergent copy Bad.
+#[test]
+#[ignore = "fault-injection: installs a test backend on a live PD"]
+fn mirror_partial_write_torn_state_multi_strip_then_scrub() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 3);
+    let id = pool.create_ld(LdSpec::mirror(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+
+    // 16 KiB = 4 strips, so the batched submit carries many strips per copy.
+    let span = 16 * 1024;
+    let initial = vec![0xa0u8; span];
+    ld.write_at(0, &initial).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let target_pd_id = desc.members[1].pd;
+    let target_pd = pool.pd(target_pd_id).unwrap();
+    let inner = target_pd.backend();
+    let injector = Arc::new(FaultInjectingBackend::new(inner, target_pd_id, 0));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
+    }
+
+    let new_payload: Vec<u8> = (0..span).map(|i| (i % 251) as u8).collect();
+    let ld = pool.open_ld(id).unwrap();
+    let err = ld.write_at(0, &new_payload).err();
+    assert!(
+        err.is_some(),
+        "multi-strip mirror write must surface the injected fault"
+    );
+
+    // Survivors hold the FULL new multi-strip payload; failed copy keeps old.
+    let pd0 = pool.pd(desc.members[0].pd).unwrap();
+    let pd2 = pool.pd(desc.members[2].pd).unwrap();
+    let mut buf0 = vec![0u8; span];
+    let mut buf2 = vec![0u8; span];
+    pd0.read_chunklet_user(desc.members[0].chunklet_index, 0, &mut buf0)
+        .unwrap();
+    pd2.read_chunklet_user(desc.members[2].chunklet_index, 0, &mut buf2)
+        .unwrap();
+    assert_eq!(buf0, new_payload, "surviving copy 0 has new multi-strip data");
+    assert_eq!(buf2, new_payload, "surviving copy 2 has new multi-strip data");
+    let mut buf1 = vec![0u8; span];
+    target_pd
+        .read_chunklet_user(desc.members[1].chunklet_index, 0, &mut buf1)
+        .unwrap();
+    assert_eq!(buf1, initial, "failed copy 1 keeps old data (torn state)");
+    assert!(injector.failed_count() >= 1);
+
+    // Heal the backend, then scrub: 3-way majority-vote marks copy 1 Bad.
+    let healthy = onyx_chunklet::io::make_backend(onyx_chunklet::io::IoBackendKind::Sync);
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(healthy.clone());
+    }
+    let report = pool.scrub_ld(id).unwrap();
+    assert!(
+        !report.mismatches.is_empty(),
+        "scrub must detect the multi-strip divergence"
+    );
+    assert_eq!(report.marked_bad, 1);
+    let (_, bm, _) = target_pd.snapshot();
+    assert_eq!(
+        bm.get(desc.members[1].chunklet_index).unwrap(),
+        ChunkletState::Bad
+    );
+}
+
 /// R5 full-stripe write where the parity-PD's submit fails:
 /// - Caller sees the error.
 /// - Data strips that succeeded are durable (written before the fault

@@ -176,6 +176,23 @@ impl StripeLockTable {
             .map(|bucket| self.buckets[bucket].write())
             .collect()
     }
+
+    /// Read-lock the union of `keys`' buckets in ONE globally-sorted batch.
+    /// Mirrors `write_keys`' acquisition order exactly (same `lock_bucket`
+    /// mapping, `sort_unstable` + `dedup`) so a multi-range reader and a
+    /// concurrent multi-range writer always take overlapping buckets in the
+    /// same order. Acquiring per-range instead (one `read_key_range` per op,
+    /// each sorted only within itself) lets a reader grab buckets in a
+    /// different global order than `write_keys` → AB-BA deadlock.
+    pub(crate) fn read_keys(&self, keys: &[u64]) -> Vec<RwLockReadGuard<'_, ()>> {
+        let mut buckets: Vec<usize> = keys.iter().copied().map(lock_bucket).collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        buckets
+            .into_iter()
+            .map(|bucket| self.buckets[bucket].read())
+            .collect()
+    }
 }
 
 fn lock_bucket(key: u64) -> usize {
