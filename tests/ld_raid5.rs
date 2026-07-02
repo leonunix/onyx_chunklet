@@ -13,6 +13,7 @@ use std::thread;
 
 use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::ld::raid5::LdRaid5;
+use onyx_chunklet::LogicalDisk;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE};
 use onyx_chunklet::{Pool, PoolConfig};
@@ -42,6 +43,16 @@ fn make_pool(dir: &TempDir, n_pds: usize) -> (Arc<Pool>, Vec<PathBuf>) {
 fn open_pool(paths: &[PathBuf]) -> Arc<Pool> {
     let raws: Vec<_> = paths.iter().map(|p| RawDevice::open(p).unwrap()).collect();
     Pool::open(raws).unwrap()
+}
+
+fn pds_map(
+    pool: &Arc<Pool>,
+) -> std::collections::BTreeMap<onyx_chunklet::PdId, Arc<onyx_chunklet::PhysicalDisk>> {
+    let mut m = std::collections::BTreeMap::new();
+    for info in pool.list_pds() {
+        m.insert(info.pd_id, pool.pd(info.pd_id).unwrap());
+    }
+    m
 }
 
 #[test]
@@ -419,4 +430,161 @@ fn raid5_partial_rmw_starts_at_pos1_sub_strip() {
         .read_chunklet_user(desc.members[3].chunklet_index, 0, &mut parity)
         .unwrap();
     assert_eq!(parity, expected_parity, "parity drifted after partial RMW");
+}
+
+// ---- batched write_many_at (the flusher hot path) --------------------------
+//
+// write_many_at now collapses every op's stripe segments into ONE batched
+// read submit + ONE batched write submit (healthy disjoint stripes) instead
+// of the trait-default serial per-op loop. These assert the batched path
+// recomputes parity correctly across Full / RMW / RW segments, and bails to
+// the serial path for degraded sets + intra-batch stripe collisions.
+
+/// Read the raw D0..D(K-1) + parity strips of one healthy set stripe and
+/// assert on-disk parity == XOR of on-disk data.
+fn assert_r5_stripe_parity(
+    pool: &Arc<Pool>,
+    id: onyx_chunklet::LdId,
+    in_chunklet_off: u64,
+    strip: usize,
+) {
+    let desc = pool.find_ld(id).unwrap();
+    let k = (desc.set_size - 1) as usize;
+    let mut exp = vec![0u8; strip];
+    for pos in 0..k {
+        let mm = &desc.members[pos];
+        let mut d = vec![0u8; strip];
+        pool.pd(mm.pd)
+            .unwrap()
+            .read_chunklet_user(mm.chunklet_index, in_chunklet_off, &mut d)
+            .unwrap();
+        for i in 0..strip {
+            exp[i] ^= d[i];
+        }
+    }
+    let pm = &desc.members[k];
+    let mut p_buf = vec![0u8; strip];
+    pool.pd(pm.pd)
+        .unwrap()
+        .read_chunklet_user(pm.chunklet_index, in_chunklet_off, &mut p_buf)
+        .unwrap();
+    assert_eq!(p_buf, exp, "parity mismatch at off {}", in_chunklet_off);
+}
+
+#[test]
+fn raid5_write_many_batched_full_and_partial() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+    let fs = 3 * strip;
+
+    let full: Vec<u8> = (0..fs).map(|i| ((i * 7 + 1) % 251) as u8).collect(); // stripe 0, Full
+    let one: Vec<u8> = vec![0xA5u8; strip]; // stripe 4 / D1 only → RMW
+    let two: Vec<u8> = (0..2 * strip).map(|i| ((i * 13 + 5) % 251) as u8).collect(); // stripe 7 / D0+D1 → RW
+
+    let off_full = 0u64;
+    let off_one = (4 * fs + strip) as u64;
+    let off_two = (7 * fs) as u64;
+
+    ld.write_many_at(&[
+        (off_full, full.as_slice()),
+        (off_one, one.as_slice()),
+        (off_two, two.as_slice()),
+    ])
+    .unwrap();
+
+    let mut rb = vec![0u8; fs];
+    ld.read_at(off_full, &mut rb).unwrap();
+    assert_eq!(rb, full);
+    let mut rb1 = vec![0u8; strip];
+    ld.read_at(off_one, &mut rb1).unwrap();
+    assert_eq!(rb1, one);
+    let mut rb2 = vec![0u8; 2 * strip];
+    ld.read_at(off_two, &mut rb2).unwrap();
+    assert_eq!(rb2, two);
+
+    drop(ld);
+    assert_r5_stripe_parity(&pool, id, 0, strip);
+    assert_r5_stripe_parity(&pool, id, 4 * strip as u64, strip);
+    assert_r5_stripe_parity(&pool, id, 7 * strip as u64, strip);
+}
+
+#[test]
+fn raid5_write_many_batched_rmw_substrip() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 13)).unwrap(); // strip = 2 blocks
+    let ld = pool.open_ld(id).unwrap();
+    let strip = 2 * BLOCK_SIZE as usize;
+    let fs = 3 * strip;
+
+    let seed: Vec<u8> = (0..fs).map(|i| ((i * 11 + 2) % 251) as u8).collect();
+    ld.write_at((2 * fs) as u64, &seed).unwrap();
+
+    // Sub-strip overwrite (len < strip) → RMW.
+    let sub: Vec<u8> = vec![0x5Au8; BLOCK_SIZE as usize];
+    ld.write_many_at(&[((2 * fs) as u64, sub.as_slice())]).unwrap();
+
+    let mut expect = seed.clone();
+    expect[0..BLOCK_SIZE as usize].copy_from_slice(&sub);
+    let mut rb = vec![0u8; fs];
+    ld.read_at((2 * fs) as u64, &mut rb).unwrap();
+    assert_eq!(rb, expect);
+
+    drop(ld);
+    assert_r5_stripe_parity(&pool, id, 2 * strip as u64, strip);
+}
+
+#[test]
+fn raid5_write_many_batched_duplicate_stripe_serializes() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+    let fs = 3 * strip;
+
+    let a = vec![0x11u8; fs];
+    let b = vec![0x22u8; fs];
+    ld.write_many_at(&[(0u64, a.as_slice()), (0u64, b.as_slice())])
+        .unwrap();
+
+    let mut rb = vec![0u8; fs];
+    ld.read_at(0, &mut rb).unwrap();
+    assert_eq!(rb, b);
+    drop(ld);
+    assert_r5_stripe_parity(&pool, id, 0, strip);
+}
+
+#[test]
+fn raid5_write_many_batched_degraded_falls_back() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+    let fs = 3 * strip;
+    let seed: Vec<u8> = (0..2 * fs).map(|i| ((i * 7 + 9) % 251) as u8).collect();
+    ld.write_at(0, &seed).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let d0_pd = desc.members[0].pd;
+    let mut pds = pds_map(&pool);
+    pds.remove(&d0_pd);
+    let r5 = LdRaid5::open(pool.find_ld(id).unwrap(), &pds).unwrap();
+
+    let w0 = vec![0x33u8; fs];
+    let w1 = vec![0x44u8; strip];
+    r5.write_many_at(&[(0u64, w0.as_slice()), ((fs + strip) as u64, w1.as_slice())])
+        .unwrap();
+
+    let mut rb0 = vec![0u8; fs];
+    r5.read_at(0, &mut rb0).unwrap();
+    assert_eq!(rb0, w0);
+    let mut rb1 = vec![0u8; strip];
+    r5.read_at((fs + strip) as u64, &mut rb1).unwrap();
+    assert_eq!(rb1, w1);
 }

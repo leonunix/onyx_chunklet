@@ -7,6 +7,7 @@ use std::thread;
 
 use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::ld::raid6::LdRaid6;
+use onyx_chunklet::LogicalDisk;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE};
 use onyx_chunklet::{Pool, PoolConfig};
@@ -313,6 +314,197 @@ fn raid6_persists_across_reopen() {
     assert_eq!(readback, payload);
 }
 
+/// Reproduce onyx's EXACT LV3 geometry (raid6 6 data + 2 parity, row_size=1,
+/// num_rows=12, 4 KiB strip) and verify a full write -> drop pool -> reopen ->
+/// read round-trips across the WHOLE linear space. `raid6_persists_across_reopen`
+/// only covers num_rows=1; onyx runs num_rows=12. If the descriptor encode/decode
+/// does not preserve the per-row (PD, chunklet_index) mapping, a post-reopen read
+/// at a given LD offset resolves to the WRONG physical chunklet and returns stale
+/// bytes -- exactly the "clean before restart, corrupt after restart" signature.
+#[test]
+fn raid6_multirow_reopen_onyx_geometry() {
+    let dir = TempDir::new().unwrap();
+    // 9 PDs matching onyx's LV3 pool. num_rows=12 needs 96 chunklets (96 GiB
+    // raw), so the default 4 GiB test PDs are too small -> use 16 GiB each
+    // (9 * 16 = 144 GiB, > 96 chunklets with margin). Sparse files: only the
+    // ~72 MiB actually written allocates.
+    const PD_BIG: u64 = 16 * 1024 * 1024 * 1024;
+    let mut raws = Vec::new();
+    let mut paths = Vec::new();
+    for i in 0..9 {
+        let p = dir.path().join(format!("pd{}", i));
+        raws.push(RawDevice::open_or_create(&p, PD_BIG).unwrap());
+        paths.push(p);
+    }
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // strip_size_log2 = 12 -> 4 KiB strip == block size, like onyx.
+    let id = pool.create_ld(LdSpec::raid6(6, 1, 12, 12)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let bs = ld.block_size();
+    let cap = ld.capacity_bytes();
+    let stripe = 6 * bs; // full-stripe data = 6 data strips * 4 KiB = 24 KiB
+    let n_stripes = cap / stripe as u64;
+    assert!(n_stripes > 12, "expected many stripes across 12 rows, got {n_stripes}");
+
+    // Unique per-stripe pattern so a misplaced read is detectable.
+    let pat = |s: u64| -> Vec<u8> {
+        let mut b = vec![0u8; stripe];
+        let seed = s.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = ((seed >> ((i % 8) * 8)) as u8) ^ (i as u8) ^ (s as u8);
+        }
+        b
+    };
+
+    // Sample stripes evenly across the entire capacity (covers all 12 rows).
+    // Full 72 GiB on sparse files is too heavy; a stride sample still catches
+    // any per-row mapping shift.
+    let n_samples: u64 = 3000;
+    let step = (n_stripes / n_samples).max(1);
+    let samples: Vec<u64> = (0..n_stripes).step_by(step as usize).collect();
+
+    for &s in &samples {
+        ld.write_at(s * stripe as u64, &pat(s)).unwrap();
+    }
+    drop((ld, pool));
+
+    let pool2 = open_pool(&paths);
+    let ld2 = pool2.open_ld(id).unwrap();
+    let mut mismatches = 0u64;
+    let mut first_bad: Option<u64> = None;
+    for &s in &samples {
+        let mut rb = vec![0u8; stripe];
+        ld2.read_at(s * stripe as u64, &mut rb).unwrap();
+        if rb != pat(s) {
+            mismatches += 1;
+            if first_bad.is_none() {
+                first_bad = Some(s);
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "{}/{} sampled stripes mismatched after reopen (first bad stripe={:?}); \
+         descriptor round-trip corrupts the offset->chunklet mapping at num_rows=12",
+        mismatches,
+        samples.len(),
+        first_bad
+    );
+}
+
+/// Like `raid6_multirow_reopen_onyx_geometry` but adds onyx's real write mix:
+/// full-stripe writes FOLLOWED by partial-stripe RMW overwrites of a single
+/// data strip (the hybrid-pack "multiple sub-PBAs share one stripe, some later
+/// overwritten" case), then reopen and verify EVERY strip -- overwritten strips
+/// read the new bytes, untouched neighbors in the same stripe read the old
+/// full-stripe bytes. A partial-RMW/neighbor/parity bug that only surfaces after
+/// reopen would show here.
+#[test]
+fn raid6_multirow_reopen_partial_overwrite() {
+    let dir = TempDir::new().unwrap();
+    const PD_BIG: u64 = 16 * 1024 * 1024 * 1024;
+    let mut raws = Vec::new();
+    let mut paths = Vec::new();
+    for i in 0..9 {
+        let p = dir.path().join(format!("pd{}", i));
+        raws.push(RawDevice::open_or_create(&p, PD_BIG).unwrap());
+        paths.push(p);
+    }
+    let pool = Pool::create(
+        raws,
+        PoolConfig {
+            spare_pct: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let id = pool.create_ld(LdSpec::raid6(6, 1, 12, 12)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let bs = ld.block_size();
+    let stripe = 6 * bs;
+    let n_stripes = ld.capacity_bytes() / stripe as u64;
+
+    // Per-(stripe, strip) base pattern.
+    let base = |s: u64, j: usize| -> Vec<u8> {
+        let mut b = vec![0u8; bs];
+        let seed = s
+            .wrapping_mul(0x100_0000_01B3)
+            .wrapping_add(j as u64 + 1);
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = ((seed >> ((i % 8) * 8)) as u8) ^ (i as u8) ^ (j as u8);
+        }
+        b
+    };
+    // Overwrite pattern for the middle data strip (strip 3).
+    let over = |s: u64| -> Vec<u8> {
+        let mut b = vec![0u8; bs];
+        let seed = s.wrapping_mul(0xDEAD_BEEF_1234_5678).wrapping_add(7);
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = ((seed >> ((i % 8) * 8)) as u8) ^ (0xA5 ^ i as u8);
+        }
+        b
+    };
+
+    let n_samples: u64 = 3000;
+    let step = (n_stripes / n_samples).max(1);
+    let samples: Vec<u64> = (0..n_stripes).step_by(step as usize).collect();
+    const OVER_STRIP: usize = 3;
+
+    // Phase 1: full-stripe writes.
+    for &s in &samples {
+        let mut full = vec![0u8; stripe];
+        for j in 0..6 {
+            full[j * bs..(j + 1) * bs].copy_from_slice(&base(s, j));
+        }
+        ld.write_at(s * stripe as u64, &full).unwrap();
+    }
+    // Phase 2: partial-RMW overwrite of strip 3 on every other sample.
+    for (idx, &s) in samples.iter().enumerate() {
+        if idx % 2 == 0 {
+            ld.write_at(s * stripe as u64 + (OVER_STRIP * bs) as u64, &over(s))
+                .unwrap();
+        }
+    }
+    drop((ld, pool));
+
+    let pool2 = open_pool(&paths);
+    let ld2 = pool2.open_ld(id).unwrap();
+    let mut mism = 0u64;
+    let mut first_bad: Option<(u64, usize)> = None;
+    for (idx, &s) in samples.iter().enumerate() {
+        let overwritten = idx % 2 == 0;
+        for j in 0..6usize {
+            let mut rb = vec![0u8; bs];
+            ld2.read_at(s * stripe as u64 + (j * bs) as u64, &mut rb)
+                .unwrap();
+            let expect = if overwritten && j == OVER_STRIP {
+                over(s)
+            } else {
+                base(s, j)
+            };
+            if rb != expect {
+                mism += 1;
+                if first_bad.is_none() {
+                    first_bad = Some((s, j));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        mism, 0,
+        "{} strip reads mismatched after reopen (first bad (stripe,strip)={:?}); \
+         partial-RMW overwrite + reopen corrupts data at num_rows=12",
+        mism, first_bad
+    );
+}
+
 #[test]
 fn raid6_drops_5_chunklets() {
     let dir = TempDir::new().unwrap();
@@ -459,4 +651,178 @@ fn raid6_partial_rmw_starts_at_pos1_sub_strip() {
         readback, payload,
         "R6 partial RMW spanning pos[1]->pos[2] at sub-strip offset corrupts data"
     );
+}
+
+// ---- batched write_many_at (the flusher hot path) --------------------------
+//
+// write_many_at now collapses every op's stripe segments into ONE batched
+// read submit + ONE batched write submit (healthy disjoint stripes), instead
+// of the trait-default serial per-op loop. These assert the batched path
+// recomputes P/Q correctly across Full / PDW / RW segments, and that it bails
+// to the serial path for degraded sets + intra-batch stripe collisions.
+
+/// Read the raw D0..D(K-1), P, Q strips of one healthy set stripe and assert
+/// the on-disk parity matches the Anvin formula over the on-disk data.
+fn assert_r6_stripe_parity(
+    pool: &Arc<Pool>,
+    id: onyx_chunklet::LdId,
+    in_chunklet_off: u64,
+    strip: usize,
+) {
+    use onyx_chunklet::ld::gf256::{g_pow, mul};
+    let desc = pool.find_ld(id).unwrap();
+    let k = (desc.set_size - 2) as usize;
+    let mut data = vec![vec![0u8; strip]; k];
+    for pos in 0..k {
+        let mm = &desc.members[pos];
+        pool.pd(mm.pd)
+            .unwrap()
+            .read_chunklet_user(mm.chunklet_index, in_chunklet_off, &mut data[pos])
+            .unwrap();
+    }
+    let pm = &desc.members[k];
+    let qm = &desc.members[k + 1];
+    let mut p_buf = vec![0u8; strip];
+    let mut q_buf = vec![0u8; strip];
+    pool.pd(pm.pd)
+        .unwrap()
+        .read_chunklet_user(pm.chunklet_index, in_chunklet_off, &mut p_buf)
+        .unwrap();
+    pool.pd(qm.pd)
+        .unwrap()
+        .read_chunklet_user(qm.chunklet_index, in_chunklet_off, &mut q_buf)
+        .unwrap();
+    let mut exp_p = vec![0u8; strip];
+    let mut exp_q = vec![0u8; strip];
+    for pos in 0..k {
+        for i in 0..strip {
+            exp_p[i] ^= data[pos][i];
+            exp_q[i] ^= mul(g_pow(pos), data[pos][i]);
+        }
+    }
+    assert_eq!(p_buf, exp_p, "P mismatch at off {}", in_chunklet_off);
+    assert_eq!(q_buf, exp_q, "Q mismatch at off {}", in_chunklet_off);
+}
+
+#[test]
+fn raid6_write_many_batched_full_and_partial() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+    let fs = 3 * strip;
+
+    let full: Vec<u8> = (0..fs).map(|i| ((i * 7 + 1) % 251) as u8).collect(); // stripe 0, Full
+    let one: Vec<u8> = vec![0xA5u8; strip]; // stripe 4 / D1 only (M=1 full-strip → RW)
+    let two: Vec<u8> = (0..2 * strip).map(|i| ((i * 13 + 5) % 251) as u8).collect(); // stripe 7 / D0+D1 (RW)
+
+    let off_full = 0u64;
+    let off_one = (4 * fs + strip) as u64;
+    let off_two = (7 * fs) as u64;
+
+    ld.write_many_at(&[
+        (off_full, full.as_slice()),
+        (off_one, one.as_slice()),
+        (off_two, two.as_slice()),
+    ])
+    .unwrap();
+
+    let mut rb = vec![0u8; fs];
+    ld.read_at(off_full, &mut rb).unwrap();
+    assert_eq!(rb, full);
+    let mut rb1 = vec![0u8; strip];
+    ld.read_at(off_one, &mut rb1).unwrap();
+    assert_eq!(rb1, one);
+    let mut rb2 = vec![0u8; 2 * strip];
+    ld.read_at(off_two, &mut rb2).unwrap();
+    assert_eq!(rb2, two);
+
+    drop(ld);
+    assert_r6_stripe_parity(&pool, id, 0, strip);
+    assert_r6_stripe_parity(&pool, id, 4 * strip as u64, strip);
+    assert_r6_stripe_parity(&pool, id, 7 * strip as u64, strip);
+}
+
+#[test]
+fn raid6_write_many_batched_pdw_substrip() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 13)).unwrap(); // strip = 2 blocks
+    let ld = pool.open_ld(id).unwrap();
+    let strip = 2 * BLOCK_SIZE as usize;
+    let fs = 3 * strip;
+
+    // Seed stripe 2 full so the sub-strip overwrite has real old data + parity.
+    let seed: Vec<u8> = (0..fs).map(|i| ((i * 11 + 2) % 251) as u8).collect();
+    ld.write_at((2 * fs) as u64, &seed).unwrap();
+
+    // Sub-strip overwrite of D0's first block (len < strip) → PDW path.
+    let sub: Vec<u8> = vec![0x5Au8; BLOCK_SIZE as usize];
+    ld.write_many_at(&[((2 * fs) as u64, sub.as_slice())]).unwrap();
+
+    let mut expect = seed.clone();
+    expect[0..BLOCK_SIZE as usize].copy_from_slice(&sub);
+    let mut rb = vec![0u8; fs];
+    ld.read_at((2 * fs) as u64, &mut rb).unwrap();
+    assert_eq!(rb, expect);
+
+    drop(ld);
+    assert_r6_stripe_parity(&pool, id, 2 * strip as u64, strip);
+}
+
+#[test]
+fn raid6_write_many_batched_duplicate_stripe_serializes() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+    let fs = 3 * strip;
+
+    // Two ops on the SAME stripe → has_duplicate_keys → serial fallback, last wins.
+    let a = vec![0x11u8; fs];
+    let b = vec![0x22u8; fs];
+    ld.write_many_at(&[(0u64, a.as_slice()), (0u64, b.as_slice())])
+        .unwrap();
+
+    let mut rb = vec![0u8; fs];
+    ld.read_at(0, &mut rb).unwrap();
+    assert_eq!(rb, b);
+    drop(ld);
+    assert_r6_stripe_parity(&pool, id, 0, strip);
+}
+
+#[test]
+fn raid6_write_many_batched_degraded_falls_back() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+    let fs = 3 * strip;
+    let seed: Vec<u8> = (0..2 * fs).map(|i| ((i * 7 + 9) % 251) as u8).collect();
+    ld.write_at(0, &seed).unwrap();
+    drop(ld);
+
+    // Reopen with D0's PD absent → degraded set; batched writes must bail to
+    // the serial reconstruct-write path.
+    let desc = pool.find_ld(id).unwrap();
+    let d0_pd = desc.members[0].pd;
+    let mut pds = pds_map(&pool);
+    pds.remove(&d0_pd);
+    let r6 = LdRaid6::open(pool.find_ld(id).unwrap(), &pds).unwrap();
+
+    let w0 = vec![0x33u8; fs]; // full stripe 0
+    let w1 = vec![0x44u8; strip]; // stripe 1 / D1
+    r6.write_many_at(&[(0u64, w0.as_slice()), ((fs + strip) as u64, w1.as_slice())])
+        .unwrap();
+
+    // Degraded reads reconstruct D0 via P/Q — proves parity was written right.
+    let mut rb0 = vec![0u8; fs];
+    r6.read_at(0, &mut rb0).unwrap();
+    assert_eq!(rb0, w0);
+    let mut rb1 = vec![0u8; strip];
+    r6.read_at((fs + strip) as u64, &mut rb1).unwrap();
+    assert_eq!(rb1, w1);
 }

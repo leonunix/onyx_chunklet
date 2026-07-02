@@ -684,6 +684,10 @@ impl LogicalDisk for LdRaid6 {
         Ok(())
     }
 
+    fn write_many_at(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
+        self.write_many_batched(ops)
+    }
+
     fn flush(&self) -> ChunkletResult<()> {
         crate::ld::flush_members(&self.members)
     }
@@ -1065,5 +1069,320 @@ impl LdRaid6 {
             });
         }
         parallel_strip_writes(ops)
+    }
+}
+
+/// Which healthy-set write path a batched segment takes. Degraded segments
+/// never reach here — [`LdRaid6::write_many_batched`] bails the whole batch to
+/// the serial `write_at` path, which owns the reconstruct plumbing.
+#[derive(Clone, Copy)]
+enum Kind6 {
+    Full,
+    Pdw,
+    Rw,
+}
+
+/// One planned stripe segment of a batched `write_many_at`. Owns the scratch
+/// buffers that span the read → compute → write phases so the whole batch
+/// issues ONE `parallel_strip_reads` + ONE `parallel_strip_writes` instead of a
+/// serial submit pair per segment. That per-segment serialization was the
+/// flusher→RAID6 de-batching that turned µs disk IO into ~200 ms wall-clock:
+/// onyx hands one deep-QD batch to `write_many_at`, and the trait-default
+/// `for op { write_at(op) }` loop unrolled it into N serial read→compute→write
+/// RMW chains, so the disk queue never went deep.
+struct Seg6<'a> {
+    set_idx: usize,
+    strip_base: u64,
+    kind: Kind6,
+    /// (data_pos, in_strip_off, new_data) per modified position, stripe order.
+    mods: Vec<(usize, u64, &'a [u8])>,
+    /// New P / Q strip. Full/Rw compute it from scratch; Pdw reads the old
+    /// value here then applies the delta in place.
+    p: Vec<u8>,
+    q: Vec<u8>,
+    /// Pdw only: old data per modified position (each sized to its mod's len).
+    old_data: Vec<Vec<u8>>,
+    /// Rw only: K full new-data strips, parity recomputed from them.
+    new_strips: Vec<Vec<u8>>,
+}
+
+impl LdRaid6 {
+    /// Batched multi-op writer — the flusher's hot path. Collapses every op's
+    /// stripe segments into a single cross-PD read submit + a single write
+    /// submit under one stripe-lock acquisition. Bails the whole batch to the
+    /// serial `write_at` loop for any degraded set (which needs reconstruct
+    /// reads) or any intra-batch stripe collision (whose RMW a batched submit
+    /// would race). Healthy disjoint spans — the steady state — take the fast
+    /// two-phase path.
+    fn write_many_batched(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
+        for (offset, buf) in ops {
+            self.ensure_aligned(*offset, buf.len())?;
+        }
+        let strip = self.strip_bytes as usize;
+        let k = self.data_per_set;
+
+        let mut segs: Vec<Seg6> = Vec::new();
+        let mut stripe_keys: Vec<u64> = Vec::new();
+        let mut serialize = false;
+        'outer: for (offset, buf) in ops {
+            let mut remaining = buf.len();
+            let mut cursor = *offset;
+            let mut buf_start = 0usize;
+            while remaining > 0 {
+                let addr = self.locate(cursor);
+                let stripe_remain = self.full_stripe_bytes
+                    - (addr.data_pos as u64 * self.strip_bytes + addr.in_strip_off);
+                let take = std::cmp::min(remaining as u64, stripe_remain) as usize;
+                let seg_buf = &buf[buf_start..buf_start + take];
+
+                // Degraded set → the serial path owns reconstruct reads.
+                if !self.failed_data_positions(addr.set_idx).is_empty()
+                    || self.parity_p_failed(addr.set_idx)
+                    || self.parity_q_failed(addr.set_idx)
+                {
+                    serialize = true;
+                    break 'outer;
+                }
+
+                // Decompose exactly like `write_one_stripe_segment`.
+                let mut positions: Vec<(usize, u64, std::ops::Range<usize>)> =
+                    Vec::with_capacity(k);
+                let mut consumed = 0usize;
+                let mut cur_pos = addr.data_pos;
+                let mut cur_off = addr.in_strip_off;
+                while consumed < seg_buf.len() {
+                    let strip_remain = self.strip_bytes - cur_off;
+                    let t =
+                        std::cmp::min((seg_buf.len() - consumed) as u64, strip_remain) as usize;
+                    positions.push((cur_pos, cur_off, consumed..consumed + t));
+                    consumed += t;
+                    cur_pos += 1;
+                    cur_off = 0;
+                }
+                let strip_base = addr.in_chunklet_off - addr.in_strip_off;
+                stripe_keys.push(self.stripe_key(addr.set_idx, strip_base));
+
+                let is_full = positions.len() == k
+                    && positions.iter().all(|(_p, off, r)| {
+                        *off == 0 && (r.end - r.start) as u64 == self.strip_bytes
+                    });
+                let kind = if is_full {
+                    Kind6::Full
+                } else {
+                    // Same PDW-vs-RW read-cost heuristic as the serial path.
+                    let pdw = parity_delta_read_cost(&positions);
+                    let rw = reconstruct_write_read_cost(k, self.strip_bytes, &positions);
+                    if rw < pdw {
+                        Kind6::Rw
+                    } else {
+                        Kind6::Pdw
+                    }
+                };
+                let mods: Vec<(usize, u64, &[u8])> = positions
+                    .iter()
+                    .map(|(p, off, r)| (*p, *off, &seg_buf[r.clone()]))
+                    .collect();
+                let old_data = match kind {
+                    Kind6::Pdw => mods.iter().map(|(_p, _o, nd)| vec![0u8; nd.len()]).collect(),
+                    _ => Vec::new(),
+                };
+                let new_strips = match kind {
+                    Kind6::Rw => (0..k).map(|_| vec![0u8; strip]).collect(),
+                    _ => Vec::new(),
+                };
+                segs.push(Seg6 {
+                    set_idx: addr.set_idx,
+                    strip_base,
+                    kind,
+                    mods,
+                    p: vec![0u8; strip],
+                    q: vec![0u8; strip],
+                    old_data,
+                    new_strips,
+                });
+
+                buf_start += take;
+                cursor += take as u64;
+                remaining -= take;
+            }
+        }
+
+        if serialize || crate::ld::has_duplicate_keys(&stripe_keys) {
+            for (offset, buf) in ops {
+                self.write_at(*offset, buf)?;
+            }
+            return Ok(());
+        }
+
+        // Hold every touched stripe lock across read+compute+write, acquired in
+        // one globally-sorted batch (matches `write_key`'s bucket order).
+        let _guards = self.stripe_locks.write_keys(&stripe_keys);
+
+        // Phase 1: one batched read submit for every segment's RMW reads.
+        let mut reads: Vec<StripRead> = Vec::new();
+        for seg in segs.iter_mut() {
+            self.r6_collect_reads(seg, &mut reads);
+        }
+        parallel_strip_reads(&mut reads)?;
+        drop(reads);
+
+        // Phase 2: recompute P/Q per segment from the freshly-read state.
+        for seg in segs.iter_mut() {
+            self.r6_compute(seg);
+        }
+
+        // Phase 3: one batched write submit for all data + parity strips.
+        let mut writes: Vec<StripWrite> = Vec::new();
+        for seg in segs.iter() {
+            self.r6_collect_writes(seg, &mut writes);
+        }
+        parallel_strip_writes(writes)
+    }
+
+    /// Append `seg`'s RMW reads (into its owned scratch) to the shared batch.
+    fn r6_collect_reads<'s>(&self, seg: &'s mut Seg6<'_>, reads: &mut Vec<StripRead<'s>>) {
+        let set_idx = seg.set_idx;
+        let strip_base = seg.strip_base;
+        let strip = self.strip_bytes as usize;
+        match seg.kind {
+            Kind6::Full => {}
+            Kind6::Pdw => {
+                let Seg6 {
+                    mods,
+                    old_data,
+                    p,
+                    q,
+                    ..
+                } = &mut *seg;
+                for ((pos, off, _nd), old) in mods.iter().zip(old_data.iter_mut()) {
+                    let m = self.member_idx_data(set_idx, *pos);
+                    let pd = self.members[m].as_ref().expect("healthy PDW data PD");
+                    reads.push(StripRead {
+                        pd: pd.clone(),
+                        chunklet_index: self.desc.members[m].chunklet_index,
+                        in_chunklet_off: strip_base + off,
+                        data: old.as_mut_slice(),
+                    });
+                }
+                let pm = self.member_idx_p(set_idx);
+                let pdp = self.members[pm].as_ref().expect("healthy PDW P");
+                reads.push(StripRead {
+                    pd: pdp.clone(),
+                    chunklet_index: self.desc.members[pm].chunklet_index,
+                    in_chunklet_off: strip_base,
+                    data: p.as_mut_slice(),
+                });
+                let qm = self.member_idx_q(set_idx);
+                let pdq = self.members[qm].as_ref().expect("healthy PDW Q");
+                reads.push(StripRead {
+                    pd: pdq.clone(),
+                    chunklet_index: self.desc.members[qm].chunklet_index,
+                    in_chunklet_off: strip_base,
+                    data: q.as_mut_slice(),
+                });
+            }
+            Kind6::Rw => {
+                let Seg6 {
+                    mods, new_strips, ..
+                } = &mut *seg;
+                for (pos, strip_buf) in new_strips.iter_mut().enumerate() {
+                    // Fully-modified positions are filled from new data in the
+                    // compute phase; every other position reads its base strip.
+                    let full_mod = mods
+                        .iter()
+                        .any(|(p, off, nd)| *p == pos && *off == 0 && nd.len() == strip);
+                    if full_mod {
+                        continue;
+                    }
+                    let m = self.member_idx_data(set_idx, pos);
+                    let pd = self.members[m].as_ref().expect("healthy RW data PD");
+                    reads.push(StripRead {
+                        pd: pd.clone(),
+                        chunklet_index: self.desc.members[m].chunklet_index,
+                        in_chunklet_off: strip_base,
+                        data: strip_buf.as_mut_slice(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Recompute the segment's P/Q from the read-phase results.
+    fn r6_compute(&self, seg: &mut Seg6<'_>) {
+        let strip = self.strip_bytes as usize;
+        match seg.kind {
+            Kind6::Full => {
+                seg.p.iter_mut().for_each(|b| *b = 0);
+                seg.q.iter_mut().for_each(|b| *b = 0);
+                for &(pos, _off, nd) in &seg.mods {
+                    gf256::xor_into(&mut seg.p, nd);
+                    gf256::mul_xor_into(&mut seg.q, nd, gf256::g_pow(pos));
+                }
+            }
+            Kind6::Pdw => {
+                let mut delta_p = vec![0u8; strip];
+                let mut delta_q = vec![0u8; strip];
+                for ((pos, off, nd), old) in seg.mods.iter().zip(seg.old_data.iter()) {
+                    let g_i = gf256::g_pow(*pos);
+                    let off = *off as usize;
+                    for i in 0..nd.len() {
+                        let d = old[i] ^ nd[i];
+                        delta_p[off + i] ^= d;
+                        delta_q[off + i] ^= gf256::mul(g_i, d);
+                    }
+                }
+                gf256::xor_into(&mut seg.p, &delta_p);
+                gf256::xor_into(&mut seg.q, &delta_q);
+            }
+            Kind6::Rw => {
+                for &(pos, off, nd) in &seg.mods {
+                    let off = off as usize;
+                    if off == 0 && nd.len() == strip {
+                        seg.new_strips[pos].copy_from_slice(nd);
+                    } else {
+                        seg.new_strips[pos][off..off + nd.len()].copy_from_slice(nd);
+                    }
+                }
+                seg.p.iter_mut().for_each(|b| *b = 0);
+                seg.q.iter_mut().for_each(|b| *b = 0);
+                for (i, s) in seg.new_strips.iter().enumerate() {
+                    gf256::xor_into(&mut seg.p, s);
+                    gf256::mul_xor_into(&mut seg.q, s, gf256::g_pow(i));
+                }
+            }
+        }
+    }
+
+    /// Append `seg`'s data + P + Q writes to the shared batch. Data payloads
+    /// borrow the caller's buffers; P/Q borrow the segment's computed scratch.
+    fn r6_collect_writes<'s>(&self, seg: &'s Seg6<'s>, writes: &mut Vec<StripWrite<'s>>) {
+        let set_idx = seg.set_idx;
+        let strip_base = seg.strip_base;
+        for &(pos, off, nd) in &seg.mods {
+            let m = self.member_idx_data(set_idx, pos);
+            let pd = self.members[m].as_ref().expect("healthy write data PD");
+            writes.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[m].chunklet_index,
+                in_chunklet_off: strip_base + off,
+                data: nd,
+            });
+        }
+        let pm = self.member_idx_p(set_idx);
+        let pdp = self.members[pm].as_ref().expect("healthy write P");
+        writes.push(StripWrite {
+            pd: pdp.clone(),
+            chunklet_index: self.desc.members[pm].chunklet_index,
+            in_chunklet_off: strip_base,
+            data: &seg.p,
+        });
+        let qm = self.member_idx_q(set_idx);
+        let pdq = self.members[qm].as_ref().expect("healthy write Q");
+        writes.push(StripWrite {
+            pd: pdq.clone(),
+            chunklet_index: self.desc.members[qm].chunklet_index,
+            in_chunklet_off: strip_base,
+            data: &seg.q,
+        });
     }
 }
