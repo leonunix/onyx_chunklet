@@ -835,11 +835,12 @@ struct Seg5<'a> {
 }
 
 impl LdRaid5 {
-    /// Batched multi-op writer — the flusher's hot path. Collapses every op's
-    /// stripe segments into a single cross-PD read submit + a single write
-    /// submit under one stripe-lock acquisition. Bails the whole batch to the
-    /// serial `write_at` loop for any degraded set or any intra-batch stripe
-    /// collision; healthy disjoint spans take the fast two-phase path.
+    /// Batched multi-op writer — the flusher's hot path. Groups every op's
+    /// stripe segments BY physical stripe (merging colliding segments into one
+    /// write), then collapses the batch into a single cross-PD read submit + a
+    /// single write submit under one stripe-lock acquisition. Merging turns
+    /// dense sub-stripe units into zero-RMW full-stripe writes. Bails to serial
+    /// `write_at` only for a degraded set or a byte-overlapping stripe.
     fn write_many_batched(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
         for (offset, buf) in ops {
             self.ensure_aligned(*offset, buf.len())?;
@@ -847,8 +848,18 @@ impl LdRaid5 {
         let strip = self.strip_bytes as usize;
         let k = self.data_per_set;
 
-        let mut segs: Vec<Seg5> = Vec::new();
-        let mut stripe_keys: Vec<u64> = Vec::new();
+        // Phase 0: decompose every op into per-position mods, GROUPED by
+        // physical stripe. Segments colliding on one stripe are MERGED into a
+        // single stripe write (their disjoint sub-ranges combine) instead of
+        // bailing the whole batch to serial; a fully-covered stripe is promoted
+        // to a zero-RMW full-stripe write. See LdRaid6::write_many_batched.
+        struct RawStripe<'a> {
+            set_idx: usize,
+            strip_base: u64,
+            mods: Vec<(usize, u64, &'a [u8])>,
+        }
+        let mut by_stripe: std::collections::BTreeMap<u64, RawStripe> =
+            std::collections::BTreeMap::new();
         let mut serialize = false;
         'outer: for (offset, buf) in ops {
             let mut remaining = buf.len();
@@ -869,9 +880,13 @@ impl LdRaid5 {
                     break 'outer;
                 }
 
-                // Decompose exactly like `write_one_stripe_segment`.
-                let mut positions: Vec<(usize, u64, std::ops::Range<usize>)> =
-                    Vec::with_capacity(k);
+                let strip_base = addr.in_chunklet_off - addr.in_strip_off;
+                let key = self.stripe_key(addr.set_idx, strip_base);
+                let entry = by_stripe.entry(key).or_insert_with(|| RawStripe {
+                    set_idx: addr.set_idx,
+                    strip_base,
+                    mods: Vec::new(),
+                });
                 let mut consumed = 0usize;
                 let mut cur_pos = addr.data_pos;
                 let mut cur_off = addr.in_strip_off;
@@ -879,54 +894,13 @@ impl LdRaid5 {
                     let strip_remain = self.strip_bytes - cur_off;
                     let t =
                         std::cmp::min((seg_buf.len() - consumed) as u64, strip_remain) as usize;
-                    positions.push((cur_pos, cur_off, consumed..consumed + t));
+                    entry
+                        .mods
+                        .push((cur_pos, cur_off, &seg_buf[consumed..consumed + t]));
                     consumed += t;
                     cur_pos += 1;
                     cur_off = 0;
                 }
-                let strip_base = addr.in_chunklet_off - addr.in_strip_off;
-                stripe_keys.push(self.stripe_key(addr.set_idx, strip_base));
-
-                let is_full = positions.len() == k
-                    && positions.iter().all(|(_p, off, r)| {
-                        *off == 0 && (r.end - r.start) as u64 == self.strip_bytes
-                    });
-                let kind = if is_full {
-                    Kind5::Full
-                } else {
-                    // Same RMW-vs-RW threshold as the serial path: RW only wins
-                    // when every modification is full-strip and (K-M) < (M+1).
-                    let m = positions.len();
-                    let all_full_strip = positions.iter().all(|(_p, off, r)| {
-                        *off == 0 && (r.end - r.start) as u64 == self.strip_bytes
-                    });
-                    if all_full_strip && (k - m) < (m + 1) {
-                        Kind5::Rw
-                    } else {
-                        Kind5::Rmw
-                    }
-                };
-                let mods: Vec<(usize, u64, &[u8])> = positions
-                    .iter()
-                    .map(|(p, off, r)| (*p, *off, &seg_buf[r.clone()]))
-                    .collect();
-                let old_data = match kind {
-                    Kind5::Rmw => mods.iter().map(|(_p, _o, nd)| vec![0u8; nd.len()]).collect(),
-                    _ => Vec::new(),
-                };
-                let new_strips = match kind {
-                    Kind5::Rw => (0..k).map(|_| vec![0u8; strip]).collect(),
-                    _ => Vec::new(),
-                };
-                segs.push(Seg5 {
-                    set_idx: addr.set_idx,
-                    strip_base,
-                    kind,
-                    mods,
-                    parity: vec![0u8; strip],
-                    old_data,
-                    new_strips,
-                });
 
                 buf_start += take;
                 cursor += take as u64;
@@ -934,11 +908,85 @@ impl LdRaid5 {
             }
         }
 
-        if serialize || crate::ld::has_duplicate_keys(&stripe_keys) {
+        if serialize {
             for (offset, buf) in ops {
                 self.write_at(*offset, buf)?;
             }
             return Ok(());
+        }
+
+        // Phase 0b: one merged Seg5 per stripe. Byte-disjointness check (overlap
+        // → serial last-writer-wins). Promote a fully-covered stripe to Full
+        // (zero RMW); never promote a partially-covered stripe (would clobber
+        // unmodified positions).
+        let mut segs: Vec<Seg5> = Vec::with_capacity(by_stripe.len());
+        let mut stripe_keys: Vec<u64> = Vec::with_capacity(by_stripe.len());
+        for (key, raw) in by_stripe {
+            let mut spans: Vec<(u64, u64)> = raw
+                .mods
+                .iter()
+                .map(|(p, off, nd)| {
+                    let s = *p as u64 * self.strip_bytes + off;
+                    (s, s + nd.len() as u64)
+                })
+                .collect();
+            spans.sort_unstable_by_key(|(s, _)| *s);
+            if spans.windows(2).any(|w| w[0].1 > w[1].0) {
+                for (offset, buf) in ops {
+                    self.write_at(*offset, buf)?;
+                }
+                return Ok(());
+            }
+
+            let mut clean_full = raw.mods.len() == k;
+            if clean_full {
+                let mut seen = vec![false; k];
+                for (p, off, nd) in &raw.mods {
+                    if *off != 0 || nd.len() != strip || *p >= k || seen[*p] {
+                        clean_full = false;
+                        break;
+                    }
+                    seen[*p] = true;
+                }
+            }
+            let kind = if clean_full {
+                Kind5::Full
+            } else {
+                // Same RMW-vs-RW threshold as the serial path, on merged mods:
+                // RW only wins when every mod is full-strip and (K-M) < (M+1).
+                let m = raw.mods.len();
+                let all_full_strip = raw
+                    .mods
+                    .iter()
+                    .all(|(_p, off, nd)| *off == 0 && nd.len() as u64 == self.strip_bytes);
+                if all_full_strip && (k - m.min(k)) < (m + 1) {
+                    Kind5::Rw
+                } else {
+                    Kind5::Rmw
+                }
+            };
+            let old_data = match kind {
+                Kind5::Rmw => raw
+                    .mods
+                    .iter()
+                    .map(|(_p, _o, nd)| vec![0u8; nd.len()])
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let new_strips = match kind {
+                Kind5::Rw => (0..k).map(|_| vec![0u8; strip]).collect(),
+                _ => Vec::new(),
+            };
+            stripe_keys.push(key);
+            segs.push(Seg5 {
+                set_idx: raw.set_idx,
+                strip_base: raw.strip_base,
+                kind,
+                mods: raw.mods,
+                parity: vec![0u8; strip],
+                old_data,
+                new_strips,
+            });
         }
 
         let _guards = self.stripe_locks.write_keys(&stripe_keys);

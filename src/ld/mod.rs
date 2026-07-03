@@ -200,18 +200,6 @@ fn lock_bucket(key: u64) -> usize {
     (mixed as usize) & (STRIPE_LOCK_BUCKETS - 1)
 }
 
-/// True if any two stripe keys in the batch collide. The batched
-/// `write_many_at` planners (`LdRaid5` / `LdRaid6`) bail to the serial
-/// `write_at` path when two segments of one batch hit the same physical
-/// stripe: a single batched read+write submit would race their
-/// read-modify-write against each other. Disjoint ring spans (the flusher's
-/// steady state) never collide, so this only trips on a misbehaving caller.
-pub(crate) fn has_duplicate_keys(keys: &[u64]) -> bool {
-    let mut sorted = keys.to_vec();
-    sorted.sort_unstable();
-    sorted.windows(2).any(|w| w[0] == w[1])
-}
-
 /// Convert the descriptor's strip-size encoding into bytes.
 ///
 /// `0` preserves the historical default of one 4 KiB block. Non-zero strip

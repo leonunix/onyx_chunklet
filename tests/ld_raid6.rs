@@ -826,3 +826,58 @@ fn raid6_write_many_batched_degraded_falls_back() {
     r6.read_at((fs + strip) as u64, &mut rb1).unwrap();
     assert_eq!(rb1, w1);
 }
+
+#[test]
+fn raid6_write_many_batched_same_stripe_merge_to_full() {
+    // Two DISJOINT ops that together fill stripe 0 (D0+D1 from op A, D2 from op
+    // B) collide on one stripe within a single write_many_at. They must MERGE
+    // into a zero-RMW full-stripe write, not bail to serial.
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+
+    let a: Vec<u8> = (0..2 * strip).map(|i| ((i * 7 + 1) % 251) as u8).collect();
+    let b = vec![0xC7u8; strip];
+    ld.write_many_at(&[(0u64, a.as_slice()), ((2 * strip) as u64, b.as_slice())])
+        .unwrap();
+
+    let mut ra = vec![0u8; 2 * strip];
+    ld.read_at(0, &mut ra).unwrap();
+    assert_eq!(ra, a);
+    let mut rb = vec![0u8; strip];
+    ld.read_at((2 * strip) as u64, &mut rb).unwrap();
+    assert_eq!(rb, b);
+
+    drop(ld);
+    assert_r6_stripe_parity(&pool, id, 0, strip);
+}
+
+#[test]
+fn raid6_write_many_batched_same_stripe_merge_partial_preserves_untouched() {
+    // Two ops touch D0 and D2 of stripe 0 in one write_many_at, leaving D1.
+    // The merge must stay partial (read + preserve D1), never promote to full.
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let strip = BLOCK_SIZE as usize;
+
+    let seed: Vec<u8> = (0..3 * strip).map(|i| ((i * 5 + 3) % 251) as u8).collect();
+    ld.write_at(0, &seed).unwrap();
+
+    let d0 = vec![0x11u8; strip];
+    let d2 = vec![0x33u8; strip];
+    ld.write_many_at(&[(0u64, d0.as_slice()), ((2 * strip) as u64, d2.as_slice())])
+        .unwrap();
+
+    let mut rb = vec![0u8; 3 * strip];
+    ld.read_at(0, &mut rb).unwrap();
+    assert!(rb[0..strip].iter().all(|&x| x == 0x11), "D0 overwritten");
+    assert_eq!(&rb[strip..2 * strip], &seed[strip..2 * strip], "D1 preserved");
+    assert!(rb[2 * strip..3 * strip].iter().all(|&x| x == 0x33), "D2 overwritten");
+
+    drop(ld);
+    assert_r6_stripe_parity(&pool, id, 0, strip);
+}
