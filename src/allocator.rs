@@ -100,14 +100,23 @@ pub fn plan_alloc(request: &AllocRequest, pd_views: Vec<PdFreeView>) -> Chunklet
     let mut role_iter = request.role_assignments.iter().copied();
     match request.ha_domain {
         HaDomain::Pd => {
-            for _row in 0..request.num_rows {
-                for _set in 0..request.row_size {
-                    members.extend(pick_set(
-                        &mut state,
-                        None,
-                        request.set_size as usize,
-                        &mut role_iter,
-                    )?);
+            if request.set_size >= 2 {
+                // Redundant / striped levels (mirror, raid5, raid6): band the
+                // rows and rotate the position→PD map per band so the LD spreads
+                // across ALL PDs (balanced wear, many-to-many rebuild) while the
+                // descriptor stays O(N·positions), independent of num_rows. Plain
+                // / Raid0 (set_size == 1) keep the row-major spread below.
+                plan_pd_banded(&mut state, request, &mut role_iter, &mut members)?;
+            } else {
+                for _row in 0..request.num_rows {
+                    for _set in 0..request.row_size {
+                        members.extend(pick_set(
+                            &mut state,
+                            None,
+                            request.set_size as usize,
+                            &mut role_iter,
+                        )?);
+                    }
                 }
             }
         }
@@ -259,6 +268,99 @@ fn pick_set(
         used_pds.push(chosen);
     }
     Ok(picks)
+}
+
+/// Banded column-contiguous placement for redundant / striped levels
+/// (`set_size >= 2`) — the chunklet-faithful spread.
+///
+/// The `num_rows` are split into `bands = min(N_pds, num_rows)` contiguous row
+/// bands. In band `k` the member positions map to a PD window rotated by `k`
+/// (`pd_order[(p + k) mod N]`), so across the bands every PD carries a roughly
+/// equal share of the LD — full-width striping and balanced wear, exactly what
+/// chunklet exists for, and the property that makes rebuild many-to-many (a
+/// failed PD's chunklets scatter across many bands / rebuild targets).
+///
+/// Within a band a position sits on one PD with a contiguous index run, so the
+/// descriptor's per-position RLE (`LdDescriptor::position_runs`) yields ~one run
+/// per band → at most `N` runs per position, **independent of `num_rows`**. With
+/// the 32 MiB manifest slot that stays a few KB, so full spread costs nothing —
+/// no return to the ~13-row wall and no write amplification.
+///
+/// Per-set PD uniqueness holds by construction: a set's `set_size` positions are
+/// consecutive, so their rotated PD indices are `set_size` consecutive values
+/// mod `N` — distinct whenever `N >= set_size`.
+///
+/// Pushes members into `out` in the canonical row-major / set-major order that
+/// `role_assignments` and `LdDescriptor::flat_index` expect.
+fn plan_pd_banded(
+    state: &mut AllocState,
+    request: &AllocRequest,
+    role_iter: &mut impl Iterator<Item = LdRole>,
+    out: &mut Vec<LdMember>,
+) -> ChunkletResult<()> {
+    let set_size = request.set_size as usize;
+    let num_rows = request.num_rows as usize;
+    let p_count = set_size * request.row_size as usize;
+
+    // Stable PD order (most-free first, tie by id) to index the rotation. All
+    // PDs with any free space participate — that is the whole point.
+    let mut pd_order: Vec<PdId> = state
+        .candidate_pds(None)
+        .map(|(pd, _)| *pd)
+        .collect();
+    pd_order.sort_by_key(|pd| {
+        let free = state.free_by_pd.get(pd).map(|q| q.len()).unwrap_or(0);
+        (std::cmp::Reverse(free), *pd)
+    });
+    let n = pd_order.len();
+    if n < set_size {
+        return Err(ChunkletError::Config(format!(
+            "alloc: set_size {} requires {} distinct PDs, pool has only {} usable",
+            set_size, set_size, n
+        )));
+    }
+
+    // (pd, chunklet_index) for every (row, position), filled band by band.
+    let mut placed: Vec<Option<(PdId, u32)>> = vec![None; p_count * num_rows];
+    let bands = num_rows.min(n).max(1);
+    for k in 0..bands {
+        let r0 = k * num_rows / bands;
+        let r1 = (k + 1) * num_rows / bands;
+        for p in 0..p_count {
+            let home = pd_order[(p + k) % n];
+            // Pop `r1-r0` contiguous indices for this (band, position): on an
+            // unfragmented PD they are sequential → one RLE run for the band.
+            for r in r0..r1 {
+                let idx = state.pop_front(&home).ok_or_else(|| {
+                    ChunkletError::Config(format!(
+                        "alloc: PD ran out of free chunklets placing a {}-row LD across {} PDs \
+                         (pool too small or unbalanced); reduce num_rows or rebalance",
+                        num_rows, n
+                    ))
+                })?;
+                placed[r * p_count + p] = Some((home, idx));
+            }
+        }
+    }
+
+    // Emit row-major / set-major with roles: members[r*p_count + p] matches
+    // LdDescriptor::flat_index(p, r).
+    for r in 0..num_rows {
+        for p in 0..p_count {
+            let (pd, chunklet_index) = placed[r * p_count + p]
+                .expect("every (row, position) placed across the bands above");
+            let role = role_iter
+                .next()
+                .ok_or_else(|| ChunkletError::Invariant("role_assignments exhausted".into()))?;
+            out.push(LdMember {
+                pd,
+                chunklet_index,
+                role,
+                generation: 0,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -430,6 +532,123 @@ mod tests {
         let v = views(&[(1, &[0])]);
         let err = plan_alloc(&req, v).err().unwrap();
         assert!(matches!(err, ChunkletError::Unsupported(_)));
+    }
+
+    #[test]
+    fn pd_banded_spreads_all_pds_balanced_and_compresses() {
+        use crate::ld::descriptor::LdDescriptor;
+        use crate::types::{LdId, RaidLevel};
+
+        // 9 PDs (onyx LV3 shape), RAID6 6+2 (set_size 8, row_size 1), many rows.
+        let num_rows: u16 = 300;
+        let free: Vec<u32> = (0..1000).collect();
+        let v: Vec<PdFreeView> = (1..=9u8)
+            .map(|s| PdFreeView {
+                pd: pd(s),
+                numa_node: None,
+                free_indices: free.clone(),
+            })
+            .collect();
+        let mut roles = Vec::with_capacity(8 * num_rows as usize);
+        for _ in 0..num_rows {
+            for m in 0..8 {
+                roles.push(match m {
+                    6 => LdRole::ParityP,
+                    7 => LdRole::ParityQ,
+                    _ => LdRole::Data,
+                });
+            }
+        }
+        let req = AllocRequest {
+            set_size: 8,
+            row_size: 1,
+            num_rows,
+            role_assignments: roles,
+            ha_domain: HaDomain::Pd,
+        };
+        let plan = plan_alloc(&req, v).unwrap();
+        assert_eq!(plan.members.len(), 8 * num_rows as usize);
+
+        // chunklet essence: EVERY PD carries a share (no idle disk), balanced.
+        let mut per_pd: BTreeMap<PdId, u32> = BTreeMap::new();
+        for m in &plan.members {
+            *per_pd.entry(m.pd).or_insert(0) += 1;
+        }
+        assert_eq!(per_pd.len(), 9, "all 9 PDs must be used, got {}", per_pd.len());
+        let total = (8 * num_rows as u32) as f64;
+        let avg = total / 9.0;
+        let (min, max) = (
+            *per_pd.values().min().unwrap() as f64,
+            *per_pd.values().max().unwrap() as f64,
+        );
+        assert!(
+            min >= 0.7 * avg && max <= 1.3 * avg,
+            "PD load imbalanced: min={min} max={max} avg={avg:.1}"
+        );
+
+        // Per-row set PD-uniqueness (RAID fault tolerance) holds every row.
+        for r in 0..num_rows as usize {
+            let mut pds: Vec<PdId> = (0..8).map(|p| plan.members[r * 8 + p].pd).collect();
+            pds.sort();
+            pds.dedup();
+            assert_eq!(pds.len(), 8, "row {r} has duplicate PDs in its set");
+        }
+
+        // Descriptor stays O(N·positions), NOT O(rows): banding gives <= N runs
+        // per position (here <= 9), so ~2 KB regardless of the 300 rows — vs the
+        // ~65 KB / overflow a row-major layout would produce.
+        let desc = LdDescriptor {
+            id: LdId::new_v4(),
+            raid_level: RaidLevel::Raid6,
+            set_size: 8,
+            row_size: 1,
+            num_rows,
+            strip_size_log2: 0,
+            ha_domain: HaDomain::Pd,
+            members: plan.members,
+        };
+        assert!(
+            desc.encoded_len() < 2500,
+            "expected <= N runs/position (~2 KB), got {}",
+            desc.encoded_len()
+        );
+        // Round-trips losslessly through the codec.
+        let bytes = desc.encode().unwrap();
+        let (decoded, used) = LdDescriptor::decode_one(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded, desc);
+    }
+
+    #[test]
+    fn pd_column_positions_reuse_pds_across_sets_when_p_exceeds_n() {
+        // set_size 2 (mirror), row_size 6 => P=12 positions on only 4 PDs:
+        // positions must reuse PDs across sets while staying distinct WITHIN a
+        // set, each still a contiguous column.
+        let num_rows: u16 = 10;
+        let free: Vec<u32> = (0..100).collect();
+        let v: Vec<PdFreeView> = (1..=4u8)
+            .map(|s| PdFreeView {
+                pd: pd(s),
+                numa_node: None,
+                free_indices: free.clone(),
+            })
+            .collect();
+        let req = AllocRequest {
+            set_size: 2,
+            row_size: 6,
+            num_rows,
+            role_assignments: vec![LdRole::Data; 2 * 6 * num_rows as usize],
+            ha_domain: HaDomain::Pd,
+        };
+        let plan = plan_alloc(&req, v).unwrap();
+        // Each of the 6 sets (2 members) must be on distinct PDs every row.
+        for r in 0..num_rows as usize {
+            for set in 0..6usize {
+                let a = plan.members[r * 12 + set * 2].pd;
+                let b = plan.members[r * 12 + set * 2 + 1].pd;
+                assert_ne!(a, b, "row {r} set {set} mirror copies collide on one PD");
+            }
+        }
     }
 
     #[test]
