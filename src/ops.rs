@@ -10,10 +10,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::error::{ChunkletError, ChunkletResult};
-use crate::io::{AlignedBuf, RawDevice};
+use crate::io::RawDevice;
 use crate::metrics::{PdOperationalState, PoolMetrics};
 use crate::pool::{AutoRecoverReport, LdRecoverReport};
-use crate::superblock::{SuperblockSlot, SLOT_BYTES};
 use crate::types::{
     LdId, PdId, PoolId, RaidLevel, PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET,
     SUPERBLOCK_SLOT_B_OFFSET,
@@ -287,7 +286,7 @@ pub struct RecoveryCyclePayload {
 }
 
 pub fn probe_pool_id(raw: &RawDevice) -> ChunkletResult<Option<PoolId>> {
-    if raw.size() < PD_RESERVED_BYTES + SLOT_BYTES as u64 {
+    if raw.size() < 2 * PD_RESERVED_BYTES {
         return Ok(None);
     }
     let tail_base = raw.size() - PD_RESERVED_BYTES;
@@ -297,11 +296,7 @@ pub fn probe_pool_id(raw: &RawDevice) -> ChunkletResult<Option<PoolId>> {
         tail_base + SUPERBLOCK_SLOT_A_OFFSET,
         tail_base + SUPERBLOCK_SLOT_B_OFFSET,
     ] {
-        let mut buf = AlignedBuf::new(SLOT_BYTES)?;
-        if raw.read_at(buf.as_mut_slice(), offset).is_err() {
-            continue;
-        }
-        if let Ok(slot) = SuperblockSlot::decode(buf.as_slice()) {
+        if let Ok(slot) = crate::pd::read_superblock_slot(raw, offset) {
             return Ok(Some(slot.pool_id));
         }
     }

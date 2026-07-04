@@ -39,18 +39,52 @@ use std::convert::TryInto;
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::types::{
-    PdId, PoolId, BLOCK_SIZE, CHUNKLET_SIZE_LOG2, SUPERBLOCK_MAGIC, SUPERBLOCK_VERSION,
+    PdId, PoolId, BLOCK_SIZE, CHUNKLET_SIZE_LOG2, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_CAPACITY,
+    SUPERBLOCK_VERSION,
 };
 
-/// Total slot size on disk.
-pub const SLOT_BYTES: usize = BLOCK_SIZE as usize;
+/// Reserved on-disk capacity per slot (32 MiB). Only the used, block-aligned
+/// prefix (`encoded_slot_len`) is actually written or read — the rest of the
+/// capacity is headroom so a growing manifest body never hits a wall.
+pub const SLOT_CAPACITY: usize = SUPERBLOCK_SLOT_CAPACITY as usize;
 
 /// Slot header bytes preceding the body.
 pub const SLOT_HEADER_BYTES: usize = 64;
-/// Trailer bytes (CRC).
+/// CRC bytes (follow the body in the length-aware layout).
 pub const SLOT_CRC_BYTES: usize = 4;
-/// Maximum body bytes per slot.
-pub const MAX_BODY_BYTES: usize = SLOT_BYTES - SLOT_HEADER_BYTES - SLOT_CRC_BYTES;
+/// Maximum body bytes per slot (fills the slot capacity minus header + CRC).
+pub const MAX_BODY_BYTES: usize = SLOT_CAPACITY - SLOT_HEADER_BYTES - SLOT_CRC_BYTES;
+
+/// Block-aligned on-disk length a slot with `body_len` bytes actually occupies:
+/// `[header | body | crc]` padded up to a `BLOCK_SIZE` multiple. This — NOT the
+/// 32 MiB capacity — is what the writer emits and the reader consumes, so a
+/// normal commit still touches ~4 KiB (no write amplification).
+pub fn encoded_slot_len(body_len: usize) -> usize {
+    let used = SLOT_HEADER_BYTES + body_len + SLOT_CRC_BYTES;
+    let block = BLOCK_SIZE as usize;
+    used.div_ceil(block) * block
+}
+
+/// Peek the block-aligned on-disk length of a slot from a buffer holding at
+/// least its 64-byte header. Lets the reader decide whether one initial read
+/// captured the whole slot or a second, exact-length read is needed. Rejects a
+/// header advertising an out-of-range body length.
+pub fn slot_len_from_header(bytes: &[u8]) -> ChunkletResult<usize> {
+    if bytes.len() < SLOT_HEADER_BYTES {
+        return Err(ChunkletError::Format(format!(
+            "slot header truncated: {} bytes",
+            bytes.len()
+        )));
+    }
+    let body_len = u32::from_le_bytes(bytes[56..60].try_into().unwrap()) as usize;
+    if body_len > MAX_BODY_BYTES {
+        return Err(ChunkletError::Format(format!(
+            "body_len {} > MAX_BODY_BYTES {}",
+            body_len, MAX_BODY_BYTES
+        )));
+    }
+    Ok(encoded_slot_len(body_len))
+}
 
 const PD_LIST_ENTRY_BYTES: usize = 24;
 
@@ -104,17 +138,10 @@ pub mod pool_pd_flags {
 }
 
 impl SuperblockSlot {
-    pub fn encode(&self) -> ChunkletResult<[u8; SLOT_BYTES]> {
-        let mut out = [0u8; SLOT_BYTES];
-        // Header.
-        out[0..8].copy_from_slice(SUPERBLOCK_MAGIC);
-        out[8..12].copy_from_slice(&SUPERBLOCK_VERSION.to_le_bytes());
-        // [12..16] reserved.
-        out[16..32].copy_from_slice(&self.pool_id.to_bytes());
-        out[32..48].copy_from_slice(&self.pd_id.to_bytes());
-        out[48..56].copy_from_slice(&self.manifest_gen.to_le_bytes());
-
-        // Body.
+    /// Encode to a block-aligned `[header | body | crc]` buffer whose length is
+    /// `encoded_slot_len(body_len)` — only the used prefix of the 32 MiB slot,
+    /// so a commit writes ~4 KiB not 32 MiB.
+    pub fn encode(&self) -> ChunkletResult<Vec<u8>> {
         let body_bytes = self.body.encode()?;
         if body_bytes.len() > MAX_BODY_BYTES {
             return Err(ChunkletError::Format(format!(
@@ -123,30 +150,64 @@ impl SuperblockSlot {
                 MAX_BODY_BYTES
             )));
         }
-        out[56..60].copy_from_slice(&(body_bytes.len() as u32).to_le_bytes());
+        let body_len = body_bytes.len();
+        let total = encoded_slot_len(body_len);
+        let mut out = vec![0u8; total];
+        // Header.
+        out[0..8].copy_from_slice(SUPERBLOCK_MAGIC);
+        out[8..12].copy_from_slice(&SUPERBLOCK_VERSION.to_le_bytes());
+        // [12..16] reserved.
+        out[16..32].copy_from_slice(&self.pool_id.to_bytes());
+        out[32..48].copy_from_slice(&self.pd_id.to_bytes());
+        out[48..56].copy_from_slice(&self.manifest_gen.to_le_bytes());
+        out[56..60].copy_from_slice(&(body_len as u32).to_le_bytes());
         // [60..64] reserved.
         let body_start = SLOT_HEADER_BYTES;
-        out[body_start..body_start + body_bytes.len()].copy_from_slice(&body_bytes);
+        out[body_start..body_start + body_len].copy_from_slice(&body_bytes);
 
-        // CRC over [0..4092].
-        let crc = crc32c::crc32c(&out[..SLOT_BYTES - SLOT_CRC_BYTES]);
-        out[SLOT_BYTES - SLOT_CRC_BYTES..].copy_from_slice(&crc.to_le_bytes());
+        // CRC over [0 .. header+body], stored immediately after the body (its
+        // position depends on body_len — that's why the reader reads body_len
+        // from the header first).
+        let crc_pos = SLOT_HEADER_BYTES + body_len;
+        let crc = crc32c::crc32c(&out[..crc_pos]);
+        out[crc_pos..crc_pos + SLOT_CRC_BYTES].copy_from_slice(&crc.to_le_bytes());
         Ok(out)
     }
 
+    /// Decode from a buffer that must contain at least the used slot prefix
+    /// (`encoded_slot_len(body_len)` bytes). `body_len` is read from the header
+    /// (bounded before use), then the CRC — which follows the body — is verified
+    /// over `[0 .. header+body]`.
     pub fn decode(bytes: &[u8]) -> ChunkletResult<Self> {
-        if bytes.len() < SLOT_BYTES {
+        if bytes.len() < SLOT_HEADER_BYTES {
             return Err(ChunkletError::Format(format!(
-                "slot bytes len {} < {}",
+                "slot bytes len {} < header {}",
                 bytes.len(),
-                SLOT_BYTES
+                SLOT_HEADER_BYTES
             )));
         }
-        let bytes = &bytes[..SLOT_BYTES];
+        // body_len lives in the not-yet-verified header; bound it before it
+        // drives any slicing, then let the CRC reject a torn/garbage slot.
+        let body_len = u32::from_le_bytes(bytes[56..60].try_into().unwrap()) as usize;
+        if body_len > MAX_BODY_BYTES {
+            return Err(ChunkletError::Format(format!(
+                "body_len {} > MAX_BODY_BYTES {}",
+                body_len, MAX_BODY_BYTES
+            )));
+        }
+        let crc_pos = SLOT_HEADER_BYTES + body_len;
+        if bytes.len() < crc_pos + SLOT_CRC_BYTES {
+            return Err(ChunkletError::Format(format!(
+                "slot bytes len {} < needed {} (header+body+crc)",
+                bytes.len(),
+                crc_pos + SLOT_CRC_BYTES
+            )));
+        }
 
-        // Verify CRC first (cheap; rejects torn / corrupt slots).
-        let stored = u32::from_le_bytes(bytes[SLOT_BYTES - SLOT_CRC_BYTES..].try_into().unwrap());
-        let computed = crc32c::crc32c(&bytes[..SLOT_BYTES - SLOT_CRC_BYTES]);
+        // Verify CRC over [0 .. header+body] (rejects torn / corrupt slots).
+        let stored =
+            u32::from_le_bytes(bytes[crc_pos..crc_pos + SLOT_CRC_BYTES].try_into().unwrap());
+        let computed = crc32c::crc32c(&bytes[..crc_pos]);
         if stored != computed {
             return Err(ChunkletError::Crc {
                 what: "superblock slot".into(),
@@ -171,13 +232,6 @@ impl SuperblockSlot {
         let pool_id = PoolId::from_bytes(bytes[16..32].try_into().unwrap());
         let pd_id = PdId::from_bytes(bytes[32..48].try_into().unwrap());
         let manifest_gen = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
-        let body_len = u32::from_le_bytes(bytes[56..60].try_into().unwrap()) as usize;
-        if body_len > MAX_BODY_BYTES {
-            return Err(ChunkletError::Format(format!(
-                "body_len {} > MAX_BODY_BYTES {}",
-                body_len, MAX_BODY_BYTES
-            )));
-        }
         let body_start = SLOT_HEADER_BYTES;
         let body = SuperblockBody::decode(&bytes[body_start..body_start + body_len])?;
         Ok(Self {
@@ -442,24 +496,21 @@ mod tests {
         };
         let mut bytes = slot.encode().unwrap();
         bytes[0] = 0xff;
-        // Need to recompute CRC so we hit the magic check, not the CRC check.
-        let crc = crc32c::crc32c(&bytes[..SLOT_BYTES - SLOT_CRC_BYTES]);
-        bytes[SLOT_BYTES - SLOT_CRC_BYTES..].copy_from_slice(&crc.to_le_bytes());
+        // Recompute CRC at its body-relative position so we hit the magic check,
+        // not the CRC check.
+        let body_len = u32::from_le_bytes(bytes[56..60].try_into().unwrap()) as usize;
+        let crc_pos = SLOT_HEADER_BYTES + body_len;
+        let crc = crc32c::crc32c(&bytes[..crc_pos]);
+        bytes[crc_pos..crc_pos + SLOT_CRC_BYTES].copy_from_slice(&crc.to_le_bytes());
         let err = SuperblockSlot::decode(&bytes).unwrap_err();
         assert!(matches!(err, ChunkletError::Format(_)));
     }
 
     #[test]
     fn rejects_oversized_body() {
-        // Push pd_list past slot capacity.
+        // A body past the (now 32 MiB) slot capacity must be rejected.
         let mut body = sample_body();
-        body.pd_list = (0..200)
-            .map(|i| PoolPdEntry {
-                pd_id: PdId::new_v4(),
-                pd_seq: i,
-                flags: 0,
-            })
-            .collect();
+        body.ld_list_bytes = vec![0u8; MAX_BODY_BYTES + 1];
         let slot = SuperblockSlot {
             pool_id: PoolId::new_v4(),
             pd_id: PdId::new_v4(),
@@ -467,5 +518,46 @@ mod tests {
             body,
         };
         assert!(slot.encode().is_err());
+    }
+
+    #[test]
+    fn length_aware_encoding_writes_only_used_blocks() {
+        // A small body fits one 4 KiB block; a body spanning several KiB rounds
+        // up to a few blocks — NOT the 32 MiB capacity. `slot_len_from_header`
+        // must agree with the encoded length so the reader sizes its read right.
+        let block = BLOCK_SIZE as usize;
+        let small = SuperblockSlot {
+            pool_id: PoolId::new_v4(),
+            pd_id: PdId::new_v4(),
+            manifest_gen: 7,
+            body: sample_body(),
+        };
+        let sbytes = small.encode().unwrap();
+        assert_eq!(sbytes.len(), block, "tiny manifest should be one block");
+        assert_eq!(slot_len_from_header(&sbytes).unwrap(), sbytes.len());
+        assert_eq!(SuperblockSlot::decode(&sbytes).unwrap().manifest_gen, 7);
+
+        let mut big_body = sample_body();
+        big_body.ld_list_bytes = vec![0xabu8; 10 * 1024]; // ~10 KiB body
+        let big = SuperblockSlot {
+            pool_id: PoolId::new_v4(),
+            pd_id: PdId::new_v4(),
+            manifest_gen: 8,
+            body: big_body,
+        };
+        let bbytes = big.encode().unwrap();
+        assert!(
+            bbytes.len() < 32 * 1024 && bbytes.len() % block == 0,
+            "10 KiB body encodes to a few blocks, got {}",
+            bbytes.len()
+        );
+        assert_eq!(slot_len_from_header(&bbytes).unwrap(), bbytes.len());
+        // Round-trips, and extra trailing capacity bytes past the used prefix
+        // are ignored by the reader.
+        let mut padded = bbytes.clone();
+        padded.extend(std::iter::repeat(0u8).take(4096));
+        let decoded = SuperblockSlot::decode(&padded).unwrap();
+        assert_eq!(decoded.manifest_gen, 8);
+        assert_eq!(decoded.body.ld_list_bytes.len(), 10 * 1024);
     }
 }

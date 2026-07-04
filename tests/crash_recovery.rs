@@ -12,15 +12,20 @@ use std::path::PathBuf;
 
 use onyx_chunklet::io::{AlignedBuf, RawDevice};
 use onyx_chunklet::pool::LdSpec;
-use onyx_chunklet::superblock::SLOT_BYTES;
 use onyx_chunklet::types::{
-    ChunkletState, BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_BYTES, BITMAP_SLOT_B_OFFSET,
+    ChunkletState, BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_BYTES, BITMAP_SLOT_B_OFFSET, BLOCK_SIZE,
     PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET, SUPERBLOCK_SLOT_B_OFFSET,
 };
 use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
 const PD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// A slot with a small (test-scale) manifest body occupies exactly one 4 KiB
+/// block — its header, body and CRC all live there — so clobbering one block at
+/// a slot offset invalidates it (CRC/magic destroyed). Length-aware slots no
+/// longer span a fixed multi-KiB region.
+const SLOT_BYTES: usize = BLOCK_SIZE as usize;
 
 fn make_pool(dir: &TempDir, names: &[&str]) -> Vec<PathBuf> {
     let mut raws = Vec::new();

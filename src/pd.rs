@@ -31,7 +31,7 @@ use crate::bitmap::Bitmap;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::backend::make_backend;
 use crate::io::{AlignedBuf, IoBackend, IoBackendKind, RawDevice};
-use crate::superblock::{SuperblockBody, SuperblockSlot, SLOT_BYTES};
+use crate::superblock::{slot_len_from_header, SuperblockBody, SuperblockSlot};
 use crate::types::{
     PdId, PoolId, BITMAP_SLOT_A_OFFSET, BITMAP_SLOT_BYTES, BITMAP_SLOT_B_OFFSET, BLOCK_SIZE,
     CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE, MAX_CHUNKLETS_PER_PD, PD_RESERVED_BYTES,
@@ -152,11 +152,7 @@ impl PhysicalDisk {
 
         // Read all 4 superblock slots; collect the valid ones.
         for &(offset, slot_id) in &slot_offsets(pd_size).superblock_slots {
-            let mut buf = AlignedBuf::new(SLOT_BYTES)?;
-            if raw.read_at(buf.as_mut_slice(), offset).is_err() {
-                continue;
-            }
-            match SuperblockSlot::decode(buf.as_slice()) {
+            match read_superblock_slot(&raw, offset) {
                 Ok(slot) => candidates.push((slot.manifest_gen, slot, slot_id)),
                 Err(_) => continue,
             }
@@ -504,6 +500,28 @@ fn compute_total_chunklets(pd_size: u64) -> ChunkletResult<u32> {
 fn compute_spare_count(total: u32, spare_pct: u8) -> u32 {
     let spare = ((total as u64) * (spare_pct as u64) + 99) / 100;
     spare.min(total as u64) as u32
+}
+
+/// Initial read size for a superblock slot: one read covers the 64-byte header
+/// plus any realistic manifest body, so the common path is a single IO. A body
+/// larger than this (heavy post-rebuild fragmentation) triggers exactly one
+/// exact-length follow-up read.
+const INITIAL_SLOT_READ: usize = 64 * 1024;
+
+/// Read + decode one superblock slot at `offset`. The slot occupies only the
+/// used, block-aligned prefix of its 32 MiB reserved region, so the read is
+/// sized from the header's advertised body length rather than the full capacity.
+pub fn read_superblock_slot(raw: &RawDevice, offset: u64) -> ChunkletResult<SuperblockSlot> {
+    let mut buf = AlignedBuf::new(INITIAL_SLOT_READ)?;
+    raw.read_at(buf.as_mut_slice(), offset)?;
+    let needed = slot_len_from_header(buf.as_slice())?;
+    if needed <= INITIAL_SLOT_READ {
+        SuperblockSlot::decode(buf.as_slice())
+    } else {
+        let mut big = AlignedBuf::new(needed)?;
+        raw.read_at(big.as_mut_slice(), offset)?;
+        SuperblockSlot::decode(big.as_slice())
+    }
 }
 
 fn superblock_slot_offset(slot_id: u8) -> u64 {

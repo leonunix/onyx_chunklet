@@ -9,15 +9,29 @@ pub const BLOCK_SIZE: u64 = 4096;
 pub const CHUNKLET_SIZE_LOG2: u8 = 30;
 pub const CHUNKLET_SIZE: u64 = 1 << CHUNKLET_SIZE_LOG2;
 
-/// Reserved head/tail region per PD (1 MiB each).
-/// Holds: superblock COW pair, bitmap COW pair, room for future metadata.
-pub const PD_RESERVED_BYTES: u64 = 1 << 20;
+/// Reserved head/tail region per PD (128 MiB each).
+///
+/// Sized generously ONCE and never changed again: chunklet `i` lives at
+/// `PD_RESERVED_BYTES + i*CHUNKLET_SIZE`, so shrinking/growing this constant
+/// would relocate every already-allocated chunklet (= data migration). 128 MiB
+/// holds the 2×32 MiB superblock COW pair + 2×256 KiB bitmap COW pair with
+/// ~63 MiB of slack for future on-disk metadata — so metadata growth stays
+/// inside the reserved region and never disturbs chunklet addressing.
+pub const PD_RESERVED_BYTES: u64 = 128 << 20;
+
+/// Reserved on-disk capacity per superblock slot: 32 MiB. The manifest body
+/// (pd_list + LD descriptors + cpg_list) may grow up to this bound, so an LD's
+/// descriptor never hits a capacity wall — even fully fragmented after many
+/// rebuilds. Writes are LENGTH-AWARE (`SuperblockSlot::encode` emits only the
+/// used, block-aligned prefix), so a normal commit still writes ~4 KiB, not
+/// 32 MiB — no write amplification.
+pub const SUPERBLOCK_SLOT_CAPACITY: u64 = 32 << 20;
 
 /// Slot offsets within the head/tail reserved region.
 pub const SUPERBLOCK_SLOT_A_OFFSET: u64 = 0;
-pub const SUPERBLOCK_SLOT_B_OFFSET: u64 = 4096;
-pub const BITMAP_SLOT_A_OFFSET: u64 = 8192;
-pub const BITMAP_SLOT_B_OFFSET: u64 = 8192 + 256 * 1024; // 264 KiB
+pub const SUPERBLOCK_SLOT_B_OFFSET: u64 = SUPERBLOCK_SLOT_CAPACITY; // 32 MiB
+pub const BITMAP_SLOT_A_OFFSET: u64 = 2 * SUPERBLOCK_SLOT_CAPACITY; // 64 MiB
+pub const BITMAP_SLOT_B_OFFSET: u64 = BITMAP_SLOT_A_OFFSET + BITMAP_SLOT_BYTES;
 
 /// Bitmap region size per slot: 256 KiB. Supports up to 256 Ki chunklets = 256 TiB per PD.
 pub const BITMAP_SLOT_BYTES: u64 = 256 * 1024;
@@ -30,11 +44,14 @@ pub const CHUNKLET_HEADER_BYTES: u64 = 4096;
 
 /// On-disk superblock format version. Bumped on any layout change.
 ///
-/// v2: LD descriptors use per-position run-length extent encoding (see
-/// `ld::descriptor`) so an LD scales to ~1 PB within the single-slot manifest
-/// body. v1 pools (explicit per-chunklet members) are hard-rejected — recreate
-/// the pool (Phase 0-7 policy: no on-disk migration).
-pub const SUPERBLOCK_VERSION: u32 = 2;
+/// v3: 32 MiB superblock slot capacity (`SUPERBLOCK_SLOT_CAPACITY`) inside a
+/// 128 MiB reserved region, with LENGTH-AWARE slot encoding (CRC follows the
+/// body; only the used block-aligned prefix is written). Removes the 4028-byte
+/// manifest wall (LD `num_rows` was capped ~13) and gives fault-rebuild /
+/// large-pool headroom. v2: per-position RLE extent descriptors in a single
+/// 4 KiB slot. v1: explicit per-chunklet members. v1/v2 pools are hard-rejected
+/// — recreate the pool (Phase 0-7 policy: no on-disk migration).
+pub const SUPERBLOCK_VERSION: u32 = 3;
 
 /// Magic for chunklet superblock: ASCII "ONYXCHK1".
 pub const SUPERBLOCK_MAGIC: &[u8; 8] = b"ONYXCHK1";

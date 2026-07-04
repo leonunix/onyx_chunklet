@@ -12,13 +12,12 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use onyx_chunklet::io::{AlignedBuf, RawDevice};
+use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::metrics::{PdOperationalState, PoolMetrics};
 use onyx_chunklet::ops::{
     self, AutoRecoverSnapshot, PoolSnapshot, RecoveryCycleOptions, RecoveryCycleSnapshot,
 };
 use onyx_chunklet::pool::{AutoRecoverReport, CpgSpec, LdSpec, SpareRebalanceReport};
-use onyx_chunklet::superblock::{SuperblockSlot, SLOT_BYTES};
 use onyx_chunklet::types::{
     HaDomain, LdId, PdId, RaidLevel, PD_RESERVED_BYTES, SUPERBLOCK_SLOT_A_OFFSET,
     SUPERBLOCK_SLOT_B_OFFSET,
@@ -1145,22 +1144,18 @@ fn scan_pd_slots(raw: &RawDevice) -> ChunkletResult<()> {
         ("tail B", tail_base + SUPERBLOCK_SLOT_B_OFFSET),
     ];
     for (label, offset) in slots {
-        let mut buf = AlignedBuf::new(SLOT_BYTES)?;
-        match raw.read_at(buf.as_mut_slice(), offset) {
-            Err(e) => println!("  {} @ {}: read error: {}", label, offset, e),
-            Ok(()) => match SuperblockSlot::decode(buf.as_slice()) {
-                Ok(slot) => println!(
-                    "  {} @ {}: pool={} pd={} gen={} chunklets={} pd_count={}",
-                    label,
-                    offset,
-                    slot.pool_id,
-                    slot.pd_id,
-                    slot.manifest_gen,
-                    slot.body.total_chunklets,
-                    slot.body.pool_pd_count
-                ),
-                Err(e) => println!("  {} @ {}: decode error: {}", label, offset, e),
-            },
+        match onyx_chunklet::pd::read_superblock_slot(&raw, offset) {
+            Ok(slot) => println!(
+                "  {} @ {}: pool={} pd={} gen={} chunklets={} pd_count={}",
+                label,
+                offset,
+                slot.pool_id,
+                slot.pd_id,
+                slot.manifest_gen,
+                slot.body.total_chunklets,
+                slot.body.pool_pd_count
+            ),
+            Err(e) => println!("  {} @ {}: read/decode error: {}", label, offset, e),
         }
     }
     Ok(())
