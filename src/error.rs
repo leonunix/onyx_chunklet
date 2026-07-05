@@ -28,6 +28,9 @@ pub enum ChunkletError {
     #[error("no valid superblock on {path}")]
     NoValidSuperblock { path: PathBuf },
 
+    #[error("pool device {path} is held by another process (flock LOCK_EX failed)")]
+    PoolLocked { path: PathBuf },
+
     #[error("pool inconsistency: {0}")]
     PoolMismatch(String),
 

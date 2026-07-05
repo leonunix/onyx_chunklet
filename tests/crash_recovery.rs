@@ -149,6 +149,10 @@ fn forward_reconciles_descriptor_to_bitmap_on_open() {
         );
     }
 
+    // Release the borrowed PD handle before dropping the pool — otherwise its
+    // fd (and the pool's exclusive flock) outlives `pool` and the reopen below
+    // would be rejected as still-held.
+    drop(pd);
     drop(pool);
 
     let raws: Vec<_> = paths.iter().map(|p| RawDevice::open(p).unwrap()).collect();
@@ -188,6 +192,9 @@ fn commit_rotates_to_inactive_slot() {
     let info = pool.list_pds()[0].clone();
     let pd = pool.pd(info.pd_id).unwrap();
     pd.commit_manifest(|_, _| Ok(())).unwrap();
+    // Drop the borrowed PD handle before the pool so its fd/flock is released
+    // and the direct re-read + reopen below can take the device.
+    drop(pd);
     drop(pool);
 
     let raw_post = RawDevice::open(&paths[0]).unwrap();

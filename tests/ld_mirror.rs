@@ -329,6 +329,10 @@ fn mark_chunklet_bad_persists_and_excludes_member_from_reads() {
     let (_, bm, _) = pd.snapshot();
     assert_eq!(bm.get(bad.chunklet_index).unwrap(), ChunkletState::Bad);
 
+    // Release the LD/PD handles that still pin member fds, then the pool, so
+    // the reopen below isn't rejected by the pool's exclusive flock.
+    drop(old_handle);
+    drop(pd);
     drop(pool);
 
     // Reopen + verify Bad state survived.

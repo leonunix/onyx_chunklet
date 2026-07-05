@@ -312,7 +312,9 @@ fn rebuild_bumps_member_generation() {
         "chunklet header generation must match descriptor"
     );
 
-    // Persist across reopen.
+    // Persist across reopen. Release the borrowed PD handle first so its fd
+    // (and the pool's exclusive flock) is gone before the reopen.
+    drop(new_pd);
     drop(pool_deg);
     let pool_reopen = open_subset(&paths, &[drop_idx]);
     let desc2 = pool_reopen.find_ld(ld_id).unwrap();

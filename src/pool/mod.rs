@@ -172,6 +172,9 @@ impl Pool {
         if devices.is_empty() {
             return Err(ChunkletError::Config("create: no devices".into()));
         }
+        // Claim the devices before writing any superblock, so a concurrent
+        // create/open on the same PDs loses the race cleanly.
+        lock_devices_exclusive(&devices)?;
 
         let pool_id = PoolId::new_v4();
         let pd_count = devices.len() as u32;
@@ -234,6 +237,10 @@ impl Pool {
         if devices.is_empty() {
             return Err(ChunkletError::Config("open: no devices".into()));
         }
+        // Claim the devices before reading their superblocks, so a second
+        // opener (or a still-running engine) is rejected instead of ending up
+        // with a duplicate in-memory pool that races on the on-disk manifest.
+        lock_devices_exclusive(&devices)?;
 
         let mut opened: Vec<Arc<PhysicalDisk>> = Vec::with_capacity(devices.len());
         for raw in devices {
@@ -374,6 +381,9 @@ impl Pool {
                 "open_with_missing: no devices".into(),
             ));
         }
+        // Same cross-process guard as `open`: degraded opens still take
+        // exclusive ownership of the PDs they can reach.
+        lock_devices_exclusive(&devices)?;
 
         let mut opened: Vec<Arc<PhysicalDisk>> = Vec::with_capacity(devices.len());
         for raw in devices {
@@ -499,6 +509,9 @@ impl Pool {
     /// entry.
     pub fn admit(&self, raw: RawDevice, cfg: PoolConfig) -> ChunkletResult<PdId> {
         let _commit = self.manifest_lock.lock();
+        // A newly admitted PD becomes a live pool member — lock it too so no
+        // other process can grab the same device out from under us.
+        lock_devices_exclusive(std::slice::from_ref(&raw))?;
 
         let new_pd_id = PdId::new_v4();
         let new_pd_seq;
@@ -810,6 +823,44 @@ pub fn open_paths(paths: &[impl AsRef<Path>]) -> ChunkletResult<Vec<RawDevice>> 
     Ok(out)
 }
 
+/// Take an advisory exclusive lock (`flock(LOCK_EX | LOCK_NB)`) on every device
+/// before it becomes a live pool member.
+///
+/// This is the pool's cross-process mutex: a second process — or a stray
+/// same-process double-open — that tries to `Pool::open`/`create` the same PDs
+/// is rejected with `PoolLocked` instead of racing us on the superblock COW
+/// pair (and, once onyx parks its metadb on a pool LD, tearing the durable
+/// metadata pages that live there). The lock rides the open file description
+/// owned by each `RawDevice`, so it is held for exactly as long as the `Pool`
+/// keeps the PD alive and is released by the kernel when the last fd closes.
+///
+/// Locks are taken **before** any superblock read/write; on failure the caller
+/// returns `Err`, dropping the devices/PDs it built so far and releasing every
+/// lock already acquired. Non-blocking, so it never deadlocks with a live
+/// holder — `EWOULDBLOCK` maps straight to `PoolLocked`.
+fn lock_devices_exclusive(devices: &[RawDevice]) -> ChunkletResult<()> {
+    use std::os::fd::AsRawFd;
+    for dev in devices {
+        // SAFETY: `dev` owns a valid open fd for the duration of this call; the
+        // fd stays valid afterwards because ownership moves into the PhysicalDisk
+        // the pool keeps alive.
+        let ret = unsafe { libc::flock(dev.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK)) {
+                return Err(ChunkletError::PoolLocked {
+                    path: dev.path().to_path_buf(),
+                });
+            }
+            return Err(ChunkletError::Device {
+                path: dev.path().to_path_buf(),
+                reason: format!("flock(LOCK_EX|LOCK_NB): {}", err),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +902,37 @@ mod tests {
         for (i, info) in infos.iter().enumerate() {
             assert_eq!(info.pd_seq_in_pool, i as u32);
         }
+    }
+
+    #[test]
+    fn rejects_double_open_while_live() {
+        let dir = TempDir::new().unwrap();
+        let pool = Pool::create(
+            vec![sparse(&dir, "pd0"), sparse(&dir, "pd1")],
+            PoolConfig::default(),
+        )
+        .unwrap();
+
+        // A second open of the same devices while the first pool is live must
+        // be rejected by the exclusive flock rather than racing us on the
+        // superblock COW pair.
+        let paths = collect_paths(&dir, &["pd0", "pd1"]);
+        let err = Pool::open(open_paths(&paths).unwrap())
+            .err()
+            .expect("expected second open to fail while pool is live");
+        assert!(matches!(err, ChunkletError::PoolLocked { .. }), "got {err:?}");
+
+        // Even a single overlapping device is enough to reject the open.
+        let one = collect_paths(&dir, &["pd1"]);
+        let err = Pool::open_with_missing(open_paths(&one).unwrap())
+            .err()
+            .expect("expected degraded open to fail while pool is live");
+        assert!(matches!(err, ChunkletError::PoolLocked { .. }), "got {err:?}");
+
+        // Dropping the live pool releases the kernel flocks; reopen succeeds.
+        drop(pool);
+        let pool2 = Pool::open(open_paths(&paths).unwrap()).unwrap();
+        assert_eq!(pool2.pd_count(), 2);
     }
 
     #[test]
