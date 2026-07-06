@@ -369,7 +369,11 @@ impl Pool {
                 Arc::new(raid0)
             }
             RaidLevel::Raid6 => {
-                let raid6 = LdRaid6::open_with_health(desc, &s.pds, &s.pd_health)?;
+                let mut raid6 = LdRaid6::open_with_health(desc, &s.pds, &s.pd_health)?;
+                // Share the runtime's stripe-lock table + rebuild cell so an
+                // online rebuild's shadow backfill serializes with this handle's
+                // writes and foreground writes can write-forward below the cursor.
+                raid6.attach_shared(runtime.stripe_locks.clone(), runtime.rebuild.clone());
                 Arc::new(raid6)
             }
         };

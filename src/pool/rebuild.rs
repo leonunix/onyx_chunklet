@@ -12,6 +12,7 @@
 //! cover return `Invariant("unrecoverable")`.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::chunklet::ChunkletHeader;
@@ -19,7 +20,7 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{LdMirror, LdRaid5, LdRaid6};
 use crate::pd::PhysicalDisk;
-use crate::pool::{PdHealth, Pool};
+use crate::pool::{PdHealth, Pool, RebuildProgress, SetRebuild, ShadowTarget};
 use crate::types::{
     ChunkletState, LdId, LdRole, PdId, RaidLevel, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
 };
@@ -41,8 +42,305 @@ pub struct RebuildReport {
 }
 
 impl Pool {
-    /// Rebuild any failed members of the given LD onto spare chunklets on
-    /// live PDs. Returns a `RebuildReport` summarizing the work done.
+    /// Rebuild any failed members of the given LD onto spare chunklets.
+    ///
+    /// RAID6 uses the ONLINE (non-blocking) path — foreground IO keeps flowing
+    /// during the backfill. Other levels still use the blocking path (converted
+    /// in a follow-up). `auto_recover` / `drain_pd` reach this same entry point.
+    pub fn rebuild_ld(&self, ld_id: LdId) -> ChunkletResult<RebuildReport> {
+        let level = self
+            .find_ld(ld_id)
+            .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", ld_id)))?
+            .raid_level;
+        match level {
+            RaidLevel::Raid6 => self.rebuild_ld_online(ld_id),
+            _ => self.rebuild_ld_blocking(ld_id),
+        }
+    }
+
+    /// Online (non-blocking) RAID6 rebuild. Three phases:
+    ///
+    /// - **A** (brief `manifest_lock` + `io_lock.write()`): plan spares, write
+    ///   their chunklet headers, mark them `Migrating`, install `RebuildProgress`
+    ///   into the runtime cell. The descriptor is NOT changed and the epoch is
+    ///   NOT bumped, so live handles keep serving and just start observing the
+    ///   rebuild cell.
+    /// - **B** (`io_lock.read()`, concurrent with foreground): backfill each
+    ///   failed member's shadow chunklet from current survivors, one stripe
+    ///   batch at a time under the SHARED stripe lock, advancing the per-set
+    ///   cursor. Foreground writes below the cursor write-forward to the shadow
+    ///   (see `LdRaid6::write_forward`); the failed position stays `None` so
+    ///   reads reconstruct as before.
+    /// - **C** (brief `manifest_lock` + `io_lock.write()`): if a shadow write
+    ///   failed, reclaim the `Migrating` spares and return `Err`. Otherwise swap
+    ///   the descriptor to the spares (`Migrating`→`Used`, old chunklet→`Free`),
+    ///   clear the cell, and bump the epoch so handles reopen onto the spares.
+    fn rebuild_ld_online(&self, ld_id: LdId) -> ChunkletResult<RebuildReport> {
+        // ---------------------------- Phase A ----------------------------
+        let commit_a = self.manifest_lock.lock();
+        let runtime = self
+            .state
+            .read()
+            .ld_runtime
+            .get(&ld_id)
+            .cloned()
+            .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", ld_id)))?;
+        let io_a = runtime.io_lock.write();
+
+        let desc = self
+            .find_ld(ld_id)
+            .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", ld_id)))?;
+        let pd_health = self.state.read().pd_health.clone();
+        let pds_snapshot: BTreeMap<PdId, Arc<PhysicalDisk>> = self
+            .state
+            .read()
+            .pds
+            .iter()
+            .filter(|(pd_id, _)| pd_health.get(pd_id) != Some(&PdHealth::Failed))
+            .map(|(pd_id, pd)| (*pd_id, pd.clone()))
+            .collect();
+        let draining = self.state.read().draining.clone();
+
+        // Identify members needing rebuild per set (same rule as blocking).
+        let member_needs_rebuild = |m: &crate::types::LdMember| -> ChunkletResult<bool> {
+            if draining.contains(&m.pd) {
+                return Ok(true);
+            }
+            match pd_health.get(&m.pd) {
+                Some(PdHealth::Failed) => Ok(true),
+                Some(PdHealth::Healthy) => {
+                    let pd = pds_snapshot.get(&m.pd).ok_or_else(|| {
+                        ChunkletError::Invariant(format!(
+                            "PD {} health=Healthy but missing from pds map",
+                            m.pd
+                        ))
+                    })?;
+                    let (_, bitmap, _) = pd.snapshot();
+                    Ok(matches!(bitmap.get(m.chunklet_index)?, ChunkletState::Bad))
+                }
+                None => Ok(true),
+            }
+        };
+        let n_per_set = desc.set_size as usize;
+        let n_sets = (desc.row_size as usize) * (desc.num_rows as usize);
+        let mut failed_per_set: Vec<Vec<usize>> = vec![Vec::new(); n_sets];
+        let mut total_failed = 0usize;
+        for set_idx in 0..n_sets {
+            let base = set_idx * n_per_set;
+            for pos in 0..n_per_set {
+                if member_needs_rebuild(&desc.members[base + pos])? {
+                    failed_per_set[set_idx].push(pos);
+                    total_failed += 1;
+                }
+            }
+        }
+        if total_failed == 0 {
+            return Ok(RebuildReport {
+                ld_id,
+                rebuilt_members: 0,
+                skipped: true,
+            });
+        }
+        for (set_idx, failed) in failed_per_set.iter().enumerate() {
+            if failed.len() > 2 {
+                return Err(ChunkletError::Invariant(format!(
+                    "Raid6 set {} lost {} members (max tolerable: 2)",
+                    set_idx,
+                    failed.len()
+                )));
+            }
+        }
+
+        // Plan the spare placement (same as blocking): new_desc points failed
+        // positions at fresh chunklets on live PDs outside the surviving set.
+        let mut new_desc = desc.clone();
+        let mut working_free = self.snapshot_working_free(&pds_snapshot)?;
+        for pd in &draining {
+            working_free.remove(pd);
+        }
+        let mut new_alloc_by_pd: BTreeMap<PdId, Vec<(u32, LdRole, u8)>> = BTreeMap::new();
+        let mut freed_by_pd: BTreeMap<PdId, Vec<u32>> = BTreeMap::new();
+        for (set_idx, failed) in failed_per_set.iter().enumerate() {
+            if failed.is_empty() {
+                continue;
+            }
+            let base = set_idx * n_per_set;
+            let mut used_pds: Vec<PdId> = (0..n_per_set)
+                .filter(|i| !failed.contains(i))
+                .map(|i| desc.members[base + i].pd)
+                .collect();
+            for &failed_pos in failed {
+                let old_member = desc.members[base + failed_pos];
+                let role = old_member.role;
+                let new_gen = old_member.generation.wrapping_add(1);
+                let target_pd = pick_replacement_pd(&working_free, &pds_snapshot, &used_pds)?;
+                let chunklet_idx = working_free.get_mut(&target_pd).unwrap().remove(0);
+                used_pds.push(target_pd);
+                new_alloc_by_pd
+                    .entry(target_pd)
+                    .or_default()
+                    .push((chunklet_idx, role, new_gen));
+                if pds_snapshot.contains_key(&old_member.pd) {
+                    freed_by_pd
+                        .entry(old_member.pd)
+                        .or_default()
+                        .push(old_member.chunklet_index);
+                }
+                let m = &mut new_desc.members[base + failed_pos];
+                m.pd = target_pd;
+                m.chunklet_index = chunklet_idx;
+                m.generation = new_gen;
+            }
+        }
+
+        // Write the shadow chunklet headers + mark the spares Migrating (invisible
+        // to the allocator; reclaimed at open if we crash before Phase C). The
+        // descriptor still names the OLD failed members, so foreground stays
+        // degraded (reads reconstruct) until Phase C swaps.
+        for (pd_id, allocs) in &new_alloc_by_pd {
+            let pd = pds_snapshot
+                .get(pd_id)
+                .ok_or_else(|| ChunkletError::Invariant(format!("shadow PD {} missing", pd_id)))?;
+            for (chunklet_idx, role, gen) in allocs {
+                self.write_header(pd, *chunklet_idx, new_desc.id, *role, *gen)?;
+            }
+            let idxs: Vec<u32> = allocs.iter().map(|(i, _, _)| *i).collect();
+            pd.commit_manifest(move |_body, bitmap| {
+                for i in &idxs {
+                    bitmap.set(*i, ChunkletState::Migrating)?;
+                }
+                Ok(())
+            })?;
+        }
+
+        // Build + install the rebuild plan cell. targets_by_set[s] carries the
+        // shadow targets for set s (aligned to failed positions in new_desc).
+        let mut targets_by_set: Vec<Option<SetRebuild>> = Vec::with_capacity(n_sets);
+        for (set_idx, failed) in failed_per_set.iter().enumerate() {
+            if failed.is_empty() {
+                targets_by_set.push(None);
+                continue;
+            }
+            let base = set_idx * n_per_set;
+            let mut shadows = Vec::with_capacity(failed.len());
+            for &pos in failed {
+                let m = &new_desc.members[base + pos];
+                let pd = pds_snapshot.get(&m.pd).ok_or_else(|| {
+                    ChunkletError::Invariant(format!("shadow PD {} missing", m.pd))
+                })?;
+                shadows.push(ShadowTarget {
+                    pos_in_set: pos,
+                    role: m.role,
+                    pd: pd.clone(),
+                    chunklet_index: m.chunklet_index,
+                });
+            }
+            targets_by_set.push(Some(SetRebuild {
+                cursor: AtomicU64::new(0),
+                shadows,
+            }));
+        }
+        let progress = Arc::new(RebuildProgress {
+            targets_by_set,
+            aborted: AtomicBool::new(false),
+        });
+        *runtime.rebuild.write() = Some(progress.clone());
+
+        drop(io_a);
+        drop(commit_a);
+
+        // ---------------------------- Phase B ----------------------------
+        // Backfill each shadow from current survivors, concurrent with fg IO.
+        {
+            let _io = runtime.io_lock.read();
+            let engine = LdRaid6::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?;
+            let strip_bytes = engine.strip_bytes();
+            let stripes = engine.stripes_per_chunklet();
+            let batch_stripes = std::cmp::max(1, REBUILD_BATCH_BYTES / strip_bytes);
+            let mut buf = vec![0u8; strip_bytes as usize];
+            'backfill: for (set_idx, sr) in progress.targets_by_set.iter().enumerate() {
+                let Some(sr) = sr else { continue };
+                let mut s = 0u64;
+                while s < stripes {
+                    if progress.aborted.load(Ordering::Relaxed) {
+                        break 'backfill;
+                    }
+                    let n = std::cmp::min(batch_stripes, stripes - s);
+                    // Hold the SAME stripe locks foreground writes take, in the
+                    // same globally-sorted order, across reconstruct + shadow
+                    // write + cursor advance for this batch.
+                    let keys: Vec<u64> =
+                        (s..s + n).map(|st| ((set_idx as u64) << 32) | st).collect();
+                    let _guards = runtime.stripe_locks.write_keys(&keys);
+                    for st in s..s + n {
+                        let off = st * strip_bytes;
+                        for shadow in &sr.shadows {
+                            let midx = set_idx * n_per_set + shadow.pos_in_set;
+                            engine.reconstruct_member_strip(midx, off, &mut buf)?;
+                            if let Err(e) = shadow.pd.write_chunklet_user(
+                                shadow.chunklet_index,
+                                off,
+                                &buf,
+                            ) {
+                                tracing::error!(
+                                    "online rebuild: shadow backfill write failed (set {} pos {}): {} — aborting",
+                                    set_idx, shadow.pos_in_set, e
+                                );
+                                progress.aborted.store(true, Ordering::Relaxed);
+                                break 'backfill;
+                            }
+                        }
+                    }
+                    sr.cursor.store(s + n, Ordering::Release);
+                    s += n;
+                }
+            }
+            // Make the shadow data durable before the descriptor swap.
+            if !progress.aborted.load(Ordering::Relaxed) {
+                for sr in progress.targets_by_set.iter().flatten() {
+                    for shadow in &sr.shadows {
+                        shadow.pd.sync()?;
+                    }
+                }
+            }
+        }
+
+        // ---------------------------- Phase C ----------------------------
+        let _commit_c = self.manifest_lock.lock();
+        let _io_c = runtime.io_lock.write();
+        if progress.aborted.load(Ordering::Relaxed) {
+            // Reclaim the Migrating spares → Free; leave the LD degraded (still
+            // redundant) and let a later rebuild retry.
+            for (pd_id, allocs) in &new_alloc_by_pd {
+                if let Some(pd) = pds_snapshot.get(pd_id) {
+                    let idxs: Vec<u32> = allocs.iter().map(|(i, _, _)| *i).collect();
+                    let _ = pd.commit_manifest(move |_body, bitmap| {
+                        for i in &idxs {
+                            bitmap.set(*i, ChunkletState::Free)?;
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            *runtime.rebuild.write() = None;
+            return Err(ChunkletError::Invariant(format!(
+                "online rebuild of LD {} aborted: shadow PD write failure",
+                ld_id
+            )));
+        }
+        // Atomic swap: spare Migrating→Used, descriptor→new_desc, old→Free.
+        self.commit_rebuild(&new_desc, &new_alloc_by_pd, &freed_by_pd, &pds_snapshot)?;
+        *runtime.rebuild.write() = None;
+        runtime.bump();
+
+        Ok(RebuildReport {
+            ld_id,
+            rebuilt_members: total_failed,
+            skipped: false,
+        })
+    }
+
+    /// Blocking rebuild (Mirror / RAID5 today; RAID6 uses `rebuild_ld_online`).
     ///
     /// On success, the LD descriptor is updated in-memory and persisted on
     /// every live PD's manifest. New chunklets are marked `Used`; old
@@ -50,7 +348,10 @@ impl Pool {
     /// healthy PD's scrub-marked-Bad chunklet) are marked `Free` in the
     /// same commit. Failed PDs (gone from `pds_snapshot`) get no bitmap
     /// update — their on-disk state is unreachable until they come back.
-    pub fn rebuild_ld(&self, ld_id: LdId) -> ChunkletResult<RebuildReport> {
+    ///
+    /// Holds `io_lock.write()` for the whole reconstruct, blocking foreground
+    /// IO on this LD — the flaw `rebuild_ld_online` fixes for RAID6.
+    pub fn rebuild_ld_blocking(&self, ld_id: LdId) -> ChunkletResult<RebuildReport> {
         let _commit = self.manifest_lock.lock();
         let runtime = self
             .state

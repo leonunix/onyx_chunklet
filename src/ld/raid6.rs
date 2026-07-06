@@ -64,6 +64,7 @@
 //!   re-encode the missing parity. Implemented as two passes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::error::{ChunkletError, ChunkletResult};
@@ -74,7 +75,7 @@ use crate::ld::{
     StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
-use crate::pool::PdHealth;
+use crate::pool::{new_rebuild_cell, PdHealth, RebuildCell};
 use crate::types::{
     LdId, LdRole, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
 };
@@ -88,9 +89,16 @@ pub struct LdRaid6 {
     strip_bytes: u64,
     data_per_set: usize,
     full_stripe_bytes: u64,
-    /// Per-full-stripe serialization. RMW/RW updates parity from old stripe
-    /// state, so overlapping writes to one stripe must not interleave.
-    stripe_locks: StripeLockTable,
+    /// Per-full-stripe serialization, SHARED with the online-rebuild worker via
+    /// `attach_shared` (default: a private table for tests / the reconstruct
+    /// engine). RMW/RW updates parity from old stripe state, so overlapping
+    /// writes to one stripe must not interleave — and the rebuild worker takes
+    /// the SAME lock so its shadow backfill serializes with foreground writes.
+    stripe_locks: Arc<StripeLockTable>,
+    /// Online-rebuild plan cell (shared via `attach_shared`; default empty).
+    /// Foreground writes consult it to write-forward reconstructed strips to
+    /// the shadow spare for stripes below the set cursor.
+    rebuild: RebuildCell,
 }
 
 impl LdRaid6 {
@@ -180,12 +188,83 @@ impl LdRaid6 {
             strip_bytes,
             data_per_set,
             full_stripe_bytes,
-            stripe_locks: StripeLockTable::new(),
+            stripe_locks: Arc::new(StripeLockTable::new()),
+            rebuild: new_rebuild_cell(),
         })
     }
 
     pub fn descriptor(&self) -> &LdDescriptor {
         &self.desc
+    }
+
+    /// Install the shared stripe-lock table + rebuild cell from `LdRuntime`
+    /// (called by `open_ld`). Handles built for tests / the rebuild worker's
+    /// reconstruct engine skip this and keep their private table + empty cell,
+    /// so they never write-forward and lock only within themselves.
+    pub(crate) fn attach_shared(&mut self, stripe_locks: Arc<StripeLockTable>, rebuild: RebuildCell) {
+        self.stripe_locks = stripe_locks;
+        self.rebuild = rebuild;
+    }
+
+    /// True iff an online rebuild is currently backfilling `set_idx`.
+    fn set_being_rebuilt(&self, set_idx: usize) -> bool {
+        self.rebuild
+            .read()
+            .as_ref()
+            .map(|p| {
+                p.targets_by_set
+                    .get(set_idx)
+                    .map(|o| o.is_some())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// While holding the stripe lock, mirror this stripe's just-computed strips
+    /// to the online-rebuild shadow spare(s) for `set_idx` — but only for
+    /// stripes strictly below the set cursor (already-backfilled stripes that
+    /// must stay current). `strip_for(pos_in_set)` yields the full strip bytes
+    /// for a member position (data `0..K`, P=`K`, Q=`K+1`). A shadow write
+    /// failure sets `aborted` (Phase C then skips the swap) but does NOT fail
+    /// the foreground write — live data is intact via reconstruct.
+    fn write_forward(
+        &self,
+        set_idx: usize,
+        strip_base: u64,
+        mut strip_for: impl FnMut(usize) -> Vec<u8>,
+    ) {
+        let guard = self.rebuild.read();
+        let Some(progress) = guard.as_ref() else {
+            return;
+        };
+        if progress.aborted.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(sr) = progress.targets_by_set.get(set_idx).and_then(|o| o.as_ref()) else {
+            return;
+        };
+        let set_stripe_n = strip_base / self.strip_bytes;
+        if set_stripe_n >= sr.cursor.load(Ordering::Acquire) {
+            return;
+        }
+        for shadow in &sr.shadows {
+            let bytes = strip_for(shadow.pos_in_set);
+            if let Err(e) =
+                shadow
+                    .pd
+                    .write_chunklet_user(shadow.chunklet_index, strip_base, &bytes)
+            {
+                tracing::error!(
+                    "online rebuild: shadow write-forward failed (set {} pos {} chunklet {}): {} — aborting rebuild",
+                    set_idx,
+                    shadow.pos_in_set,
+                    shadow.chunklet_index,
+                    e
+                );
+                progress.aborted.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
     }
 
     fn ensure_aligned(&self, offset: u64, len: usize) -> ChunkletResult<()> {
@@ -740,8 +819,11 @@ impl LdRaid6 {
             return self.write_full_stripe(start.set_idx, strip_base, &positions, buf);
         }
 
-        if f_data == 0 && p_failed && q_failed {
+        if f_data == 0 && p_failed && q_failed && !self.set_being_rebuilt(start.set_idx) {
             // Both parities gone (F=2): just write data, no parity work.
+            // An online rebuild targeting a parity needs P/Q computed so it can
+            // write-forward to the shadow, so a rebuilding set falls through to
+            // RW (which computes both parities) instead of this fast path.
             return self.write_data_only(start.set_idx, strip_base, &positions, buf);
         }
 
@@ -817,7 +899,20 @@ impl LdRaid6 {
                 data: &q,
             });
         }
-        parallel_strip_writes(ops)
+        parallel_strip_writes(ops)?;
+        // Mirror to online-rebuild shadow(s) below the cursor: full-stripe gives
+        // each data pos its slice of `buf`; P/Q are the strips just computed.
+        let strip = self.strip_bytes as usize;
+        self.write_forward(set_idx, strip_base, |pos| {
+            if pos < self.data_per_set {
+                buf[pos * strip..pos * strip + strip].to_vec()
+            } else if pos == self.data_per_set {
+                p.clone()
+            } else {
+                q.clone()
+            }
+        });
+        Ok(())
     }
 
     /// F=2 P+Q failed fast path: skip both parities, write data only.
@@ -1068,7 +1163,19 @@ impl LdRaid6 {
                 data: &q,
             });
         }
-        parallel_strip_writes(ops)
+        parallel_strip_writes(ops)?;
+        // Mirror to online-rebuild shadow(s) below the cursor. RW built the full
+        // new strip for every data position plus P and Q.
+        self.write_forward(set_idx, strip_base, |pos| {
+            if pos < self.data_per_set {
+                new_strips[pos].clone()
+            } else if pos == self.data_per_set {
+                p.clone()
+            } else {
+                q.clone()
+            }
+        });
+        Ok(())
     }
 }
 

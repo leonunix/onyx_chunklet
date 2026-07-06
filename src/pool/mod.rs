@@ -49,7 +49,7 @@ use crate::ld::descriptor::LdList;
 use crate::ld::StripeLockTable;
 use crate::pd::{PdInfo, PhysicalDisk};
 use crate::superblock::PoolPdEntry;
-use crate::types::{LdId, PdId, PoolId};
+use crate::types::{LdId, LdRole, PdId, PoolId};
 
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -101,9 +101,53 @@ pub(crate) struct PoolState {
     pub last_reconciliation_count: usize,
 }
 
+/// Shared cell holding the in-progress online-rebuild plan for one LD, or
+/// `None` when no rebuild is running. Lives in `LdRuntime` so every handle of
+/// the LD (opened before or after the rebuild starts) AND the rebuild worker
+/// observe the same plan + per-set cursor. Foreground writes re-read it on
+/// every write (never cache) so a rebuild that starts mid-life is seen.
+pub(crate) type RebuildCell = Arc<RwLock<Option<Arc<RebuildProgress>>>>;
+
+pub(crate) fn new_rebuild_cell() -> RebuildCell {
+    Arc::new(RwLock::new(None))
+}
+
+/// One online rebuild in flight. `targets_by_set[set_idx] == Some` iff that set
+/// has failed members being backfilled onto shadow spares; a foreground write
+/// to such a set write-forwards the reconstructed strip to the shadow for
+/// stripes below the set's cursor (see `SetRebuild::cursor`).
+pub(crate) struct RebuildProgress {
+    pub targets_by_set: Vec<Option<SetRebuild>>,
+    /// Set true if any shadow write failed (shadow PD died mid-rebuild). Worker
+    /// + foreground stop write-forwarding; Phase C aborts the descriptor swap.
+    pub aborted: AtomicBool,
+}
+
+pub(crate) struct SetRebuild {
+    /// Count of set-stripes fully backfilled: stripes `[0, cursor)` are done in
+    /// the shadow and kept current by foreground write-forward. Monotone, only
+    /// advanced by the worker under the shared stripe lock.
+    pub cursor: AtomicU64,
+    pub shadows: Vec<ShadowTarget>,
+}
+
+pub(crate) struct ShadowTarget {
+    /// Member position within the set (`0..set_size`).
+    pub pos_in_set: usize,
+    pub role: LdRole,
+    pub pd: Arc<PhysicalDisk>,
+    pub chunklet_index: u32,
+}
+
 pub(crate) struct LdRuntime {
     pub io_lock: RwLock<()>,
     pub range_locks: StripeLockTable,
+    /// Per-stripe lock SHARED between every handle of this LD and the online
+    /// rebuild worker (hoisted out of the per-`LdRaid*` instance so the worker
+    /// and foreground write-forward serialize on the same key). Installed into
+    /// the inner LD by `open_ld` via `attach_shared`.
+    pub stripe_locks: Arc<StripeLockTable>,
+    pub rebuild: RebuildCell,
     epoch: AtomicU64,
     dropped: AtomicBool,
 }
@@ -113,6 +157,8 @@ impl LdRuntime {
         Self {
             io_lock: RwLock::new(()),
             range_locks: StripeLockTable::new(),
+            stripe_locks: Arc::new(StripeLockTable::new()),
+            rebuild: new_rebuild_cell(),
             epoch: AtomicU64::new(0),
             dropped: AtomicBool::new(false),
         }
@@ -331,6 +377,7 @@ impl Pool {
         };
 
         let reconciled = forward_reconcile_bitmaps(&ld_list, &pds)?;
+        reclaim_orphan_migrating(&ld_list, &pds)?;
 
         Ok(Arc::new(Self {
             pool_id,
@@ -471,6 +518,7 @@ impl Pool {
         };
 
         let reconciled = forward_reconcile_bitmaps(&ld_list, &pds)?;
+        reclaim_orphan_migrating(&ld_list, &pds)?;
 
         Ok(Arc::new(Self {
             pool_id,
@@ -786,16 +834,19 @@ fn forward_reconcile_bitmaps(
             };
             match state {
                 ChunkletState::Used => {} // already correct
-                ChunkletState::Free => {
+                // Free: a non-atomic cross-PD commit left this PD's bitmap
+                // behind. Migrating: an online rebuild's Phase C swapped this
+                // spare INTO the descriptor (so it is now referenced + valid)
+                // but this PD's Migrating->Used flip lagged. Both → Used.
+                ChunkletState::Free | ChunkletState::Migrating => {
                     fixes_by_pd
                         .entry(member.pd)
                         .or_default()
                         .push(member.chunklet_index);
                 }
                 other => {
-                    // Bad / Spare / Migrating — descriptor still references
-                    // this chunklet but operator/scrub flagged it. Don't
-                    // clobber, just warn so the operator notices.
+                    // Bad / Spare — descriptor still references this chunklet
+                    // but operator/scrub flagged it. Don't clobber, just warn.
                     tracing::warn!(
                         "forward reconcile: ld {} references PD {} chunklet {} but bitmap says {:?}; leaving as-is",
                         ld.id,
@@ -821,6 +872,66 @@ fn forward_reconcile_bitmaps(
         })?;
         tracing::warn!(
             "forward reconcile fixed {} Free->Used bitmap entries on PD {}",
+            n,
+            pd_id
+        );
+        total += n;
+    }
+    Ok(total)
+}
+
+/// Reclaim abandoned online-rebuild shadow chunklets at open.
+///
+/// An online rebuild (see `pool/rebuild.rs`) marks its shadow spare chunklets
+/// `Migrating` in Phase A and only swaps them into the descriptor (flipping
+/// them `Migrating->Used`) in Phase C. `ChunkletState::Migrating` is written by
+/// NO other code path, so at open any `Migrating` chunklet that is NOT
+/// referenced by an authoritative descriptor member is unambiguously the
+/// leftover of a rebuild that crashed before Phase C committed. Reclaim it to
+/// `Free`: the descriptor still names the original (failed) member, the LD is
+/// its pre-rebuild degraded-but-redundant self, and the shadow was never
+/// authoritative (reads never read it) — so this loses nothing and a fresh
+/// rebuild can re-run. Referenced `Migrating` members are handled by
+/// `forward_reconcile_bitmaps` (Migrating->Used); this only touches orphans.
+///
+/// Returns the number of chunklets reclaimed. Called after
+/// `forward_reconcile_bitmaps` in both `Pool::open` and `open_with_missing`.
+fn reclaim_orphan_migrating(
+    ld_list: &LdList,
+    pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
+) -> ChunkletResult<usize> {
+    use crate::types::ChunkletState;
+    // All (pd, chunklet) referenced by any live descriptor member.
+    let mut referenced: std::collections::BTreeSet<(PdId, u32)> = std::collections::BTreeSet::new();
+    for ld in &ld_list.lds {
+        for m in &ld.members {
+            referenced.insert((m.pd, m.chunklet_index));
+        }
+    }
+    let mut total = 0usize;
+    for (pd_id, pd) in pds {
+        let (_, bitmap, _) = pd.snapshot();
+        let mut orphans: Vec<u32> = Vec::new();
+        for idx in 0..bitmap.len() {
+            if matches!(bitmap.get(idx), Ok(ChunkletState::Migrating))
+                && !referenced.contains(&(*pd_id, idx))
+            {
+                orphans.push(idx);
+            }
+        }
+        if orphans.is_empty() {
+            continue;
+        }
+        let n = orphans.len();
+        let captured = orphans.clone();
+        pd.commit_manifest(move |_body, bitmap| {
+            for idx in &captured {
+                bitmap.set(*idx, ChunkletState::Free)?;
+            }
+            Ok(())
+        })?;
+        tracing::warn!(
+            "reclaimed {} orphan Migrating (abandoned online-rebuild shadow) chunklets on PD {} -> Free",
             n,
             pd_id
         );

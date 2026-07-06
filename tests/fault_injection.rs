@@ -311,3 +311,95 @@ fn raid6_double_pd_fail_rebuild_to_spare_restores_data() {
     ld.read_at(0, &mut got).unwrap();
     assert_eq!(got, expected, "rebuilt R6 data matches the original");
 }
+
+/// The headline ONLINE-rebuild test: foreground writes run CONCURRENTLY with a
+/// RAID6 rebuild and every write survives the descriptor swap. Proves the
+/// write-forward + per-set cursor keep the shadow spare consistent with live
+/// writes across all interleavings — the property that lets `rebuild_ld` drop
+/// the whole-op `io_lock.write()` and stop hard-blocking foreground IO.
+///
+/// One writer thread hammers a fixed set of blocks with monotonically-changing
+/// values (recording the last value written to each) while another thread runs
+/// the rebuild; after both finish, a fresh handle must read back the last value
+/// written to every block. A stale shadow (broken write-forward) would surface
+/// as a mismatch on blocks whose last write landed below the cursor mid-rebuild.
+#[test]
+#[ignore = "fault-injection: online rebuild backfills a full 1 GiB chunklet (~60s)"]
+fn raid6_online_rebuild_concurrent_writes_preserve_data() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, 8);
+    let id = pool.create_ld(LdSpec::raid6(4, 1, 1, 0)).unwrap();
+
+    // 96 distinct 4 KiB blocks spread across the LD's capacity.
+    let ld = pool.open_ld(id).unwrap();
+    let cap = ld.capacity_bytes();
+    let block = 4096u64;
+    let n_off = 96usize;
+    let stride = ((cap / block / n_off as u64).max(1)) * block;
+    let offsets: Vec<u64> = (0..n_off as u64).map(|i| i * stride).collect();
+    // Seed a baseline so degraded reads/reconstructs have data.
+    for &off in &offsets {
+        ld.write_at(off, &pattern(0, block as usize, off)).unwrap();
+    }
+    ld.flush().unwrap();
+    drop(ld);
+
+    // Fail one data-member PD, reopen degraded (7 of 8 PDs, quorum holds).
+    let drop0 = path_for_member(&pool, &paths, 0);
+    drop(pool);
+    let pool = open_subset(&paths, &[drop0]);
+
+    let rebuild_done = Arc::new(AtomicBool::new(false));
+
+    // Rebuild on its own thread (Phase B holds only io_lock.read).
+    let pool_r = pool.clone();
+    let done_r = rebuild_done.clone();
+    let rebuild_thread = std::thread::spawn(move || {
+        let report = pool_r.rebuild_ld(id).unwrap();
+        done_r.store(true, Ordering::Release);
+        report
+    });
+
+    // Concurrent writer: hammer every offset with a fresh value until the
+    // rebuild finishes, recording the last value written to each. Reopen the
+    // handle when Phase C bumps the epoch (mirrors onyx's stale-handle retry).
+    let mut expected: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut ld = pool.open_ld(id).unwrap();
+    let mut counter: u64 = 1;
+    while !rebuild_done.load(Ordering::Acquire) {
+        for &off in &offsets {
+            let val = pattern(counter, block as usize, off);
+            counter += 1;
+            match ld.write_at(off, &val) {
+                Ok(()) => {
+                    expected.insert(off, val);
+                }
+                Err(_) => {
+                    // Stale handle (epoch bumped by Phase C) → reopen + retry.
+                    ld = pool.open_ld(id).unwrap();
+                    ld.write_at(off, &val).unwrap();
+                    expected.insert(off, val);
+                }
+            }
+        }
+    }
+    let report = rebuild_thread.join().unwrap();
+    assert!(!report.skipped, "rebuild ran");
+    assert_eq!(report.rebuilt_members, 1, "one failed data member rebuilt");
+
+    // Fresh handle (post-swap: reads hit the rebuilt spare). Every block must
+    // read back the last value the writer recorded for it.
+    let ld = pool.open_ld(id).unwrap();
+    for &off in &offsets {
+        let mut got = vec![0u8; block as usize];
+        ld.read_at(off, &mut got).unwrap();
+        assert_eq!(
+            got, expected[&off],
+            "block at offset {} lost its last concurrent write across the online rebuild",
+            off
+        );
+    }
+}
