@@ -50,10 +50,10 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{
     compute_strip_bytes, parallel_strip_reads, parallel_strip_writes, resolve_members, LogicalDisk,
-    StripRead, StripWrite, StripeLockTable,
+    ReconstructEngine, StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
-use crate::pool::PdHealth;
+use crate::pool::{new_rebuild_cell, PdHealth, RebuildCell};
 use crate::types::{LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
 
 const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
@@ -68,9 +68,12 @@ pub struct LdMirror {
     /// different sets don't all converge on the same copy of one set.
     /// Indexed as `row * row_size + set_in_row`.
     read_cursors: Vec<AtomicUsize>,
-    /// Per-stripe serialization. Overlapping mirror writes must not leave
-    /// copies with different write orders, but unrelated stripes can proceed.
-    stripe_locks: StripeLockTable,
+    /// Per-stripe serialization, SHARED with the online-rebuild worker via
+    /// `attach_shared` (default: private). Overlapping mirror writes must not
+    /// leave copies with different write orders; unrelated stripes proceed.
+    stripe_locks: Arc<StripeLockTable>,
+    /// Online-rebuild plan cell (shared via `attach_shared`; default empty).
+    rebuild: RebuildCell,
 }
 
 impl LdMirror {
@@ -127,12 +130,63 @@ impl LdMirror {
             capacity,
             strip_bytes,
             read_cursors,
-            stripe_locks: StripeLockTable::new(),
+            stripe_locks: Arc::new(StripeLockTable::new()),
+            rebuild: new_rebuild_cell(),
         })
     }
 
     pub fn descriptor(&self) -> &LdDescriptor {
         &self.desc
+    }
+
+    /// Install the shared stripe-lock table + rebuild cell (see `LdRaid6`).
+    pub(crate) fn attach_shared(&mut self, stripe_locks: Arc<StripeLockTable>, rebuild: RebuildCell) {
+        self.stripe_locks = stripe_locks;
+        self.rebuild = rebuild;
+    }
+
+    /// Mirror the just-written segments to the online-rebuild shadow copies for
+    /// each rebuilding set, below that set's cursor, while the stripe locks are
+    /// still held. A mirror shadow is just another identical copy, so the value
+    /// is the same `buf` slice — no parity math. Shadow-write failure sets
+    /// `aborted` (Phase C aborts) but does NOT fail the foreground write.
+    fn write_forward(&self, ops: &[(u64, &[u8])]) {
+        let guard = self.rebuild.read();
+        let Some(progress) = guard.as_ref() else {
+            return;
+        };
+        if progress.aborted.load(Ordering::Relaxed) {
+            return;
+        }
+        let row_size = self.desc.row_size as usize;
+        for (offset, buf) in ops {
+            let _ = self.for_each_segment(*offset, buf.len(), |row, set, off_in_c, range| {
+                let set_idx = row * row_size + set;
+                if let Some(sr) = progress
+                    .targets_by_set
+                    .get(set_idx)
+                    .and_then(|o| o.as_ref())
+                {
+                    let strip_n = off_in_c / self.strip_bytes;
+                    if strip_n < sr.cursor.load(Ordering::Acquire) {
+                        for shadow in &sr.shadows {
+                            if let Err(e) = shadow.pd.write_chunklet_user(
+                                shadow.chunklet_index,
+                                off_in_c,
+                                &buf[range.clone()],
+                            ) {
+                                tracing::error!(
+                                    "online rebuild (mirror): shadow write-forward failed (set {} pos {}): {} — aborting",
+                                    set_idx, shadow.pos_in_set, e
+                                );
+                                progress.aborted.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
     }
 
     fn ensure_aligned(&self, offset: u64, len: usize) -> ChunkletResult<()> {
@@ -344,6 +398,23 @@ impl LdMirror {
     }
 }
 
+impl ReconstructEngine for LdMirror {
+    fn strip_bytes(&self) -> u64 {
+        self.strip_bytes
+    }
+    fn stripes_per_chunklet(&self) -> u64 {
+        LdMirror::stripes_per_chunklet(self)
+    }
+    fn reconstruct_member_strip(
+        &self,
+        failed_member_idx: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        LdMirror::reconstruct_member_strip(self, failed_member_idx, in_chunklet_off, out)
+    }
+}
+
 impl LogicalDisk for LdMirror {
     fn id(&self) -> LdId {
         self.desc.id
@@ -391,7 +462,9 @@ impl LogicalDisk for LdMirror {
         // whole write to every live copy in one cross-PD submit.
         let (writes, stripe_keys) = self.collect_strip_writes(&[(offset, buf)])?;
         let _guards = self.stripe_locks.write_keys(&stripe_keys);
-        parallel_strip_writes(writes)
+        parallel_strip_writes(writes)?;
+        self.write_forward(&[(offset, buf)]);
+        Ok(())
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
@@ -412,6 +485,9 @@ impl LogicalDisk for LdMirror {
         }
         let stripe_guards = self.stripe_locks.write_keys(&stripe_keys);
         let result = parallel_strip_writes(writes);
+        if result.is_ok() {
+            self.write_forward(ops);
+        }
         drop(stripe_guards);
         result
     }

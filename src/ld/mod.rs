@@ -55,6 +55,21 @@ pub fn healthy_pd_map(
         .collect()
 }
 
+/// Minimal per-member reconstruct surface the online-rebuild Phase B backfill
+/// needs, so it can drive Mirror / Raid5 / Raid6 through one generic loop
+/// (`Box<dyn ReconstructEngine>`). Each redundant LD already has these inherent
+/// methods; the impls just delegate.
+pub(crate) trait ReconstructEngine: Send + Sync {
+    fn strip_bytes(&self) -> u64;
+    fn stripes_per_chunklet(&self) -> u64;
+    fn reconstruct_member_strip(
+        &self,
+        failed_member_idx: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()>;
+}
+
 /// Public interface every LD implementation exposes.
 pub trait LogicalDisk: Send + Sync {
     fn id(&self) -> LdId;

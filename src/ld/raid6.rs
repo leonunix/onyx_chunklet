@@ -72,7 +72,7 @@ use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256;
 use crate::ld::{
     compute_strip_bytes, parallel_strip_reads, parallel_strip_writes, resolve_members, LogicalDisk,
-    StripRead, StripWrite, StripeLockTable,
+    ReconstructEngine, StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::pool::{new_rebuild_cell, PdHealth, RebuildCell};
@@ -654,6 +654,23 @@ struct StripeAddr {
     data_pos: usize,
     in_strip_off: u64,
     in_chunklet_off: u64,
+}
+
+impl ReconstructEngine for LdRaid6 {
+    fn strip_bytes(&self) -> u64 {
+        self.strip_bytes
+    }
+    fn stripes_per_chunklet(&self) -> u64 {
+        LdRaid6::stripes_per_chunklet(self)
+    }
+    fn reconstruct_member_strip(
+        &self,
+        failed_member_idx: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        LdRaid6::reconstruct_member_strip(self, failed_member_idx, in_chunklet_off, out)
+    }
 }
 
 impl LogicalDisk for LdRaid6 {

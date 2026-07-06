@@ -403,3 +403,100 @@ fn raid6_online_rebuild_concurrent_writes_preserve_data() {
         );
     }
 }
+
+/// Shared driver: fail the PD holding member `fail_member_idx`, run an online
+/// rebuild on one thread while another hammers a fixed block set with changing
+/// values, then assert every block reads back its last concurrent write. Proves
+/// the write-forward + cursor for whichever RAID level `spec` selects.
+fn run_online_rebuild_concurrent(
+    n_pds: usize,
+    spec: LdSpec,
+    fail_member_idx: usize,
+    expect_rebuilt: usize,
+) {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, n_pds);
+    let id = pool.create_ld(spec).unwrap();
+
+    let ld = pool.open_ld(id).unwrap();
+    let cap = ld.capacity_bytes();
+    let block = 4096u64;
+    let n_off = 96usize;
+    let stride = ((cap / block / n_off as u64).max(1)) * block;
+    let offsets: Vec<u64> = (0..n_off as u64).map(|i| i * stride).collect();
+    for &off in &offsets {
+        ld.write_at(off, &pattern(0, block as usize, off)).unwrap();
+    }
+    ld.flush().unwrap();
+    drop(ld);
+
+    let drop0 = path_for_member(&pool, &paths, fail_member_idx);
+    drop(pool);
+    let pool = open_subset(&paths, &[drop0]);
+
+    let rebuild_done = Arc::new(AtomicBool::new(false));
+    let pool_r = pool.clone();
+    let done_r = rebuild_done.clone();
+    let rebuild_thread = std::thread::spawn(move || {
+        let report = pool_r.rebuild_ld(id).unwrap();
+        done_r.store(true, Ordering::Release);
+        report
+    });
+
+    let mut expected: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut ld = pool.open_ld(id).unwrap();
+    let mut counter: u64 = 1;
+    while !rebuild_done.load(Ordering::Acquire) {
+        for &off in &offsets {
+            let val = pattern(counter, block as usize, off);
+            counter += 1;
+            match ld.write_at(off, &val) {
+                Ok(()) => {
+                    expected.insert(off, val);
+                }
+                Err(_) => {
+                    ld = pool.open_ld(id).unwrap();
+                    ld.write_at(off, &val).unwrap();
+                    expected.insert(off, val);
+                }
+            }
+        }
+    }
+    let report = rebuild_thread.join().unwrap();
+    assert!(!report.skipped, "rebuild ran");
+    assert_eq!(report.rebuilt_members, expect_rebuilt, "rebuilt member count");
+
+    let ld = pool.open_ld(id).unwrap();
+    for &off in &offsets {
+        let mut got = vec![0u8; block as usize];
+        ld.read_at(off, &mut got).unwrap();
+        assert_eq!(
+            got, expected[&off],
+            "block at offset {} lost its last concurrent write across the online rebuild",
+            off
+        );
+    }
+}
+
+/// Mirror (RAID10) online rebuild under concurrent writes — exercises the
+/// write-forward added to `LdMirror::collect_strip_writes`. LV2 + metadb are
+/// RAID10, so this is the level that matters for onyx's failover.
+#[test]
+#[ignore = "fault-injection: online rebuild backfills a full 1 GiB chunklet"]
+fn mirror_online_rebuild_concurrent_writes_preserve_data() {
+    // 3-way mirror, single set; fail one copy, rebuild onto a live outside PD.
+    run_online_rebuild_concurrent(8, LdSpec::mirror(3, 1, 1, 0), 0, 1);
+}
+
+/// RAID5 online rebuild under concurrent writes — exercises the R5 write-forward
+/// + the RW-path failed-parity fix (rebuilding a data member keeps the set on
+/// the RW path, which now tolerates + write-forwards correctly).
+#[test]
+#[ignore = "fault-injection: online rebuild backfills a full 1 GiB chunklet"]
+fn raid5_online_rebuild_concurrent_writes_preserve_data() {
+    // raid5(3) = 3 data + P; fail one data member, rebuild onto an outside PD.
+    run_online_rebuild_concurrent(8, LdSpec::raid5(3, 1, 1, 0), 0, 1);
+}

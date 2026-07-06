@@ -49,7 +49,7 @@ use crate::ld::descriptor::LdList;
 use crate::ld::StripeLockTable;
 use crate::pd::{PdInfo, PhysicalDisk};
 use crate::superblock::PoolPdEntry;
-use crate::types::{LdId, LdRole, PdId, PoolId};
+use crate::types::{LdId, PdId, PoolId};
 
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -134,7 +134,6 @@ pub(crate) struct SetRebuild {
 pub(crate) struct ShadowTarget {
     /// Member position within the set (`0..set_size`).
     pub pos_in_set: usize,
-    pub role: LdRole,
     pub pd: Arc<PhysicalDisk>,
     pub chunklet_index: u32,
 }

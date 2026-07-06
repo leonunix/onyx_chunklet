@@ -357,11 +357,13 @@ impl Pool {
                 Arc::new(plain)
             }
             RaidLevel::Mirror => {
-                let mirror = LdMirror::open_with_health(desc, &s.pds, &s.pd_health)?;
+                let mut mirror = LdMirror::open_with_health(desc, &s.pds, &s.pd_health)?;
+                mirror.attach_shared(runtime.stripe_locks.clone(), runtime.rebuild.clone());
                 Arc::new(mirror)
             }
             RaidLevel::Raid5 => {
-                let raid5 = LdRaid5::open_with_health(desc, &s.pds, &s.pd_health)?;
+                let mut raid5 = LdRaid5::open_with_health(desc, &s.pds, &s.pd_health)?;
+                raid5.attach_shared(runtime.stripe_locks.clone(), runtime.rebuild.clone());
                 Arc::new(raid5)
             }
             RaidLevel::Raid0 => {
