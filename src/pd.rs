@@ -426,6 +426,22 @@ impl PhysicalDisk {
         self.raw.sync()
     }
 
+    /// Cheap liveness probe: a single aligned read of the head superblock
+    /// region via the raw device. Returns `true` if the read syscall
+    /// succeeds (the device answers IO), `false` on any IO error (disk
+    /// pulled → EIO / ENODEV). Deliberately does NOT decode or CRC-check
+    /// the bytes — a torn slot mid-`commit_manifest` still counts as alive;
+    /// the only question is whether the device responds. Lock-free
+    /// (`RawDevice` IO takes no PD lock), so a health watchdog can poll it
+    /// concurrently with normal IO. O_DIRECT means a pulled disk fails here
+    /// instead of being masked by the page cache.
+    pub fn probe_liveness(&self) -> bool {
+        match AlignedBuf::new(BLOCK_SIZE as usize) {
+            Ok(mut buf) => self.raw.read_at(buf.as_mut_slice(), 0).is_ok(),
+            Err(_) => false,
+        }
+    }
+
     fn bind_current_to_local_node(&self) {
         crate::numa::bind_current_to_node(*self.numa_node.read());
     }
@@ -670,6 +686,26 @@ mod tests {
         assert_eq!(pd2.manifest_gen(), 5);
         let (_, bitmap, _) = pd2.snapshot();
         assert_eq!(bitmap.get(0).unwrap(), ChunkletState::Used);
+    }
+
+    #[test]
+    fn probe_liveness_true_on_healthy_pd() {
+        let dir = TempDir::new().unwrap();
+        let raw = sparse_pd(&dir, "pd0", TEST_PD_SIZE);
+        let pd = PhysicalDisk::init(
+            raw,
+            PoolId::new_v4(),
+            PdId::new_v4(),
+            0,
+            1,
+            vec![],
+            0,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        // A backing file that answers reads is "alive".
+        assert!(pd.probe_liveness());
     }
 
     #[test]

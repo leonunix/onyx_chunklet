@@ -233,8 +233,8 @@ impl Pool {
             .iter()
             .map(|(_, runtime)| runtime.io_lock.write())
             .collect::<Vec<_>>();
-        for pd in pds.values() {
-            pd.commit_manifest(|body, _bitmap| {
+        for (id, pd) in pds.iter() {
+            let res = pd.commit_manifest(|body, _bitmap| {
                 let entry = body
                     .pd_list
                     .iter_mut()
@@ -248,7 +248,26 @@ impl Pool {
                     entry.flags &= !pool_pd_flags::FAILED;
                 }
                 Ok(())
-            })?;
+            });
+            // When *failing* a PD, the target's own device may be physically
+            // gone (disk pulled) — its superblock write EIOs. The FAILED flag
+            // recorded on the SURVIVING PDs is the authoritative record a later
+            // `open`/`open_with_missing` reads, so tolerate the target's own
+            // commit failing and keep going. Any OTHER PD failing to commit is
+            // a real cross-PD error we must surface. Clearing a failed mark
+            // (`failed == false`) still requires every commit to land.
+            if let Err(e) = res {
+                if failed && *id == pd_id {
+                    tracing::warn!(
+                        "mark_pd_failed: commit to target PD {} failed ({}); \
+                         relying on surviving PDs' FAILED flag",
+                        pd_id,
+                        e
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
         }
         self.state.write().pd_health.insert(
             pd_id,

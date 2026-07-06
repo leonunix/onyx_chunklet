@@ -494,6 +494,21 @@ impl Pool {
         self.state.read().pd_health.get(&id).copied()
     }
 
+    /// Probe whether a live PD is still answering IO. `None` if `pd_id` has no
+    /// live handle in the pool (already gone → treat as dead by the caller);
+    /// `Some(true)` if its device answers a superblock read, `Some(false)` on
+    /// IO error. This is the detection primitive for an external health
+    /// watchdog (onyx) that decides when to `mark_pd_failed` — chunklet itself
+    /// runs no background probe thread (its own recovery model is the external
+    /// `run_recovery_cycle` re-open loop).
+    pub fn probe_pd_liveness(&self, pd_id: PdId) -> Option<bool> {
+        self.state
+            .read()
+            .pds
+            .get(&pd_id)
+            .map(|pd| pd.probe_liveness())
+    }
+
     /// Returns IDs of all PDs marked as Failed. Empty for a fully healthy pool.
     pub fn failed_pds(&self) -> Vec<PdId> {
         self.state
@@ -966,6 +981,36 @@ mod tests {
         let paths = collect_paths(&dir, &["pd0", "pd1", "pd2"]);
         let pool2 = Pool::open(open_paths(&paths).unwrap()).unwrap();
         assert_eq!(pool2.pd_count(), 3);
+    }
+
+    #[test]
+    fn probe_and_mark_pd_failed_flow() {
+        let dir = TempDir::new().unwrap();
+        let pool = Pool::create(
+            vec![sparse(&dir, "pd0"), sparse(&dir, "pd1")],
+            PoolConfig::default(),
+        )
+        .unwrap();
+        let ids: Vec<PdId> = pool.list_pds().iter().map(|i| i.pd_id).collect();
+
+        // Healthy PDs answer the liveness probe; an unknown id is None.
+        assert_eq!(pool.probe_pd_liveness(ids[0]), Some(true));
+        assert_eq!(pool.probe_pd_liveness(ids[1]), Some(true));
+        assert_eq!(pool.probe_pd_liveness(PdId::new_v4()), None);
+
+        // Mark pd0 failed: in-memory health flips and the surviving pd1's
+        // manifest carries the FAILED flag for pd0.
+        pool.mark_pd_failed(ids[0]).unwrap();
+        assert_eq!(pool.pd_health(ids[0]), Some(PdHealth::Failed));
+        assert_eq!(pool.failed_pds(), vec![ids[0]]);
+        let pd1 = pool.pd(ids[1]).unwrap();
+        let (body, _, _) = pd1.snapshot();
+        let entry = body
+            .pd_list
+            .iter()
+            .find(|e| e.pd_id == ids[0])
+            .expect("pd0 in pd1's pd_list");
+        assert!(entry.flags & crate::superblock::pool_pd_flags::FAILED != 0);
     }
 
     #[test]
