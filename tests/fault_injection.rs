@@ -16,7 +16,7 @@ use onyx_chunklet::types::ChunkletState;
 use tempfile::TempDir;
 
 use common::fault::FaultInjectingBackend;
-use common::make_pool;
+use common::{make_pool, open_subset, path_for_member, pattern};
 
 /// Mirror write where one of N copies fails mid-batch must:
 /// - Surface the error to the caller (so the upper layer knows to retry
@@ -226,4 +226,88 @@ fn raid5_full_stripe_fault_on_parity_pd_detected_by_scrub() {
         !report.mismatches.is_empty(),
         "scrub must detect parity mismatch after parity-write fault"
     );
+}
+
+/// R6 full-stripe write where the Q-parity PD's submit fails. The Anvin
+/// incremental Q is a distinct code path from P (`g^i` GF(2⁸) weighting), so a
+/// fault landing on Q — the LAST member of a raid6 set — must be surfaced to
+/// the caller and later caught by scrub, exactly like the R5 P-parity case.
+#[test]
+#[ignore = "fault-injection: installs a test backend on a live PD"]
+fn raid6_full_stripe_fault_on_q_parity_detected_by_scrub() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5); // raid6(3) = 3 data + P + Q = 5 members
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+
+    // Known baseline (4 full stripes; raid6(3) full stripe = 3 * 4096).
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &vec![0x00u8; 12 * 4096]).unwrap();
+    drop(ld);
+
+    // members = [data0, data1, data2, ParityP, ParityQ]; Q is the last.
+    let desc = pool.find_ld(id).unwrap();
+    let q_pd = desc.members[4].pd;
+    let q_pd_handle = pool.pd(q_pd).unwrap();
+    let injector = Arc::new(FaultInjectingBackend::new(q_pd_handle.backend(), q_pd, 0));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
+    }
+
+    let ld = pool.open_ld(id).unwrap();
+    let err = ld.write_at(0, &vec![0x88u8; 12 * 4096]).err();
+    assert!(err.is_some(), "R6 full-stripe write must surface the Q fault");
+    assert!(injector.failed_count() >= 1);
+
+    // Heal, then scrub: stale Q vs recomputed Q is a mismatch.
+    let healthy = onyx_chunklet::io::make_backend(onyx_chunklet::io::IoBackendKind::Sync);
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(healthy.clone());
+    }
+    let report = pool.scrub_ld(id).unwrap();
+    assert!(
+        !report.mismatches.is_empty(),
+        "scrub must detect Q-parity mismatch after Q-write fault"
+    );
+}
+
+/// R6 double-PD failure → `rebuild_ld` reconstructs BOTH lost members onto
+/// spares and restores the data bit-for-bit. This is the headline R6 recovery
+/// path — 2-missing PQ reconstruction driven through the rebuild orchestration
+/// (allocate replacements outside the surviving set → reconstruct → commit),
+/// not just the in-place degraded-read reconstruct that `ld_raid6.rs` covers.
+///
+/// 8 PDs so the 6-member set leaves 2 live non-member PDs to rebuild onto after
+/// 2 member PDs are lost (6 survivors ≥ quorum 5).
+#[test]
+#[ignore = "fault-injection: rebuild reconstructs a 1 GiB chunklet per member"]
+fn raid6_double_pd_fail_rebuild_to_spare_restores_data() {
+    let dir = TempDir::new().unwrap();
+    let (pool, paths) = make_pool(&dir, 8);
+    let id = pool.create_ld(LdSpec::raid6(4, 1, 1, 0)).unwrap();
+
+    // 4 full stripes (raid6(4) full stripe = 4 data strips * 4096 = 16 KiB).
+    let span = 4 * 4 * 4096;
+    let expected = pattern(0x6a, span, 0);
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &expected).unwrap();
+    drop(ld);
+
+    // Kill two DATA member PDs (positions 0 and 1) by reopening without them.
+    let drop0 = path_for_member(&pool, &paths, 0);
+    let drop1 = path_for_member(&pool, &paths, 1);
+    assert_ne!(drop0, drop1);
+    drop(pool);
+    let pool = open_subset(&paths, &[drop0, drop1]);
+
+    // Both lost members reconstructed onto fresh chunklets on live non-set PDs.
+    let report = pool.rebuild_ld(id).unwrap();
+    assert!(!report.skipped, "rebuild must run with two failed members");
+    assert_eq!(report.rebuilt_members, 2, "both R6 members rebuilt");
+
+    // The LD is whole again (all 6 members on live PDs) → healthy read returns
+    // the original bytes, proving the PQ reconstruction was correct.
+    let ld = pool.open_ld(id).unwrap();
+    let mut got = vec![0u8; span];
+    ld.read_at(0, &mut got).unwrap();
+    assert_eq!(got, expected, "rebuilt R6 data matches the original");
 }
