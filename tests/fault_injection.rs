@@ -948,3 +948,136 @@ fn raid6_partial_write_read_eio_recomputes_via_rw() {
         .expect("reconstruct via P/Q after RW recompute");
     assert_eq!(rc, new0, "P/Q consistent with the RW-recomputed stripe");
 }
+
+/// RAID6 RW that must READ an UNMODIFIED data position whose member is faulting
+/// at runtime but not yet isolated (still `is_some`). With strip == block, a
+/// flusher write that covers only some positions leaves the rest unmodified; RW
+/// reads those to recompute parity. Before the fix that read surfaced the EIO
+/// (the 7 flush errors on a box disk-pull); now RW reconstructs the unmodified
+/// position from P + surviving data (md "compute, don't read a faulty device")
+/// within R6's budget of 2. Verifies the write completes, the unmodified strip
+/// is preserved, parity is consistent, and the member is suspected.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid6_rw_faulting_unmodified_member_reconstructs() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 6);
+    let id = pool.create_ld(LdSpec::raid6(4, 1, 1, 0)).unwrap(); // 4 data + P + Q
+    let ld = pool.open_ld(id).unwrap();
+    let base = pattern(60, 4 * 4096, 0);
+    ld.write_at(0, &base).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let data0 = desc.members[0].pd; // data position 0 — left UNMODIFIED below
+    pool.pd(data0).unwrap().set_read_faulting(true);
+
+    // Modify positions 1,2,3 full-strip (offset 4096, len 12288) → RW (rw_reads
+    // 1 < pdw_reads 5). RW reads the unmodified position 0 to recompute parity —
+    // that read faults on the still-is_some member → reconstruct from P + others.
+    let ld = pool.open_ld(id).unwrap();
+    let new = pattern(61, 3 * 4096, 0);
+    ld.write_at(4096, &new)
+        .expect("R6 RW reconstructs a faulting UNMODIFIED position instead of surfacing EIO");
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("the faulting member is reported as a suspect");
+    assert_eq!(ev.pd_id, data0);
+    drop(ld);
+
+    // Read-back (fault cleared): position 0 unchanged, positions 1..3 new.
+    pool.pd(data0).unwrap().set_read_faulting(false);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rb = vec![0u8; 4 * 4096];
+    ld.read_at(0, &mut rb).unwrap();
+    assert_eq!(&rb[..4096], &base[..4096], "unmodified position 0 preserved");
+    assert_eq!(&rb[4096..], &new[..], "positions 1..3 durable with new data");
+    drop(ld);
+
+    // Parity consistency: re-fault data0 → degraded read reconstructs position 0's
+    // OLD value, proving RW recomputed P/Q from the reconstructed strip.
+    pool.pd(data0).unwrap().set_read_faulting(true);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rc = vec![0u8; 4096];
+    ld.read_at(0, &mut rc)
+        .expect("reconstruct position 0 via P/Q after RW");
+    assert_eq!(rc, base[..4096], "parity consistent with the RW-recomputed stripe");
+}
+
+/// RAID5 RW that must READ an UNMODIFIED data position on the still-`is_some`
+/// faulting member: the inline reconstruct fallback rebuilds it from parity +
+/// survivors within R5's budget of 1 rather than surfacing the EIO.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid5_rw_faulting_unmodified_member_reconstructs() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid5(4, 1, 1, 0)).unwrap(); // 4 data + parity
+    let ld = pool.open_ld(id).unwrap();
+    let base = pattern(62, 4 * 4096, 0);
+    ld.write_at(0, &base).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let data0 = desc.members[0].pd; // position 0 — left UNMODIFIED below
+    pool.pd(data0).unwrap().set_read_faulting(true);
+
+    // Modify positions 1,2,3 full-strip → RW ((k-m)=1 < (m+1)=4). RW reads the
+    // unmodified position 0 → faults → inline reconstruct from parity + survivors.
+    let ld = pool.open_ld(id).unwrap();
+    let new = pattern(63, 3 * 4096, 0);
+    ld.write_at(4096, &new)
+        .expect("R5 RW reconstructs a faulting UNMODIFIED position instead of surfacing EIO");
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("the faulting member is reported as a suspect");
+    assert_eq!(ev.pd_id, data0);
+    drop(ld);
+
+    pool.pd(data0).unwrap().set_read_faulting(false);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rb = vec![0u8; 4 * 4096];
+    ld.read_at(0, &mut rb).unwrap();
+    assert_eq!(&rb[..4096], &base[..4096], "unmodified position 0 preserved");
+    assert_eq!(&rb[4096..], &new[..], "positions 1..3 durable with new data");
+    drop(ld);
+
+    // Parity consistency: re-fault data0 → reconstruct returns position 0's old value.
+    pool.pd(data0).unwrap().set_read_faulting(true);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rc = vec![0u8; 4096];
+    ld.read_at(0, &mut rc)
+        .expect("reconstruct position 0 via parity after RW");
+    assert_eq!(rc, base[..4096], "parity consistent with the RW-recomputed stripe");
+}
+
+/// RAID5 RW with TWO data members faulting reads = a 2-member loss in a set that
+/// tolerates 1: RW's inline reconstruct of the first faulting position must READ
+/// the second faulting member, which faults → the write surfaces an error rather
+/// than writing a stripe built from wrong data.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid5_rw_two_faulting_members_over_budget_errors() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid5(4, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &pattern(64, 4 * 4096, 0)).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    pool.pd(desc.members[0].pd).unwrap().set_read_faulting(true); // data 0
+    pool.pd(desc.members[1].pd).unwrap().set_read_faulting(true); // data 1
+
+    // Full-strip modify of positions 2 and 3 → RW (2 full mods: rw_reads 2 <
+    // pdw_reads 4). RW reads the unmodified positions 0 and 1 — both faulting →
+    // reconstruct of pos 0 must read pos 1 (also faulting) → over budget → error.
+    let ld = pool.open_ld(id).unwrap();
+    let new = pattern(65, 2 * 4096, 0);
+    assert!(
+        ld.write_at(2 * 4096, &new).is_err(),
+        "two faulting data members ⇒ over R5 budget 1 ⇒ write must error (no wrong data)"
+    );
+}

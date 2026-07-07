@@ -296,7 +296,21 @@ impl LdRaid5 {
                         if pd_failed {
                             self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
                         } else {
-                            self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos])?;
+                            match self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos]) {
+                                Ok(()) => {}
+                                Err(e) if is_runtime_read_fault(&e) => {
+                                    // Old strip on a still-is_some member that is faulting at runtime.
+                                    // Reconstruct from parity + survivors (md "compute, don't read a
+                                    // faulty device") within R5's budget of 1; a pre-existing is_none
+                                    // loss makes this a 2nd loss → over budget → surface the error.
+                                    if !self.failed_data_positions(set_idx).is_empty() {
+                                        return Err(e);
+                                    }
+                                    self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
+                                    self.report_read_suspect(self.member_idx_data(set_idx, pos));
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
                         new_strips[pos][off..off + len].copy_from_slice(new_data);
                     }
@@ -305,7 +319,17 @@ impl LdRaid5 {
                     if pd_failed {
                         self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
                     } else {
-                        self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos])?;
+                        match self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos]) {
+                            Ok(()) => {}
+                            Err(e) if is_runtime_read_fault(&e) => {
+                                if !self.failed_data_positions(set_idx).is_empty() {
+                                    return Err(e);
+                                }
+                                self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
+                                self.report_read_suspect(self.member_idx_data(set_idx, pos));
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
             }

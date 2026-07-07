@@ -347,6 +347,10 @@ impl LdRaid6 {
         let mut new_strips: Vec<Vec<u8>> = (0..k).map(|_| vec![0u8; strip]).collect();
         let mut copy_after_reads: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
         let mut read_ops: Vec<StripRead> = Vec::with_capacity(k);
+        // (set_idx, data_pos) aligned to `read_ops`, so a runtime read fault can
+        // be reconstructed by position via `reconstruct_read_batch` instead of
+        // surfacing the EIO (md "compute, don't read a faulty device").
+        let mut read_ctxs: Vec<(usize, usize)> = Vec::with_capacity(k);
         for (pos, strip_buf) in new_strips.iter_mut().enumerate() {
             let pd_failed = self.members[self.member_idx_data(set_idx, pos)].is_none();
             match modified_map.get(&pos) {
@@ -371,6 +375,7 @@ impl LdRaid6 {
                                 in_chunklet_off: strip_base,
                                 data: strip_buf,
                             });
+                            read_ctxs.push((set_idx, pos));
                             copy_after_reads.push((pos, off, range.clone()));
                         }
                     }
@@ -389,11 +394,23 @@ impl LdRaid6 {
                             in_chunklet_off: strip_base,
                             data: strip_buf,
                         });
+                        read_ctxs.push((set_idx, pos));
                     }
                 }
             }
         }
-        parallel_strip_reads(&mut read_ops)?;
+        // A direct base-strip read hit a member that is faulting at runtime but
+        // not yet isolated (still `is_some`). Reconstruct the faulting position(s)
+        // from survivors within R6's budget of 2 — never surface the EIO for a
+        // recoverable stripe. Same held stripe lock; reconstruct reads survivors
+        // directly (no stripe lock) so there is no re-lock/deadlock.
+        match parallel_strip_reads(&mut read_ops) {
+            Ok(()) => {}
+            Err(e) if is_runtime_read_fault(&e) => {
+                self.reconstruct_read_batch(&mut read_ops, &read_ctxs)?
+            }
+            Err(e) => return Err(e),
+        }
         drop(read_ops);
         for (pos, off, range) in copy_after_reads {
             let new_data = &buf[range];
