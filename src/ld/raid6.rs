@@ -67,12 +67,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crossbeam_channel::Sender;
+
 use crate::error::{ChunkletError, ChunkletResult};
+use crate::ld::degrade::{absorb_degraded, SuspectMember};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256;
 use crate::ld::{
-    compute_strip_bytes, parallel_strip_reads, parallel_strip_writes, resolve_members, LogicalDisk,
-    ReconstructEngine, StripRead, StripWrite, StripeLockTable,
+    compute_strip_bytes, parallel_strip_reads, resolve_members, submit_strip_writes_detailed,
+    LogicalDisk, ReconstructEngine, StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::pool::{new_rebuild_cell, PdHealth, RebuildCell};
@@ -99,6 +102,10 @@ pub struct LdRaid6 {
     /// Foreground writes consult it to write-forward reconstructed strips to
     /// the shadow spare for stripes below the set cursor.
     rebuild: RebuildCell,
+    /// Fast-isolation channel (shared via `attach_shared`; `None` for a bare
+    /// handle). An inline-degraded write (F ≤ 2 members failed at runtime) sends
+    /// the failed member(s) here so onyx isolates + rebuilds them fast.
+    suspect_tx: Option<Sender<SuspectMember>>,
 }
 
 impl LdRaid6 {
@@ -190,6 +197,7 @@ impl LdRaid6 {
             full_stripe_bytes,
             stripe_locks: Arc::new(StripeLockTable::new()),
             rebuild: new_rebuild_cell(),
+            suspect_tx: None,
         })
     }
 
@@ -198,12 +206,45 @@ impl LdRaid6 {
     }
 
     /// Install the shared stripe-lock table + rebuild cell from `LdRuntime`
-    /// (called by `open_ld`). Handles built for tests / the rebuild worker's
-    /// reconstruct engine skip this and keep their private table + empty cell,
-    /// so they never write-forward and lock only within themselves.
-    pub(crate) fn attach_shared(&mut self, stripe_locks: Arc<StripeLockTable>, rebuild: RebuildCell) {
+    /// (called by `open_ld`), plus the pool's fast-isolation sender. Handles
+    /// built for tests / the rebuild worker's reconstruct engine skip this and
+    /// keep their private table + empty cell, so they never write-forward and
+    /// lock only within themselves.
+    pub(crate) fn attach_shared(
+        &mut self,
+        stripe_locks: Arc<StripeLockTable>,
+        rebuild: RebuildCell,
+        suspect_tx: Sender<SuspectMember>,
+    ) {
         self.stripe_locks = stripe_locks;
         self.rebuild = rebuild;
+        self.suspect_tx = Some(suspect_tx);
+    }
+
+    /// Best-effort report of members that failed a write but were absorbed by
+    /// surviving parity/data, so onyx's reactor isolates them fast. Ignored when
+    /// no channel is attached (bare handle) or the reactor is gone.
+    fn report_suspects(&self, suspects: Vec<SuspectMember>) {
+        if let Some(tx) = &self.suspect_tx {
+            for s in suspects {
+                let _ = tx.try_send(s);
+            }
+        }
+    }
+
+    /// Submit ONE set's strip writes with inline-degrade. All backends
+    /// submit-and-wait every leg, so the surviving members are durable on
+    /// return; absorb up to `max_fail` runtime member failures (`2 −
+    /// open_time_failures` for the set — any ≤budget missing member reconstructs
+    /// to the correct new value from the parity that DID land), report the
+    /// failed members for fast isolation, and surface an error only when the set
+    /// exceeded its budget (genuine data loss).
+    fn submit_set_absorb(&self, ops: Vec<StripWrite<'_>>, max_fail: u32) -> ChunkletResult<()> {
+        let results = submit_strip_writes_detailed(&ops);
+        let group_of = vec![0u32; ops.len()];
+        let suspects = absorb_degraded(&ops, &results, &group_of, &[max_fail])?;
+        self.report_suspects(suspects);
+        Ok(())
     }
 
     /// True iff an online rebuild is currently backfilling `set_idx`.
@@ -828,12 +869,17 @@ impl LdRaid6 {
             .stripe_locks
             .write_key(self.stripe_key(start.set_idx, strip_base));
 
+        // Runtime member-failure budget for this set: R6 tolerates 2 total, and
+        // `f_total` are already lost at open (excluded from `ops`), so up to
+        // `2 - f_total` MORE members may fail this write and still reconstruct.
+        let budget = 2u32 - f_total as u32;
+
         let is_full_stripe = positions.len() == k
             && positions
                 .iter()
                 .all(|(_p, off, range)| *off == 0 && (range.end - range.start) as u64 == strip);
         if is_full_stripe {
-            return self.write_full_stripe(start.set_idx, strip_base, &positions, buf);
+            return self.write_full_stripe(start.set_idx, strip_base, &positions, buf, budget);
         }
 
         if f_data == 0 && p_failed && q_failed && !self.set_being_rebuilt(start.set_idx) {
@@ -841,7 +887,7 @@ impl LdRaid6 {
             // An online rebuild targeting a parity needs P/Q computed so it can
             // write-forward to the shadow, so a rebuilding set falls through to
             // RW (which computes both parities) instead of this fast path.
-            return self.write_data_only(start.set_idx, strip_base, &positions, buf);
+            return self.write_data_only(start.set_idx, strip_base, &positions, buf, budget);
         }
 
         let healthy = f_data == 0 && !p_failed && !q_failed;
@@ -853,14 +899,14 @@ impl LdRaid6 {
             let pdw_reads = parity_delta_read_cost(&positions);
             let rw_reads = reconstruct_write_read_cost(k, strip, &positions);
             if rw_reads < pdw_reads {
-                self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
+                self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf, budget)
             } else {
-                self.write_partial_stripe_pdw(start.set_idx, strip_base, &positions, buf)
+                self.write_partial_stripe_pdw(start.set_idx, strip_base, &positions, buf, budget)
             }
         } else {
             // Any failure: unified RW handles all sub-cases (single
             // surviving parity, single missing data, two missing data).
-            self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
+            self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf, budget)
         }
     }
 
@@ -876,6 +922,7 @@ impl LdRaid6 {
         strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
+        budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
         let mut p = vec![0u8; strip];
@@ -916,7 +963,7 @@ impl LdRaid6 {
                 data: &q,
             });
         }
-        parallel_strip_writes(ops)?;
+        self.submit_set_absorb(ops, budget)?;
         // Mirror to online-rebuild shadow(s) below the cursor: full-stripe gives
         // each data pos its slice of `buf`; P/Q are the strips just computed.
         let strip = self.strip_bytes as usize;
@@ -940,6 +987,7 @@ impl LdRaid6 {
         strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
+        budget: u32,
     ) -> ChunkletResult<()> {
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len());
         for (pos, off, range) in positions {
@@ -954,7 +1002,10 @@ impl LdRaid6 {
                 data: &buf[range.clone()],
             });
         }
-        parallel_strip_writes(ops)
+        // budget is 0 here (both parities already failed ⇒ f_total == 2), so ANY
+        // runtime data-strip EIO surfaces as an error — correct, the set is at
+        // its redundancy limit and a lost data strip is unrecoverable.
+        self.submit_set_absorb(ops, budget)
     }
 
     /// Parity-delta write: per touched data position compute deltas for P
@@ -969,6 +1020,7 @@ impl LdRaid6 {
         strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
+        budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
         let mut delta_p = vec![0u8; strip];
@@ -1057,7 +1109,9 @@ impl LdRaid6 {
             in_chunklet_off: strip_base,
             data: &q,
         });
-        parallel_strip_writes(ops)
+        // Healthy-set path (budget 2): the new P/Q reflect the new data, so a
+        // ≤2-member EIO here still reconstructs the modified data on read.
+        self.submit_set_absorb(ops, budget)
     }
 
     /// Reconstruct-write: build full new strips for every data position
@@ -1078,6 +1132,7 @@ impl LdRaid6 {
         strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
+        budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
         let k = self.data_per_set;
@@ -1180,7 +1235,7 @@ impl LdRaid6 {
                 data: &q,
             });
         }
-        parallel_strip_writes(ops)?;
+        self.submit_set_absorb(ops, budget)?;
         // Mirror to online-rebuild shadow(s) below the cursor. RW built the full
         // new strip for every data position plus P and Q.
         self.write_forward(set_idx, strip_base, |pos| {
@@ -1419,12 +1474,22 @@ impl LdRaid6 {
             self.r6_compute(seg);
         }
 
-        // Phase 3: one batched write submit for all data + parity strips.
+        // Phase 3: one batched write submit for all data + parity strips, with
+        // inline-degrade. Every segment here is HEALTHY (degraded sets bailed to
+        // the serial `write_at` above), so each is its own redundancy group with
+        // a budget of 2 runtime member failures.
         let mut writes: Vec<StripWrite> = Vec::new();
-        for seg in segs.iter() {
+        let mut group_of: Vec<u32> = Vec::new();
+        for (gi, seg) in segs.iter().enumerate() {
             self.r6_collect_writes(seg, &mut writes);
+            // Tag every op this seg just appended with the seg's group index.
+            group_of.resize(writes.len(), gi as u32);
         }
-        parallel_strip_writes(writes)
+        let max_fail = vec![2u32; segs.len()];
+        let results = submit_strip_writes_detailed(&writes);
+        let suspects = absorb_degraded(&writes, &results, &group_of, &max_fail)?;
+        self.report_suspects(suspects);
+        Ok(())
     }
 
     /// Append `seg`'s RMW reads (into its owned scratch) to the shared batch.

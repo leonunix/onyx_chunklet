@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use onyx_chunklet::error::ChunkletError;
+use onyx_chunklet::error::{ChunkletError, ChunkletResult};
 use onyx_chunklet::io::{IoBackend, RawDevice, StripRead, StripWrite};
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
@@ -71,8 +71,8 @@ impl IoBackend for CountingBackend {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.submit_reads(ops)
     }
-    fn submit_writes(&self, ops: &[StripWrite<'_>]) -> Result<(), ChunkletError> {
-        self.inner.submit_writes(ops)
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        self.inner.submit_writes_detailed(ops)
     }
 }
 

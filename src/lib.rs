@@ -30,6 +30,7 @@ pub mod superblock;
 pub mod types;
 
 pub use error::{ChunkletError, ChunkletResult};
+pub use ld::degrade::SuspectMember;
 pub use ld::{LdDescriptor, LdList, LdMirror, LdPlain, LdRaid0, LdRaid5, LdRaid6, LogicalDisk};
 pub use metrics::{LdMetrics, PdMetrics, PdOperationalState, PoolMetrics};
 pub use pd::PhysicalDisk;

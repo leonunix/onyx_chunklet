@@ -43,8 +43,11 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crossbeam_channel::{Receiver, Sender};
+
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::RawDevice;
+use crate::ld::degrade::SuspectMember;
 use crate::ld::descriptor::LdList;
 use crate::ld::StripeLockTable;
 use crate::pd::{PdInfo, PhysicalDisk};
@@ -74,6 +77,15 @@ pub struct Pool {
     pool_id: PoolId,
     pub(crate) state: RwLock<PoolState>,
     pub(crate) manifest_lock: Mutex<()>,
+    /// Fast-isolation channel. An LD write that absorbs a member EIO via inline
+    /// degrade (`crate::ld::degrade`) best-effort sends the failed member here;
+    /// onyx's isolation reactor drains [`Pool::suspect_events`] and calls
+    /// `mark_pd_failed` (which bumps the LD epoch so handles reopen degraded and
+    /// a rebuild-to-spare starts). Unbounded so the write hot path never blocks;
+    /// the receiver may have no consumer (e.g. standalone chunklet tests), in
+    /// which case sends simply accumulate harmlessly.
+    suspect_tx: Sender<SuspectMember>,
+    suspect_rx: Receiver<SuspectMember>,
 }
 
 pub(crate) struct PoolState {
@@ -147,17 +159,22 @@ pub(crate) struct LdRuntime {
     /// the inner LD by `open_ld` via `attach_shared`.
     pub stripe_locks: Arc<StripeLockTable>,
     pub rebuild: RebuildCell,
+    /// Sender end of the pool's fast-isolation channel, handed to each inner LD
+    /// via `attach_shared` so an inline-degraded write can report the failed
+    /// member without touching any pool lock on the hot path.
+    pub suspect_tx: Sender<SuspectMember>,
     epoch: AtomicU64,
     dropped: AtomicBool,
 }
 
 impl LdRuntime {
-    pub fn new() -> Self {
+    pub fn new(suspect_tx: Sender<SuspectMember>) -> Self {
         Self {
             io_lock: RwLock::new(()),
             range_locks: StripeLockTable::new(),
             stripe_locks: Arc::new(StripeLockTable::new()),
             rebuild: new_rebuild_cell(),
+            suspect_tx,
             epoch: AtomicU64::new(0),
             dropped: AtomicBool::new(false),
         }
@@ -194,11 +211,14 @@ impl LdRuntime {
     }
 }
 
-pub(crate) fn build_ld_runtime(ld_list: &LdList) -> BTreeMap<LdId, Arc<LdRuntime>> {
+pub(crate) fn build_ld_runtime(
+    ld_list: &LdList,
+    suspect_tx: &Sender<SuspectMember>,
+) -> BTreeMap<LdId, Arc<LdRuntime>> {
     ld_list
         .lds
         .iter()
-        .map(|desc| (desc.id, Arc::new(LdRuntime::new())))
+        .map(|desc| (desc.id, Arc::new(LdRuntime::new(suspect_tx.clone()))))
         .collect()
 }
 
@@ -256,6 +276,7 @@ impl Pool {
             pd_seq_to_id.insert(i as u32, pd_id);
         }
 
+        let (suspect_tx, suspect_rx) = crossbeam_channel::unbounded();
         Ok(Arc::new(Self {
             pool_id,
             state: RwLock::new(PoolState {
@@ -269,6 +290,8 @@ impl Pool {
                 last_reconciliation_count: 0,
             }),
             manifest_lock: Mutex::new(()),
+            suspect_tx,
+            suspect_rx,
         }))
     }
 
@@ -378,6 +401,7 @@ impl Pool {
         let reconciled = forward_reconcile_bitmaps(&ld_list, &pds)?;
         reclaim_orphan_migrating(&ld_list, &pds)?;
 
+        let (suspect_tx, suspect_rx) = crossbeam_channel::unbounded();
         Ok(Arc::new(Self {
             pool_id,
             state: RwLock::new(PoolState {
@@ -399,12 +423,14 @@ impl Pool {
                 pds,
                 pd_seq_to_id,
                 draining: std::collections::BTreeSet::new(),
-                ld_runtime: build_ld_runtime(&ld_list),
+                ld_runtime: build_ld_runtime(&ld_list, &suspect_tx),
                 ld_list,
                 cpg_list,
                 last_reconciliation_count: reconciled,
             }),
             manifest_lock: Mutex::new(()),
+            suspect_tx,
+            suspect_rx,
         }))
     }
 
@@ -519,6 +545,7 @@ impl Pool {
         let reconciled = forward_reconcile_bitmaps(&ld_list, &pds)?;
         reclaim_orphan_migrating(&ld_list, &pds)?;
 
+        let (suspect_tx, suspect_rx) = crossbeam_channel::unbounded();
         Ok(Arc::new(Self {
             pool_id,
             state: RwLock::new(PoolState {
@@ -526,13 +553,26 @@ impl Pool {
                 pd_seq_to_id,
                 pd_health,
                 draining: std::collections::BTreeSet::new(),
-                ld_runtime: build_ld_runtime(&ld_list),
+                ld_runtime: build_ld_runtime(&ld_list, &suspect_tx),
                 ld_list,
                 cpg_list,
                 last_reconciliation_count: reconciled,
             }),
             manifest_lock: Mutex::new(()),
+            suspect_tx,
+            suspect_rx,
         }))
+    }
+
+    /// Receiver for inline-degrade fast-isolation events. An LD write that rode
+    /// through a member EIO on surviving redundancy sends the failed member
+    /// here; the caller (onyx's isolation reactor) drains this and calls
+    /// `mark_pd_failed` + starts a rebuild-to-spare, so the bad PD is isolated
+    /// in ~ms instead of waiting for the slow liveness watchdog. The receiver is
+    /// cloneable (crossbeam MPMC); a pool with no consumer simply lets events
+    /// queue harmlessly (unbounded).
+    pub fn suspect_events(&self) -> Receiver<SuspectMember> {
+        self.suspect_rx.clone()
     }
 
     /// Public read accessor for PD health. Phase 5 only ever returns

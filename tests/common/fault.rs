@@ -35,16 +35,17 @@
 //! a backend Arc, so installing on any one of them — or any healthy PD
 //! that participates — works.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use onyx_chunklet::error::ChunkletError;
+use onyx_chunklet::error::{ChunkletError, ChunkletResult};
 use onyx_chunklet::io::{IoBackend, StripRead, StripWrite};
 use onyx_chunklet::types::PdId;
 
 pub struct FaultInjectingBackend {
     inner: Arc<dyn IoBackend>,
-    target_pd: PdId,
+    targets: BTreeSet<PdId>,
     succeed_remaining: AtomicUsize,
     failed_count: AtomicUsize,
 }
@@ -52,11 +53,23 @@ pub struct FaultInjectingBackend {
 impl FaultInjectingBackend {
     /// Wrap `inner`. The next `succeed_first` invocations that touch
     /// `target_pd` succeed via `inner`; every subsequent invocation
-    /// fails with an `Io` error. Non-target ops always go through.
+    /// fails writes to `target_pd` with an `Io` error. Non-target ops
+    /// always go through.
     pub fn new(inner: Arc<dyn IoBackend>, target_pd: PdId, succeed_first: usize) -> Self {
+        Self::new_multi(inner, [target_pd].into_iter().collect(), succeed_first)
+    }
+
+    /// Like [`Self::new`] but fails writes to ANY PD in `targets` — used to
+    /// exercise multi-member failure (e.g. an R6 F=2 case, or a mirror with all
+    /// copies down) in one invocation.
+    pub fn new_multi(
+        inner: Arc<dyn IoBackend>,
+        targets: BTreeSet<PdId>,
+        succeed_first: usize,
+    ) -> Self {
         Self {
             inner,
-            target_pd,
+            targets,
             succeed_remaining: AtomicUsize::new(succeed_first),
             failed_count: AtomicUsize::new(0),
         }
@@ -87,49 +100,55 @@ impl IoBackend for FaultInjectingBackend {
         self.inner.submit_reads(ops)
     }
 
-    fn submit_writes(&self, ops: &[StripWrite<'_>]) -> Result<(), ChunkletError> {
-        let other: Vec<StripWrite<'_>> = ops
-            .iter()
-            .filter(|o| o.pd.pd_id() != self.target_pd)
-            .map(clone_op)
-            .collect();
-        let target: Vec<StripWrite<'_>> = ops
-            .iter()
-            .filter(|o| o.pd.pd_id() == self.target_pd)
-            .map(clone_op)
-            .collect();
-
-        // Always issue non-target writes first so they land on disk even
-        // when we're about to inject a failure on the target. Mirrors a
-        // real K-of-N partial-failure shape.
-        if !other.is_empty() {
-            self.inner.submit_writes(&other)?;
+    /// Per-op results in INPUT order (the primitive the inline-degrade LD write
+    /// paths consume). Non-target ops go to the inner backend and get its real
+    /// per-op result; target ops fail with an injected `Io` error once the
+    /// success budget is exhausted (so a K-of-N batch lands K-1 durable copies
+    /// and one injected error — the real partial-failure shape). The historical
+    /// first-error `submit_writes` is the trait default over this.
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        let has_target = ops.iter().any(|o| self.targets.contains(&o.pd.pd_id()));
+        // Consume one budget unit per invocation that touches a target; once
+        // exhausted, this invocation fails the target ops.
+        let fail_target = has_target
+            && self
+                .succeed_remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    if v == 0 {
+                        None
+                    } else {
+                        Some(v - 1)
+                    }
+                })
+                .is_err();
+        if fail_target {
+            self.failed_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        if target.is_empty() {
-            return Ok(());
-        }
-        let prev = self
-            .succeed_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                if v == 0 {
-                    None
-                } else {
-                    Some(v - 1)
-                }
-            });
-        match prev {
-            Ok(_remaining_before_decrement) => {
-                // We had budget; let target writes through.
-                self.inner.submit_writes(&target)
-            }
-            Err(_) => {
-                self.failed_count.fetch_add(1, Ordering::Relaxed);
-                Err(ChunkletError::Io(std::io::Error::other(format!(
+        // Route everything except failed-target ops through the inner backend as
+        // ONE batch (so surviving copies land durably), then scatter the inner
+        // results + injected errors back to the caller's input positions.
+        let mut inner_ops: Vec<StripWrite<'_>> = Vec::with_capacity(ops.len());
+        let mut inner_idx: Vec<usize> = Vec::with_capacity(ops.len());
+        let mut results: Vec<Option<ChunkletResult<()>>> = (0..ops.len()).map(|_| None).collect();
+        for (i, o) in ops.iter().enumerate() {
+            if fail_target && self.targets.contains(&o.pd.pd_id()) {
+                results[i] = Some(Err(ChunkletError::Io(std::io::Error::other(format!(
                     "fault inject: write to PD {} failed",
-                    self.target_pd
-                ))))
+                    o.pd.pd_id()
+                )))));
+            } else {
+                inner_ops.push(clone_op(o));
+                inner_idx.push(i);
             }
         }
+        let inner_results = self.inner.submit_writes_detailed(&inner_ops);
+        for (k, r) in inner_results.into_iter().enumerate() {
+            results[inner_idx[k]] = Some(r);
+        }
+        results
+            .into_iter()
+            .map(|o| o.expect("every op position filled"))
+            .collect()
     }
 }

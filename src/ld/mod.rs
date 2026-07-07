@@ -13,6 +13,7 @@
 //! - `rebuild` / `drop` (Phase 5+) take `write()` to ensure no in-flight IO
 //!   races with member-set mutations.
 
+pub mod degrade;
 pub mod descriptor;
 pub mod gf256;
 pub mod mirror;
@@ -43,8 +44,7 @@ const STRIPE_LOCK_BUCKETS: usize = 1024;
 // UringBackend per Pool). Re-export so existing `use crate::ld::{...,
 // StripWrite}` import sites keep working.
 pub(crate) use crate::io::backend::{
-    submit_strip_reads as parallel_strip_reads, submit_strip_writes as parallel_strip_writes,
-    StripRead, StripWrite,
+    submit_strip_reads as parallel_strip_reads, submit_strip_writes_detailed, StripRead, StripWrite,
 };
 
 pub fn healthy_pd_map(

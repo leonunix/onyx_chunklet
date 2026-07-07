@@ -46,11 +46,14 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crossbeam_channel::Sender;
+
 use crate::error::{ChunkletError, ChunkletResult};
+use crate::ld::degrade::{absorb_degraded, SuspectMember};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{
-    compute_strip_bytes, parallel_strip_reads, parallel_strip_writes, resolve_members, LogicalDisk,
-    ReconstructEngine, StripRead, StripWrite, StripeLockTable,
+    compute_strip_bytes, parallel_strip_reads, resolve_members, submit_strip_writes_detailed,
+    LogicalDisk, ReconstructEngine, StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::pool::{new_rebuild_cell, PdHealth, RebuildCell};
@@ -74,6 +77,11 @@ pub struct LdMirror {
     stripe_locks: Arc<StripeLockTable>,
     /// Online-rebuild plan cell (shared via `attach_shared`; default empty).
     rebuild: RebuildCell,
+    /// Fast-isolation channel (shared via `attach_shared`; `None` for a bare
+    /// `open`/`open_with_health` handle not owned by a pool reactor, e.g. a unit
+    /// test). An inline-degraded write sends the failed member here so onyx
+    /// isolates it in ~ms. Best-effort: a full/disconnected channel is ignored.
+    suspect_tx: Option<Sender<SuspectMember>>,
 }
 
 impl LdMirror {
@@ -132,6 +140,7 @@ impl LdMirror {
             read_cursors,
             stripe_locks: Arc::new(StripeLockTable::new()),
             rebuild: new_rebuild_cell(),
+            suspect_tx: None,
         })
     }
 
@@ -139,10 +148,30 @@ impl LdMirror {
         &self.desc
     }
 
-    /// Install the shared stripe-lock table + rebuild cell (see `LdRaid6`).
-    pub(crate) fn attach_shared(&mut self, stripe_locks: Arc<StripeLockTable>, rebuild: RebuildCell) {
+    /// Install the shared stripe-lock table + rebuild cell (see `LdRaid6`) and
+    /// the pool's fast-isolation sender so an inline-degraded write can report a
+    /// failed member without touching a pool lock on the hot path.
+    pub(crate) fn attach_shared(
+        &mut self,
+        stripe_locks: Arc<StripeLockTable>,
+        rebuild: RebuildCell,
+        suspect_tx: Sender<SuspectMember>,
+    ) {
         self.stripe_locks = stripe_locks;
         self.rebuild = rebuild;
+        self.suspect_tx = Some(suspect_tx);
+    }
+
+    /// Best-effort report of members that failed a write but were absorbed by
+    /// surviving redundancy, so onyx's reactor can isolate them fast. A missing
+    /// or disconnected channel is ignored (a bare test handle, or a shut-down
+    /// reactor) — correctness of the current write already held on the survivors.
+    fn report_suspects(&self, suspects: Vec<SuspectMember>) {
+        if let Some(tx) = &self.suspect_tx {
+            for s in suspects {
+                let _ = tx.try_send(s);
+            }
+        }
     }
 
     /// Mirror the just-written segments to the online-rebuild shadow copies for
@@ -331,15 +360,25 @@ impl LdMirror {
     /// `parallel_strip_writes` under one `write_keys` acquisition (see
     /// `write_many_at`), so the whole coalesced batch is one cross-PD submit
     /// instead of one submit per 4 KiB strip.
+    /// Expand a batch into one `StripWrite` per (segment × live copy), plus the
+    /// per-segment stripe keys, the per-op redundancy-group index (`group_of`,
+    /// one compact group per stripe segment), and each group's runtime failure
+    /// budget (`max_fail = live_copies − 1`). The last two feed
+    /// [`absorb_degraded`] so a within-budget subset of member EIOs rides
+    /// through on the surviving copies instead of failing the write.
+    #[allow(clippy::type_complexity)]
     fn collect_strip_writes<'a>(
         &self,
         ops: &[(u64, &'a [u8])],
-    ) -> ChunkletResult<(Vec<StripWrite<'a>>, Vec<u64>)> {
+    ) -> ChunkletResult<(Vec<StripWrite<'a>>, Vec<u64>, Vec<u32>, Vec<u32>)> {
         let mut writes: Vec<StripWrite<'a>> =
             Vec::with_capacity(ops.len() * self.desc.set_size as usize);
         let mut stripe_keys: Vec<u64> = Vec::new();
+        let mut group_of: Vec<u32> = Vec::new();
+        let mut max_fail: Vec<u32> = Vec::new();
         for (offset, buf) in ops {
             self.for_each_segment(*offset, buf.len(), |row, set, off_in_c, range| {
+                let group = max_fail.len() as u32;
                 stripe_keys.push(self.stripe_key(row, set, off_in_c));
                 let before = writes.len();
                 for member_idx in self.member_indices_for(row, set) {
@@ -350,18 +389,23 @@ impl LdMirror {
                             in_chunklet_off: off_in_c,
                             data: &buf[range.clone()],
                         });
+                        group_of.push(group);
                     }
                 }
-                if writes.len() == before {
+                let copies = (writes.len() - before) as u32;
+                if copies == 0 {
                     return Err(ChunkletError::Invariant(format!(
                         "Mirror set (row={}, set={}) write: no live copy",
                         row, set
                     )));
                 }
+                // ≥1 surviving copy keeps the segment durable, so a `copies`-way
+                // mirror segment tolerates `copies - 1` runtime member failures.
+                max_fail.push(copies - 1);
                 Ok(())
             })?;
         }
-        Ok((writes, stripe_keys))
+        Ok((writes, stripe_keys, group_of, max_fail))
     }
 
     /// Carve `buf` into one `StripRead` per strip segment, appended to `out`.
@@ -460,9 +504,15 @@ impl LogicalDisk for LdMirror {
         // A single contiguous op walks distinct strips, so its segments never
         // collide — collect them all, take every stripe lock once, and fan the
         // whole write to every live copy in one cross-PD submit.
-        let (writes, stripe_keys) = self.collect_strip_writes(&[(offset, buf)])?;
+        let (writes, stripe_keys, group_of, max_fail) =
+            self.collect_strip_writes(&[(offset, buf)])?;
         let _guards = self.stripe_locks.write_keys(&stripe_keys);
-        parallel_strip_writes(writes)?;
+        // Per-op results (not first-error): a single mirror leg's runtime EIO is
+        // absorbed as long as ≥1 copy of each segment survived. Failed members
+        // are reported for fast isolation + rebuild.
+        let results = submit_strip_writes_detailed(&writes);
+        let suspects = absorb_degraded(&writes, &results, &group_of, &max_fail)?;
+        self.report_suspects(suspects);
         self.write_forward(&[(offset, buf)]);
         Ok(())
     }
@@ -474,7 +524,7 @@ impl LogicalDisk for LdMirror {
         // One StripWrite per (segment × live copy) across the whole batch, so
         // a coalesced multi-strip flush span becomes ONE cross-PD submit
         // instead of one submit per 4 KiB strip.
-        let (writes, stripe_keys) = self.collect_strip_writes(ops)?;
+        let (writes, stripe_keys, group_of, max_fail) = self.collect_strip_writes(ops)?;
         // Two segments hitting the same physical strip must serialize — a
         // single batched submit would race them. Disjoint ring spans (the
         // flusher) never collide; this only trips on a misbehaving caller, so
@@ -484,12 +534,17 @@ impl LogicalDisk for LdMirror {
             return self.write_many_fallback(ops);
         }
         let stripe_guards = self.stripe_locks.write_keys(&stripe_keys);
-        let result = parallel_strip_writes(writes);
-        if result.is_ok() {
-            self.write_forward(ops);
-        }
+        let results = submit_strip_writes_detailed(&writes);
+        let outcome = absorb_degraded(&writes, &results, &group_of, &max_fail);
         drop(stripe_guards);
-        result
+        match outcome {
+            Ok(suspects) => {
+                self.report_suspects(suspects);
+                self.write_forward(ops);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn flush(&self) -> ChunkletResult<()> {

@@ -76,12 +76,14 @@ use std::sync::Arc;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256::xor_into;
+use crate::ld::degrade::{absorb_degraded, SuspectMember};
 use crate::ld::{
-    compute_strip_bytes, parallel_strip_reads, parallel_strip_writes, resolve_members, LogicalDisk,
-    ReconstructEngine, StripRead, StripWrite, StripeLockTable,
+    compute_strip_bytes, parallel_strip_reads, resolve_members, submit_strip_writes_detailed,
+    LogicalDisk, ReconstructEngine, StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::pool::{new_rebuild_cell, PdHealth, RebuildCell};
+use crossbeam_channel::Sender;
 use crate::types::{
     LdId, LdRole, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
 };
@@ -103,6 +105,10 @@ pub struct LdRaid5 {
     stripe_locks: Arc<StripeLockTable>,
     /// Online-rebuild plan cell (shared via `attach_shared`; default empty).
     rebuild: RebuildCell,
+    /// Fast-isolation channel (shared via `attach_shared`; `None` for a bare
+    /// handle). An inline-degraded write (F ≤ 1 failed) reports the failed
+    /// member here for fast isolation + rebuild.
+    suspect_tx: Option<Sender<SuspectMember>>,
 }
 
 impl LdRaid5 {
@@ -188,6 +194,7 @@ impl LdRaid5 {
             full_stripe_bytes,
             stripe_locks: Arc::new(StripeLockTable::new()),
             rebuild: new_rebuild_cell(),
+            suspect_tx: None,
         })
     }
 
@@ -195,10 +202,37 @@ impl LdRaid5 {
         &self.desc
     }
 
-    /// Install the shared stripe-lock table + rebuild cell (see `LdRaid6`).
-    pub(crate) fn attach_shared(&mut self, stripe_locks: Arc<StripeLockTable>, rebuild: RebuildCell) {
+    /// Install the shared stripe-lock table + rebuild cell (see `LdRaid6`) plus
+    /// the pool's fast-isolation sender.
+    pub(crate) fn attach_shared(
+        &mut self,
+        stripe_locks: Arc<StripeLockTable>,
+        rebuild: RebuildCell,
+        suspect_tx: Sender<SuspectMember>,
+    ) {
         self.stripe_locks = stripe_locks;
         self.rebuild = rebuild;
+        self.suspect_tx = Some(suspect_tx);
+    }
+
+    /// Best-effort report of members that failed a write but were absorbed by
+    /// surviving parity/data (see `LdRaid6::report_suspects`).
+    fn report_suspects(&self, suspects: Vec<SuspectMember>) {
+        if let Some(tx) = &self.suspect_tx {
+            for s in suspects {
+                let _ = tx.try_send(s);
+            }
+        }
+    }
+
+    /// Submit ONE set's strip writes with inline-degrade (see
+    /// `LdRaid6::submit_set_absorb`). `max_fail = 1 − open_time_failures` for R5.
+    fn submit_set_absorb(&self, ops: Vec<StripWrite<'_>>, max_fail: u32) -> ChunkletResult<()> {
+        let results = submit_strip_writes_detailed(&ops);
+        let group_of = vec![0u32; ops.len()];
+        let suspects = absorb_degraded(&ops, &results, &group_of, &[max_fail])?;
+        self.report_suspects(suspects);
+        Ok(())
     }
 
     fn set_being_rebuilt(&self, set_idx: usize) -> bool {
@@ -603,6 +637,10 @@ impl LdRaid5 {
             });
         }
 
+        // Runtime member-failure budget: R5 tolerates 1 total, `f_total` already
+        // lost at open, so `1 - f_total` more may fail this write and reconstruct.
+        let budget = 1u32 - f_total as u32;
+
         let strip = self.strip_bytes;
         let k = self.data_per_set;
 
@@ -637,14 +675,14 @@ impl LdRaid5 {
                 .iter()
                 .all(|(_pos, off, range)| *off == 0 && (range.end - range.start) as u64 == strip);
         if is_full_stripe {
-            return self.write_full_stripe(start.set_idx, strip_base, &positions, buf);
+            return self.write_full_stripe(start.set_idx, strip_base, &positions, buf, budget);
         }
 
         if f_data == 0 && p_failed && !self.set_being_rebuilt(start.set_idx) {
             // Only parity is gone: skip parity entirely, write data direct.
             // A rebuilding parity target needs parity computed to write-forward,
             // so a rebuilding set falls through to RW instead of this fast path.
-            return self.write_data_only(start.set_idx, strip_base, &positions, buf);
+            return self.write_data_only(start.set_idx, strip_base, &positions, buf, budget);
         }
 
         if f_data == 0 && !p_failed {
@@ -656,15 +694,15 @@ impl LdRaid5 {
                 .iter()
                 .all(|(_p, off, range)| *off == 0 && (range.end - range.start) as u64 == strip);
             if all_full_strip && (k - m) < (m + 1) {
-                self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
+                self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf, budget)
             } else {
-                self.write_partial_stripe_rmw(start.set_idx, strip_base, &positions, buf)
+                self.write_partial_stripe_rmw(start.set_idx, strip_base, &positions, buf, budget)
             }
         } else {
             // F=1 data-failed (parity healthy). RMW would need to read the
             // failed PD's old data for delta computation when that position
             // is in the modified set; RW handles it uniformly via reconstruct.
-            self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf)
+            self.write_partial_stripe_rw(start.set_idx, strip_base, &positions, buf, budget)
         }
     }
 
@@ -681,6 +719,7 @@ impl LdRaid5 {
         strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
+        budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
         let mut parity = vec![0u8; strip];
@@ -709,7 +748,7 @@ impl LdRaid5 {
                 data: &parity,
             });
         }
-        parallel_strip_writes(ops)?;
+        self.submit_set_absorb(ops, budget)?;
         let strip = self.strip_bytes as usize;
         self.write_forward(set_idx, strip_base, |pos| {
             if pos < self.data_per_set {
@@ -729,6 +768,7 @@ impl LdRaid5 {
         strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
+        budget: u32,
     ) -> ChunkletResult<()> {
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len());
         for (pos, off, range) in positions {
@@ -745,7 +785,7 @@ impl LdRaid5 {
                 data: &buf[range.clone()],
             });
         }
-        parallel_strip_writes(ops)
+        self.submit_set_absorb(ops, budget)
     }
 
     /// Read-modify-write: for M modified positions, read old slices, XOR
@@ -761,6 +801,7 @@ impl LdRaid5 {
         strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
+        budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
         let mut delta_full_strip = vec![0u8; strip];
@@ -801,7 +842,7 @@ impl LdRaid5 {
             in_chunklet_off: strip_base,
             data: &parity,
         });
-        parallel_strip_writes(ops)
+        self.submit_set_absorb(ops, budget)
     }
 
     /// Reconstruct-write: build full new strips for all K data positions
@@ -822,6 +863,7 @@ impl LdRaid5 {
         strip_base: u64,
         positions: &[(usize, u64, std::ops::Range<usize>)],
         buf: &[u8],
+        budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
         let k = self.data_per_set;
@@ -889,7 +931,7 @@ impl LdRaid5 {
                 data: &parity,
             });
         }
-        parallel_strip_writes(ops)?;
+        self.submit_set_absorb(ops, budget)?;
         self.write_forward(set_idx, strip_base, |pos| {
             if pos < self.data_per_set {
                 new_strips[pos].clone()
@@ -1101,12 +1143,21 @@ impl LdRaid5 {
             self.r5_compute(seg);
         }
 
-        // Phase 3: one batched write submit for all data + parity strips.
+        // Phase 3: one batched write submit for all data + parity strips, with
+        // inline-degrade. Every segment here is HEALTHY (degraded sets bailed to
+        // the serial `write_at` above), so each is its own redundancy group with
+        // a budget of 1 runtime member failure.
         let mut writes: Vec<StripWrite> = Vec::new();
-        for seg in segs.iter() {
+        let mut group_of: Vec<u32> = Vec::new();
+        for (gi, seg) in segs.iter().enumerate() {
             self.r5_collect_writes(seg, &mut writes);
+            group_of.resize(writes.len(), gi as u32);
         }
-        parallel_strip_writes(writes)
+        let max_fail = vec![1u32; segs.len()];
+        let results = submit_strip_writes_detailed(&writes);
+        let suspects = absorb_degraded(&writes, &results, &group_of, &max_fail)?;
+        self.report_suspects(suspects);
+        Ok(())
     }
 
     /// Append `seg`'s RMW reads (into its owned scratch) to the shared batch.

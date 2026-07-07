@@ -358,12 +358,20 @@ impl Pool {
             }
             RaidLevel::Mirror => {
                 let mut mirror = LdMirror::open_with_health(desc, &s.pds, &s.pd_health)?;
-                mirror.attach_shared(runtime.stripe_locks.clone(), runtime.rebuild.clone());
+                mirror.attach_shared(
+                    runtime.stripe_locks.clone(),
+                    runtime.rebuild.clone(),
+                    runtime.suspect_tx.clone(),
+                );
                 Arc::new(mirror)
             }
             RaidLevel::Raid5 => {
                 let mut raid5 = LdRaid5::open_with_health(desc, &s.pds, &s.pd_health)?;
-                raid5.attach_shared(runtime.stripe_locks.clone(), runtime.rebuild.clone());
+                raid5.attach_shared(
+                    runtime.stripe_locks.clone(),
+                    runtime.rebuild.clone(),
+                    runtime.suspect_tx.clone(),
+                );
                 Arc::new(raid5)
             }
             RaidLevel::Raid0 => {
@@ -374,8 +382,13 @@ impl Pool {
                 let mut raid6 = LdRaid6::open_with_health(desc, &s.pds, &s.pd_health)?;
                 // Share the runtime's stripe-lock table + rebuild cell so an
                 // online rebuild's shadow backfill serializes with this handle's
-                // writes and foreground writes can write-forward below the cursor.
-                raid6.attach_shared(runtime.stripe_locks.clone(), runtime.rebuild.clone());
+                // writes and foreground writes can write-forward below the cursor;
+                // plus the fast-isolation sender for inline-degrade reporting.
+                raid6.attach_shared(
+                    runtime.stripe_locks.clone(),
+                    runtime.rebuild.clone(),
+                    runtime.suspect_tx.clone(),
+                );
                 Arc::new(raid6)
             }
         };
@@ -606,7 +619,8 @@ impl Pool {
         }
         let mut s = self.state.write();
         s.ld_list.upsert(desc.clone());
-        s.ld_runtime.insert(desc.id, Arc::new(LdRuntime::new()));
+        s.ld_runtime
+            .insert(desc.id, Arc::new(LdRuntime::new(self.suspect_tx.clone())));
         Ok(())
     }
 

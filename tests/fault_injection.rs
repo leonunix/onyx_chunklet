@@ -18,11 +18,13 @@ use tempfile::TempDir;
 use common::fault::FaultInjectingBackend;
 use common::{make_pool, open_subset, path_for_member, pattern};
 
-/// Mirror write where one of N copies fails mid-batch must:
-/// - Surface the error to the caller (so the upper layer knows to retry
-///   or scrub).
-/// - Leave the surviving copies with the new data.
-/// - Leave the failed copy with the old data (real torn state).
+/// Mirror write where one of N copies fails mid-batch must (post inline-degrade):
+/// - RIDE THROUGH on the surviving copies (≥1 survivor → the write is durable),
+///   returning `Ok` instead of surfacing the error — a single member EIO must not
+///   fail a redundant write (this is the fix for the box META_FENCE bug).
+/// - Report the failed copy as a suspect for fast isolation.
+/// - Leave the surviving copies with the new data, the failed copy with the old
+///   data (real torn state) — repaired later by scrub / rebuild.
 ///
 /// 3-way mirror so the test can demonstrate post-failure recovery via
 /// scrub_ld (which majority-votes) — the operator's recommended
@@ -55,11 +57,14 @@ fn mirror_partial_write_torn_state_then_scrub_recovers() {
 
     let new_payload = vec![0xc7u8; 4096];
     let ld = pool.open_ld(id).unwrap();
-    let err = ld.write_at(0, &new_payload).err();
-    assert!(
-        err.is_some(),
-        "mirror write must surface the injected fault"
-    );
+    ld.write_at(0, &new_payload)
+        .expect("inline-degrade: mirror write rides through one failed copy (2 survivors)");
+    // The failed copy is reported as a suspect for fast isolation.
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("a suspect member must be reported for the failed copy");
+    assert_eq!(ev.pd_id, target_pd_id, "suspect is the faulted PD");
 
     // copy 0 + copy 2 should be on healthy PDs and have new data.
     let pd0 = pool.pd(desc.members[0].pd).unwrap();
@@ -141,11 +146,15 @@ fn mirror_partial_write_torn_state_multi_strip_then_scrub() {
 
     let new_payload: Vec<u8> = (0..span).map(|i| (i % 251) as u8).collect();
     let ld = pool.open_ld(id).unwrap();
-    let err = ld.write_at(0, &new_payload).err();
-    assert!(
-        err.is_some(),
-        "multi-strip mirror write must surface the injected fault"
+    ld.write_at(0, &new_payload).expect(
+        "inline-degrade: multi-strip mirror write rides through one failed copy (2 survivors)",
     );
+    // One suspect for the failed copy (deduped across all 4 strips' segments).
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("a suspect member must be reported for the failed copy");
+    assert_eq!(ev.pd_id, target_pd_id, "suspect is the faulted PD");
 
     // Survivors hold the FULL new multi-strip payload; failed copy keeps old.
     let pd0 = pool.pd(desc.members[0].pd).unwrap();
@@ -183,12 +192,12 @@ fn mirror_partial_write_torn_state_multi_strip_then_scrub() {
     );
 }
 
-/// R5 full-stripe write where the parity-PD's submit fails:
-/// - Caller sees the error.
-/// - Data strips that succeeded are durable (written before the fault
-///   batch returned).
-/// - Parity strip on the failed PD didn't land — subsequent scrub will
-///   detect parity mismatch.
+/// R5 full-stripe write where the parity-PD's submit fails (post inline-degrade):
+/// - RIDES THROUGH: the K data strips landed and parity is reconstructible, so
+///   within the R5 budget of 1 the write returns `Ok` (not an error).
+/// - Reports the parity PD as a suspect for fast isolation.
+/// - Parity strip on the failed PD didn't land — a subsequent scrub still
+///   detects the parity mismatch until rebuild restores it.
 #[test]
 #[ignore = "fault-injection: installs a test backend on a live PD"]
 fn raid5_full_stripe_fault_on_parity_pd_detected_by_scrub() {
@@ -212,8 +221,14 @@ fn raid5_full_stripe_fault_on_parity_pd_detected_by_scrub() {
 
     let ld = pool.open_ld(id).unwrap();
     let payload = vec![0x88u8; 12 * 4096]; // a full-stripe full write
-    let err = ld.write_at(0, &payload).err();
-    assert!(err.is_some(), "R5 full-stripe write must surface fault");
+    ld.write_at(0, &payload)
+        .expect("inline-degrade: R5 full-stripe rides through a failed parity write (budget 1)");
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("a suspect member must be reported for the failed parity PD");
+    assert_eq!(ev.pd_id, parity_pd, "suspect is the faulted parity PD");
+    assert!(injector.failed_count() >= 1);
 
     // Restore healthy backend for scrub.
     let healthy = onyx_chunklet::io::make_backend(onyx_chunklet::io::IoBackendKind::Sync);
@@ -230,8 +245,9 @@ fn raid5_full_stripe_fault_on_parity_pd_detected_by_scrub() {
 
 /// R6 full-stripe write where the Q-parity PD's submit fails. The Anvin
 /// incremental Q is a distinct code path from P (`g^i` GF(2⁸) weighting), so a
-/// fault landing on Q — the LAST member of a raid6 set — must be surfaced to
-/// the caller and later caught by scrub, exactly like the R5 P-parity case.
+/// fault landing on Q — the LAST member of a raid6 set — must (post
+/// inline-degrade) RIDE THROUGH on the surviving data + P (R6 budget 2), report
+/// the Q PD as a suspect, and only be caught by scrub until rebuild restores Q.
 #[test]
 #[ignore = "fault-injection: installs a test backend on a live PD"]
 fn raid6_full_stripe_fault_on_q_parity_detected_by_scrub() {
@@ -254,8 +270,13 @@ fn raid6_full_stripe_fault_on_q_parity_detected_by_scrub() {
     }
 
     let ld = pool.open_ld(id).unwrap();
-    let err = ld.write_at(0, &vec![0x88u8; 12 * 4096]).err();
-    assert!(err.is_some(), "R6 full-stripe write must surface the Q fault");
+    ld.write_at(0, &vec![0x88u8; 12 * 4096])
+        .expect("inline-degrade: R6 full-stripe rides through a failed Q write (budget 2)");
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("a suspect member must be reported for the failed Q PD");
+    assert_eq!(ev.pd_id, q_pd, "suspect is the faulted Q PD");
     assert!(injector.failed_count() >= 1);
 
     // Heal, then scrub: stale Q vs recomputed Q is a mismatch.
@@ -499,4 +520,116 @@ fn mirror_online_rebuild_concurrent_writes_preserve_data() {
 fn raid5_online_rebuild_concurrent_writes_preserve_data() {
     // raid5(3) = 3 data + P; fail one data member, rebuild onto an outside PD.
     run_online_rebuild_concurrent(8, LdSpec::raid5(3, 1, 1, 0), 0, 1);
+}
+
+/// Budget boundary: when EVERY copy of a mirror segment fails, there is no
+/// survivor to hold the data, so inline-degrade must NOT absorb — the write
+/// surfaces the error exactly like the pre-fix all-or-nothing path.
+#[test]
+#[ignore = "fault-injection: installs a test backend on a live PD"]
+fn mirror_all_copies_fail_surfaces_error() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 3);
+    let id = pool.create_ld(LdSpec::mirror(3, 1, 1, 0)).unwrap();
+    let desc = pool.find_ld(id).unwrap();
+
+    // Fail ALL three copies' PDs.
+    let targets: std::collections::BTreeSet<_> = desc.members.iter().map(|m| m.pd).collect();
+    let any_pd = pool.pd(desc.members[0].pd).unwrap();
+    let injector = Arc::new(FaultInjectingBackend::new_multi(any_pd.backend(), targets, 0));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
+    }
+
+    let ld = pool.open_ld(id).unwrap();
+    let err = ld.write_at(0, &vec![0xc7u8; 4096]).err();
+    assert!(
+        err.is_some(),
+        "all copies failed ⇒ over budget ⇒ write must surface the error"
+    );
+}
+
+/// R6 F=2: fail one DATA member and the Q parity in one write. R6's budget is 2,
+/// so the write is absorbed on the surviving data + P; after isolating the two
+/// failed members the degraded read must reconstruct the NEW data via P
+/// (proving the parity that landed reflects the new stripe).
+#[test]
+#[ignore = "fault-injection: installs a test backend on a live PD"]
+fn raid6_two_member_fault_absorbed_then_reconstructs_new_data() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5); // raid6(3) = 3 data + P + Q
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &vec![0x00u8; 12 * 4096]).unwrap(); // baseline
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let data0_pd = desc.members[0].pd; // a data member
+    let q_pd = desc.members[4].pd; // Q parity
+    let targets: std::collections::BTreeSet<_> = [data0_pd, q_pd].into_iter().collect();
+    let injector =
+        Arc::new(FaultInjectingBackend::new_multi(pool.pd(data0_pd).unwrap().backend(), targets, 0));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
+    }
+
+    let new_payload = pattern(0x99, 12 * 4096, 0);
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &new_payload)
+        .expect("inline-degrade: R6 rides through F=2 (one data + Q) on survivors + P");
+    // Both failed members are reported (the serial write_at loop emits per
+    // stripe, so the same two PDs recur across the 4 stripes — the reactor
+    // dedups idempotently via mark_pd_failed; here we assert the UNIQUE set).
+    let suspects: std::collections::BTreeSet<_> =
+        std::iter::from_fn(|| pool.suspect_events().try_recv().ok())
+            .map(|s| s.pd_id)
+            .collect();
+    let want: std::collections::BTreeSet<_> = [data0_pd, q_pd].into_iter().collect();
+    assert_eq!(suspects, want, "both failed members reported as suspects");
+
+    // Heal the backend, isolate the two failed members, reopen degraded, and
+    // read: data0 must reconstruct to the NEW value from the P that landed.
+    let healthy = onyx_chunklet::io::make_backend(onyx_chunklet::io::IoBackendKind::Sync);
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(healthy.clone());
+    }
+    pool.mark_pd_failed(data0_pd).unwrap();
+    pool.mark_pd_failed(q_pd).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let mut got = vec![0u8; 12 * 4096];
+    ld.read_at(0, &mut got).unwrap();
+    assert_eq!(got, new_payload, "degraded read reconstructs the new data after F=2 absorb");
+}
+
+/// Budget boundary: R6 tolerates 2, so failing 3 members in one write exceeds
+/// the budget and must surface the error (no silent data loss).
+#[test]
+#[ignore = "fault-injection: installs a test backend on a live PD"]
+fn raid6_three_member_fault_exceeds_budget() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+    let desc = pool.find_ld(id).unwrap();
+
+    // Fail 3 of the 5 members (two data + Q) in one write.
+    let targets: std::collections::BTreeSet<_> =
+        [desc.members[0].pd, desc.members[1].pd, desc.members[4].pd]
+            .into_iter()
+            .collect();
+    let injector = Arc::new(FaultInjectingBackend::new_multi(
+        pool.pd(desc.members[0].pd).unwrap().backend(),
+        targets,
+        0,
+    ));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
+    }
+
+    let ld = pool.open_ld(id).unwrap();
+    let err = ld.write_at(0, &vec![0x99u8; 12 * 4096]).err();
+    assert!(
+        err.is_some(),
+        "3 failed members > R6 budget 2 ⇒ write must surface the error"
+    );
 }

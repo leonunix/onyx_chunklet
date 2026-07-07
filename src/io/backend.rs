@@ -28,6 +28,11 @@ use crate::pd::PhysicalDisk;
 /// whatever buffer the caller owns; backends are required to issue + wait
 /// for the IO before returning, so the borrow only needs to outlive a
 /// single `submit_writes` call.
+///
+/// `Clone` is cheap (an `Arc` bump + `Copy` fields + a shared-slice copy) and
+/// is used by [`submit_strip_writes_detailed`] to reorder ops by NUMA node
+/// while keeping the caller's original ordering for the returned per-op results.
+#[derive(Clone)]
 pub struct StripWrite<'a> {
     pub pd: Arc<PhysicalDisk>,
     pub chunklet_index: u32,
@@ -55,10 +60,28 @@ pub trait IoBackend: Send + Sync {
     /// the first error seen.
     fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()>;
 
-    /// Issue every write in `ops`, blocking until all complete. Returns
-    /// the first error seen (others are dropped). Implementations should
+    /// Issue every write in `ops`, blocking until all complete, and return a
+    /// **per-op** result aligned to `ops` order: `results[i]` is `Ok` iff
+    /// `ops[i]` landed durably on its PD. Every op is issued and waited even
+    /// when a sibling fails — so on return the surviving ops ARE durable, and
+    /// the LD layer decides (per its redundancy budget) whether a subset of
+    /// `Err`s is tolerable and can be absorbed into a degraded success (see
+    /// [`crate::ld::degrade::absorb_degraded`]). This is the primitive that
+    /// lets a RAID write ride through a single member's runtime EIO instead of
+    /// discarding the surviving legs' success. Implementations should
     /// short-circuit on `len <= 1` to avoid backend-specific ceremony.
-    fn submit_writes(&self, ops: &[StripWrite<'_>]) -> ChunkletResult<()>;
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>>;
+
+    /// First-error convenience over [`Self::submit_writes_detailed`]: issue and
+    /// wait on every op, then return the first `Err` (others dropped). Preserves
+    /// the historical all-or-nothing contract for callers that do not perform
+    /// inline-degrade accounting (reads path stays first-error via `submit_reads`).
+    fn submit_writes(&self, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
+        for r in self.submit_writes_detailed(ops) {
+            r?;
+        }
+        Ok(())
+    }
 
     /// Human-readable backend label for logs / metrics.
     fn name(&self) -> &'static str;
@@ -93,6 +116,40 @@ pub fn submit_strip_writes(mut ops: Vec<StripWrite<'_>>) -> ChunkletResult<()> {
     ops.sort_by_key(|op| op.pd.numa_node().unwrap_or(u16::MAX));
     let backend = ops[0].pd.backend();
     backend.submit_writes(&ops)
+}
+
+/// LD-side entry point for batched writes that returns a **per-op** result in
+/// the caller's INPUT order (unlike [`submit_strip_writes`], which collapses to
+/// the first error). Mirrors `submit_strip_writes`'s NUMA sort so the uring
+/// backend still batches contiguous same-node ops into one submit, but undoes
+/// that permutation before returning — the LD maps `results[i]` back to its
+/// `(segment, member)` by position, so the ordering is load-bearing.
+///
+/// Empty batches return `[]`. The returned Vec always has `ops.len()` entries.
+/// Borrows `ops` (it clones internally for the NUMA-sorted submission), so the
+/// caller keeps the ops to map results back to `(segment, member)` and to look
+/// up failed members for [`crate::ld::degrade::absorb_degraded`].
+pub fn submit_strip_writes_detailed(ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+    let n = ops.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Sort an index permutation by NUMA node (leaving `ops` order as the
+    // authoritative caller order), submit in NUMA order, then scatter each
+    // result back to its original slot.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| ops[i].pd.numa_node().unwrap_or(u16::MAX));
+    let backend = ops[0].pd.backend();
+    let sorted: Vec<StripWrite<'_>> = order.iter().map(|&i| ops[i].clone()).collect();
+    let sorted_results = backend.submit_writes_detailed(&sorted);
+    debug_assert_eq!(sorted_results.len(), n, "backend must return one result per op");
+    let mut out: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
+    for (pos, res) in sorted_results.into_iter().enumerate() {
+        out[order[pos]] = Some(res);
+    }
+    out.into_iter()
+        .map(|o| o.expect("every op position filled by scatter"))
+        .collect()
 }
 
 /// LD-side entry point for batched reads. Picks the backend off the

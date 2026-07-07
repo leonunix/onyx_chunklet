@@ -154,34 +154,57 @@ impl IoBackend for UringBackend {
         Ok(())
     }
 
-    fn submit_writes(&self, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
         if ops.is_empty() {
-            return Ok(());
+            return Vec::new();
         }
-        let degraded = with_ring(|access| match access {
-            RingAccess::Degrade => Ok(true),
-            RingAccess::Ready(ring) => {
-                let mut start = 0usize;
-                while start < ops.len() {
-                    let node = ops[start].pd.numa_node();
-                    let mut end = start + 1;
-                    while end < ops.len()
-                        && end - start < URING_DEPTH as usize
-                        && ops[end].pd.numa_node() == node
-                    {
-                        end += 1;
+        let n = ops.len();
+        let mut results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
+        let outcome = with_ring(|access| -> ChunkletResult<bool> {
+            match access {
+                RingAccess::Degrade => Ok(true),
+                RingAccess::Ready(ring) => {
+                    let mut start = 0usize;
+                    while start < n {
+                        let node = ops[start].pd.numa_node();
+                        let mut end = start + 1;
+                        while end < n
+                            && end - start < URING_DEPTH as usize
+                            && ops[end].pd.numa_node() == node
+                        {
+                            end += 1;
+                        }
+                        crate::numa::bind_current_to_node(node);
+                        // Per-op results for this chunk, offset back into the
+                        // full-batch positions (chunk uses chunk-local indices).
+                        for (i, r) in submit_chunk_detailed(ring, &ops[start..end])
+                            .into_iter()
+                            .enumerate()
+                        {
+                            results[start + i] = Some(r);
+                        }
+                        start = end;
                     }
-                    crate::numa::bind_current_to_node(node);
-                    submit_chunk(ring, &ops[start..end])?;
-                    start = end;
+                    Ok(false)
                 }
-                Ok(false)
             }
-        })?;
-        if degraded {
-            return SyncBackend.submit_writes(ops);
+        });
+        match outcome {
+            // fd/memory exhaustion → run this batch through the syscall fan-out.
+            Ok(true) => SyncBackend.submit_writes_detailed(ops),
+            Ok(false) => results
+                .into_iter()
+                .map(|o| o.expect("every op filled by a chunk"))
+                .collect(),
+            // Genuine (non-exhaustion) ring-init error: cannot attribute to a
+            // single op, so mark the whole batch failed and let the LD surface it.
+            Err(e) => {
+                let msg = e.to_string();
+                (0..n)
+                    .map(|_| Err(ChunkletError::Io(std::io::Error::other(msg.clone()))))
+                    .collect()
+            }
         }
-        Ok(())
     }
 }
 
@@ -279,32 +302,49 @@ fn submit_read_chunk(ring: &mut IoUring, ops: &mut [StripRead<'_>]) -> ChunkletR
     Ok(())
 }
 
-fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
-    // Resolve absolute offsets + fds while we still hold &op (PD borrow
-    // outlives the submit because `ops` is borrowed for the function).
-    let mut targets: Vec<(i32, u64)> = Vec::with_capacity(ops.len());
+/// Submit one NUMA-homogeneous chunk and return a per-op result in the chunk's
+/// input order (`results[i]` ↔ `ops[i]`). A batch-level setup failure (offset
+/// geometry, bounce alloc, SQE push, submit_and_wait) cannot be attributed to a
+/// single op, so it marks every op in the chunk failed; otherwise each op's CQE
+/// determines its own result. Surviving ops are durable when this returns.
+fn submit_chunk_detailed(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+    let n = ops.len();
+    let chunk_all_err = |msg: String| -> Vec<ChunkletResult<()>> {
+        (0..n)
+            .map(|_| Err(ChunkletError::Io(std::io::Error::other(msg.clone()))))
+            .collect()
+    };
+
+    // Resolve absolute offsets + fds while we still hold &op.
+    let mut targets: Vec<(i32, u64)> = Vec::with_capacity(n);
     for op in ops {
-        let abs = op.pd.chunklet_user_abs_offset(
+        match op.pd.chunklet_user_abs_offset(
             op.chunklet_index,
             op.in_chunklet_off,
             op.data.len() as u64,
-        )?;
-        targets.push((op.pd.raw_fd(), abs));
+        ) {
+            Ok(abs) => targets.push((op.pd.raw_fd(), abs)),
+            Err(e) => return chunk_all_err(format!("io_uring chunk offset setup: {}", e)),
+        }
     }
 
     // SQEs reference either the caller's already O_DIRECT-safe buffer or
     // one of these bounce buffers. The Vec is held until every CQE arrives.
-    let mut bounces: Vec<AlignedBuf> = Vec::with_capacity(ops.len());
-    let mut ptrs: Vec<(*const u8, u32)> = Vec::with_capacity(ops.len());
+    let mut bounces: Vec<AlignedBuf> = Vec::with_capacity(n);
+    let mut ptrs: Vec<(*const u8, u32)> = Vec::with_capacity(n);
     for (op, (_fd, abs)) in ops.iter().zip(targets.iter()) {
         let ptr = op.data.as_ptr();
         let len = op.data.len();
         if is_direct_aligned(*abs, len, ptr as usize) {
             ptrs.push((ptr, len as u32));
         } else {
-            let buf = AlignedBuf::from_slice(op.data)?;
-            ptrs.push((buf.as_slice().as_ptr(), len as u32));
-            bounces.push(buf);
+            match AlignedBuf::from_slice(op.data) {
+                Ok(buf) => {
+                    ptrs.push((buf.as_slice().as_ptr(), len as u32));
+                    bounces.push(buf);
+                }
+                Err(e) => return chunk_all_err(format!("io_uring chunk bounce alloc: {}", e)),
+            }
         }
     }
 
@@ -321,49 +361,49 @@ fn submit_chunk(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> ChunkletResult<()
             // `submit_and_wait` blocks until the kernel has consumed
             // every SQE this loop pushed.
             unsafe {
-                sq.push(&entry).map_err(|e| {
-                    ChunkletError::Io(std::io::Error::other(format!("io_uring sq push: {}", e)))
-                })?;
+                if let Err(e) = sq.push(&entry) {
+                    return chunk_all_err(format!("io_uring sq push: {}", e));
+                }
             }
         }
     }
 
-    ring.submit_and_wait(ops.len()).map_err(|e| {
-        ChunkletError::Io(std::io::Error::other(format!(
-            "io_uring submit_and_wait: {}",
-            e
-        )))
-    })?;
+    if let Err(e) = ring.submit_and_wait(n) {
+        return chunk_all_err(format!("io_uring submit_and_wait: {}", e));
+    }
 
-    let mut first_err: Option<ChunkletError> = None;
+    let mut results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
     let mut completed = 0;
     for cqe in ring.completion() {
         completed += 1;
         let idx = cqe.user_data() as usize;
         let res = cqe.result();
-        if res < 0 {
-            let errno = -res;
-            if first_err.is_none() {
-                first_err = Some(ChunkletError::Io(std::io::Error::from_raw_os_error(errno)));
-            }
+        let r = if res < 0 {
+            Err(ChunkletError::Io(std::io::Error::from_raw_os_error(-res)))
         } else if (res as u32) < ptrs[idx].1 {
-            if first_err.is_none() {
-                first_err = Some(ChunkletError::Io(std::io::Error::other(format!(
-                    "io_uring short write op_idx={}: {} of {}",
-                    idx, res, ptrs[idx].1
-                ))));
-            }
-        }
-    }
-    if completed < ops.len() {
-        return Err(ChunkletError::Io(std::io::Error::other(format!(
-            "io_uring expected {} cqes, got {}",
-            ops.len(),
-            completed
-        ))));
+            Err(ChunkletError::Io(std::io::Error::other(format!(
+                "io_uring short write op_idx={}: {} of {}",
+                idx, res, ptrs[idx].1
+            ))))
+        } else {
+            Ok(())
+        };
+        results[idx] = Some(r);
     }
     drop(bounces);
-    first_err.map_or(Ok(()), Err)
+    // Any op without a CQE (should not happen after submit_and_wait(n)) is
+    // reported as that op's own error, not a batch failure.
+    results
+        .into_iter()
+        .map(|o| {
+            o.unwrap_or_else(|| {
+                Err(ChunkletError::Io(std::io::Error::other(format!(
+                    "io_uring missing cqe (completed {} of {})",
+                    completed, n
+                ))))
+            })
+        })
+        .collect()
 }
 
 fn is_direct_aligned(offset: u64, len: usize, ptr: usize) -> bool {
