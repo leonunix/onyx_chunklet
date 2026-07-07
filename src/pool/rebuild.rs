@@ -23,11 +23,21 @@ use crate::pd::PhysicalDisk;
 use crate::pool::{PdHealth, Pool, RebuildProgress, SetRebuild, ShadowTarget};
 use crate::types::{ChunkletState, LdId, LdRole, PdId, RaidLevel};
 
-/// Batch size for rebuild reconstruct work. Trades memory (K+1 batches per
-/// LD set) for syscall count. 1 MiB / 4 KiB blocks = 256 strips per IO,
-/// reducing the per-stripe overhead by ~256x while keeping memory at
-/// (K+1) MiB per active rebuild.
-const REBUILD_BATCH_BYTES: u64 = 1024 * 1024;
+/// Batch size for the online-rebuild backfill: how many contiguous strips a
+/// single stripe-lock acquisition covers, reconstructed with one range read
+/// per survivor + one range write per shadow.
+///
+/// This is deliberately SMALL (not throughput-maximizing). Phase B holds the
+/// SAME stripe locks foreground writes take (a 1024-bucket hashed table,
+/// `ld/mod.rs`), so the batch size directly bounds how much foreground write
+/// latency a rebuild can inflict: at 256 KiB / 4 KiB = 64 strips, a batch
+/// holds ~64 of 1024 buckets for ~one range-IO round-trip. The disks are
+/// near-idle during rebuild — the lock, not bandwidth, was starving foreground
+/// — so we keep the window tiny rather than chase rebuild speed. (The old
+/// 1 MiB value only batched the LOCK; the IO was still per-4 KiB-strip and
+/// synchronous, so a batch held ~256 buckets for ~25 ms and devastated
+/// foreground writes.)
+const REBUILD_BATCH_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct RebuildReport {
@@ -276,7 +286,11 @@ impl Pool {
             let strip_bytes = engine.strip_bytes();
             let stripes = engine.stripes_per_chunklet();
             let batch_stripes = std::cmp::max(1, REBUILD_BATCH_BYTES / strip_bytes);
-            let mut buf = vec![0u8; strip_bytes as usize];
+            // One range buffer reused across batches, sized to a full batch so a
+            // batch is a single contiguous reconstruct-read per survivor + a
+            // single contiguous shadow write — not `batch_stripes` synchronous
+            // per-strip round-trips under the held stripe lock.
+            let mut buf = vec![0u8; (batch_stripes * strip_bytes) as usize];
             'backfill: for (set_idx, sr) in progress.targets_by_set.iter().enumerate() {
                 let Some(sr) = sr else { continue };
                 let mut s = 0u64;
@@ -285,29 +299,37 @@ impl Pool {
                         break 'backfill;
                     }
                     let n = std::cmp::min(batch_stripes, stripes - s);
+                    let range_len = (n * strip_bytes) as usize;
+                    let base_off = s * strip_bytes;
                     // Hold the SAME stripe locks foreground writes take, in the
                     // same globally-sorted order, across reconstruct + shadow
-                    // write + cursor advance for this batch.
+                    // write + cursor advance for this batch. Keeping the batch
+                    // small bounds both the hold TIME (one range-IO round-trip,
+                    // not `n` synchronous 4 KiB round-trips) and the hold BREADTH
+                    // (`n` of 1024 hashed buckets) so foreground writes are not
+                    // starved — see REBUILD_BATCH_BYTES.
                     let keys: Vec<u64> =
                         (s..s + n).map(|st| ((set_idx as u64) << 32) | st).collect();
                     let _guards = runtime.stripe_locks.write_keys(&keys);
-                    for st in s..s + n {
-                        let off = st * strip_bytes;
-                        for shadow in &sr.shadows {
-                            let midx = set_idx * n_per_set + shadow.pos_in_set;
-                            engine.reconstruct_member_strip(midx, off, &mut buf)?;
-                            if let Err(e) = shadow.pd.write_chunklet_user(
-                                shadow.chunklet_index,
-                                off,
-                                &buf,
-                            ) {
-                                tracing::error!(
-                                    "online rebuild: shadow backfill write failed (set {} pos {}): {} — aborting",
-                                    set_idx, shadow.pos_in_set, e
-                                );
-                                progress.aborted.store(true, Ordering::Relaxed);
-                                break 'backfill;
-                            }
+                    for shadow in &sr.shadows {
+                        let midx = set_idx * n_per_set + shadow.pos_in_set;
+                        // Range reconstruct: reconstruct_member_strip reads
+                        // `range_len` contiguous bytes from each survivor in one
+                        // syscall and reconstructs all `n` strips in memory. The
+                        // GF math is pointwise with position-indexed constants, so
+                        // a range buffer is byte-identical to `n` per-strip calls.
+                        engine.reconstruct_member_strip(midx, base_off, &mut buf[..range_len])?;
+                        if let Err(e) = shadow.pd.write_chunklet_user(
+                            shadow.chunklet_index,
+                            base_off,
+                            &buf[..range_len],
+                        ) {
+                            tracing::error!(
+                                "online rebuild: shadow backfill write failed (set {} pos {}): {} — aborting",
+                                set_idx, shadow.pos_in_set, e
+                            );
+                            progress.aborted.store(true, Ordering::Relaxed);
+                            break 'backfill;
                         }
                     }
                     sr.cursor.store(s + n, Ordering::Release);
