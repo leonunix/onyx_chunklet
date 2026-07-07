@@ -909,14 +909,37 @@ impl LdRaid5 {
             let new_data = &buf[range.clone()];
             let len = new_data.len();
             let mut old_data = vec![0u8; len];
-            self.read_data_strip(set_idx, *pos, strip_base + off, &mut old_data)?;
+            match self.read_data_strip(set_idx, *pos, strip_base + off, &mut old_data) {
+                Ok(()) => {}
+                Err(e) if is_runtime_read_fault(&e) => {
+                    // A modified position's OLD data faulted (dead-but-not-yet-
+                    // isolated). The delta can't be applied, but RW recomputes
+                    // parity from the NEW data + surviving strips WITHOUT reading
+                    // old data/parity — so abandon RMW and recompute cleanly. RW
+                    // runs under the SAME held stripe lock (no re-lock). The
+                    // follow-on write to this still-is_some member is absorbed by
+                    // submit_set_absorb within `budget`. Report a read suspect.
+                    self.report_read_suspect(self.member_idx_data(set_idx, *pos));
+                    return self.write_partial_stripe_rw(set_idx, strip_base, positions, buf, budget);
+                }
+                Err(e) => return Err(e),
+            }
             let dst = &mut delta_full_strip[(*off as usize)..(*off as usize) + len];
             for i in 0..len {
                 dst[i] ^= old_data[i] ^ new_data[i];
             }
         }
         let mut parity = vec![0u8; strip];
-        self.read_parity_strip(set_idx, strip_base, &mut parity)?;
+        match self.read_parity_strip(set_idx, strip_base, &mut parity) {
+            Ok(()) => {}
+            Err(e) if is_runtime_read_fault(&e) => {
+                // Old parity faulted — RW recomputes parity from scratch and
+                // never reads old parity, so abandon RMW.
+                self.report_read_suspect(self.member_idx_parity(set_idx));
+                return self.write_partial_stripe_rw(set_idx, strip_base, positions, buf, budget);
+            }
+            Err(e) => return Err(e),
+        }
         xor_into(&mut parity, &delta_full_strip);
 
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 1);
@@ -1228,15 +1251,32 @@ impl LdRaid5 {
             });
         }
 
-        let _guards = self.stripe_locks.write_keys(&stripe_keys);
+        let guards = self.stripe_locks.write_keys(&stripe_keys);
 
         // Phase 1: one batched read submit for every segment's RMW reads.
         let mut reads: Vec<StripRead> = Vec::new();
         for seg in segs.iter_mut() {
             self.r5_collect_reads(seg, &mut reads);
         }
-        parallel_strip_reads(&mut reads)?;
+        let read_result = parallel_strip_reads(&mut reads);
         drop(reads);
+        if let Err(e) = read_result {
+            // A member faulted on a Phase-1 old-data/parity read (dead-but-not-
+            // yet-isolated). We hold the batch's stripe write locks, so we MUST
+            // NOT re-enter write_at here (it re-locks the same buckets →
+            // self-deadlock). Drop the guards first, then replay serially: each
+            // stripe re-locks independently and write_one_stripe_segment handles
+            // the fault via RMW→RW reconstruct. The flusher's spans are disjoint,
+            // so dropping the batch guards loses no cross-stripe consistency.
+            if is_runtime_read_fault(&e) {
+                drop(guards);
+                for (offset, buf) in ops {
+                    self.write_at(*offset, buf)?;
+                }
+                return Ok(());
+            }
+            return Err(e);
+        }
 
         // Phase 2: recompute parity per segment from the freshly-read state.
         for seg in segs.iter_mut() {

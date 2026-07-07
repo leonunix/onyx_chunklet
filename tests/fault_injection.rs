@@ -819,3 +819,132 @@ fn raid6_read_eio_two_data_faults_over_budget_errors() {
          serve it ⇒ read must error (no wrong data)"
     );
 }
+
+/// RAID5 RMW write where the modified position's OLD-data read faults: RMW
+/// abandons to RW (recompute-from-scratch), which for a full-strip modify never
+/// reads that member — so the write completes transparently. Verifies the new
+/// value is durable AND that parity is consistent (re-faulting the member and
+/// reading reconstructs the NEW value via parity).
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid5_rmw_old_data_read_eio_recomputes_via_rw() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid5(4, 1, 1, 0)).unwrap(); // 4 data + parity
+    let ld = pool.open_ld(id).unwrap();
+    // Fill the full stripe so every strip has a known old value.
+    ld.write_at(0, &pattern(30, 4 * 4096, 0)).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let data0 = desc.members[0].pd;
+    pool.pd(data0).unwrap().set_read_faulting(true);
+
+    // Full-strip modify of data position 0 → RMW (4 data, 1 modified) reads its
+    // OLD data → faults → abandons to RW (which does NOT read a fully-modified
+    // position). The data0 WRITE is unaffected by the read fault, so it lands.
+    let ld = pool.open_ld(id).unwrap();
+    let new0 = pattern(31, 4096, 0);
+    ld.write_at(0, &new0)
+        .expect("R5 RMW rides through a faulting old-data read via RW recompute");
+    // The read fault surfaced a suspect for data0.
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("the faulting member is reported as a suspect");
+    assert_eq!(ev.pd_id, data0);
+    drop(ld);
+
+    // Direct read-back (fault cleared): data0 holds the new value.
+    pool.pd(data0).unwrap().set_read_faulting(false);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rb = vec![0u8; 4096];
+    ld.read_at(0, &mut rb).unwrap();
+    assert_eq!(rb, new0, "data0 durable with the new value after RW recompute");
+    drop(ld);
+
+    // Parity consistency: re-fault data0 and read → reconstruct via parity must
+    // return the NEW value (proves RW recomputed parity correctly).
+    pool.pd(data0).unwrap().set_read_faulting(true);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rc = vec![0u8; 4096];
+    ld.read_at(0, &mut rc)
+        .expect("reconstruct via parity after RW recompute");
+    assert_eq!(rc, new0, "parity is consistent with the RW-recomputed stripe");
+}
+
+/// Batched (`write_many_at`) RMW where a Phase-1 old-data read faults: the batch
+/// holds all stripe write locks, so it must NOT re-enter write_at (self-deadlock)
+/// — it drops the guards and replays serially, which recomputes via RW. Verifies
+/// no hang and the new value is durable.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid5_write_many_rmw_read_eio_bails_to_serial_and_recomputes() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid5(4, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &pattern(32, 4 * 4096, 0)).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let data0 = desc.members[0].pd;
+    pool.pd(data0).unwrap().set_read_faulting(true);
+
+    // A single full-strip modify of data0 via write_many_at → batched RMW →
+    // Phase-1 old-data0 read faults → drops guards → serial replay → RW.
+    let new0 = pattern(33, 4096, 0);
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_many_at(&[(0, &new0)])
+        .expect("batched RMW bails to serial + recomputes on a faulting read (no deadlock)");
+    drop(ld);
+
+    pool.pd(data0).unwrap().set_read_faulting(false);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rb = vec![0u8; 4096];
+    ld.read_at(0, &mut rb).unwrap();
+    assert_eq!(rb, new0, "data0 durable with the new value after serial RW replay");
+}
+
+/// RAID6 partial write where an old-data / old-P / old-Q read faults: PDW
+/// abandons to RW (recompute P and Q from scratch, never reading old parity),
+/// completing transparently. Verifies durability + parity consistency (reading
+/// the faulting member reconstructs the new value).
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid6_partial_write_read_eio_recomputes_via_rw() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 6);
+    let id = pool.create_ld(LdSpec::raid6(4, 1, 1, 0)).unwrap(); // 4 data + P + Q
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &pattern(40, 4 * 4096, 0)).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let data0 = desc.members[0].pd;
+    pool.pd(data0).unwrap().set_read_faulting(true);
+
+    // Full-strip modify of data0. Whichever partial path is chosen (PDW or RW),
+    // a full modify never reads data0's old value, and a PDW old-P/Q read fault
+    // abandons to RW — so the write completes and data0 lands.
+    let ld = pool.open_ld(id).unwrap();
+    let new0 = pattern(41, 4096, 0);
+    ld.write_at(0, &new0)
+        .expect("R6 partial write rides through a faulting old read via RW recompute");
+    drop(ld);
+
+    pool.pd(data0).unwrap().set_read_faulting(false);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rb = vec![0u8; 4096];
+    ld.read_at(0, &mut rb).unwrap();
+    assert_eq!(rb, new0, "data0 durable with the new value after RW recompute");
+    drop(ld);
+
+    // Parity consistency: re-fault data0 → read reconstructs the new value.
+    pool.pd(data0).unwrap().set_read_faulting(true);
+    let ld = pool.open_ld(id).unwrap();
+    let mut rc = vec![0u8; 4096];
+    ld.read_at(0, &mut rc)
+        .expect("reconstruct via P/Q after RW recompute");
+    assert_eq!(rc, new0, "P/Q consistent with the RW-recomputed stripe");
+}

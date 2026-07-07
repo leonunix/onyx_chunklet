@@ -1204,8 +1204,21 @@ impl LdRaid6 {
             in_chunklet_off: strip_base,
             data: &mut q,
         });
-        parallel_strip_reads(&mut read_ops)?;
+        let read_result = parallel_strip_reads(&mut read_ops);
         drop(read_ops);
+        if let Err(e) = read_result {
+            if is_runtime_read_fault(&e) {
+                // A modified position's old data, or old P/Q, faulted (dead-but-
+                // not-yet-isolated). PDW's delta can't be applied, but RW
+                // recomputes P and Q from scratch WITHOUT reading old parity, and
+                // reconstructs any faulting base strip within R6's budget of 2.
+                // RW runs under the SAME held stripe lock (no re-lock). A dead
+                // member's follow-on write is absorbed + suspected by RW's
+                // submit_set_absorb.
+                return self.write_partial_stripe_rw(set_idx, strip_base, positions, buf, budget);
+            }
+            return Err(e);
+        }
 
         for ((pos, off, range), old_data) in positions.iter().zip(old_data.iter()) {
             let new_data = &buf[range.clone()];
@@ -1597,15 +1610,32 @@ impl LdRaid6 {
 
         // Hold every touched stripe lock across read+compute+write, acquired in
         // one globally-sorted batch (matches `write_key`'s bucket order).
-        let _guards = self.stripe_locks.write_keys(&stripe_keys);
+        let guards = self.stripe_locks.write_keys(&stripe_keys);
 
         // Phase 1: one batched read submit for every segment's RMW reads.
         let mut reads: Vec<StripRead> = Vec::new();
         for seg in segs.iter_mut() {
             self.r6_collect_reads(seg, &mut reads);
         }
-        parallel_strip_reads(&mut reads)?;
+        let read_result = parallel_strip_reads(&mut reads);
         drop(reads);
+        if let Err(e) = read_result {
+            // A member faulted on a Phase-1 old-data/P/Q read (dead-but-not-yet-
+            // isolated). We hold the batch's stripe write locks; re-entering
+            // write_at here would re-lock the same buckets (self-deadlock). Drop
+            // the guards, then replay serially — each stripe re-locks on its own
+            // and write_one_stripe_segment handles the fault via PDW→RW. The
+            // flusher's spans are disjoint, so dropping the batch guards loses no
+            // cross-stripe consistency.
+            if is_runtime_read_fault(&e) {
+                drop(guards);
+                for (offset, buf) in ops {
+                    self.write_at(*offset, buf)?;
+                }
+                return Ok(());
+            }
+            return Err(e);
+        }
 
         // Phase 2: recompute P/Q per segment from the freshly-read state.
         for seg in segs.iter_mut() {
