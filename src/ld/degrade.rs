@@ -90,6 +90,24 @@ pub(crate) fn absorb_degraded(
     Ok(suspects)
 }
 
+/// True for a runtime read error from a member the LD still believes healthy —
+/// the read-side analog of a write EIO. The reconstruct-on-read path absorbs
+/// these (rebuilds the strip from surviving redundancy within budget) and emits
+/// a [`SuspectMember`] so a fault surfaced only by reads still triggers fast
+/// isolation.
+///
+/// Absorb `{Device, Io}`: `Device` is what the default `SyncBackend` and every
+/// serial direct-PD read surface (`RawDevice::read_loop` / `PhysicalDisk`
+/// read-fault hook), `Io` is what `UringBackend` / the write fault harness
+/// produce. NEVER absorb `Crc` (silent corruption MUST surface), nor structural
+/// errors (`Invariant` / `Format` / `WriteRedundancyExceeded` / `NoSpace` /
+/// `Unsupported` / `PoolLocked` / `PoolMismatch` / `NoValidSuperblock` /
+/// `Config`) — those are bugs or capacity walls, not a recoverable member IO
+/// fault, and reconstructing over them would mask the real defect.
+pub(crate) fn is_runtime_read_fault(e: &ChunkletError) -> bool {
+    matches!(e, ChunkletError::Device { .. } | ChunkletError::Io(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

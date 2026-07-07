@@ -46,6 +46,15 @@ pub struct PhysicalDisk {
     /// (Pool::create / open / open_with_missing / admit) and cloned by
     /// `parallel_strip_writes` from any PD in the batch.
     backend: parking_lot::RwLock<std::sync::Arc<dyn crate::io::IoBackend>>,
+    /// Test/diagnostic hook: when set, every `read_chunklet_user` on this PD
+    /// returns a `Device` error, simulating a member whose reads fault while the
+    /// LD still believes it healthy (a link glitch / dying disk in the window
+    /// before isolation). Installed at runtime like [`Self::set_backend`] (NOT
+    /// `cfg(test)`, so integration fault-injection tests can drive the
+    /// reconstruct-on-read path uniformly — the fast read, sibling reads, and
+    /// RAID5/6 parity survivor reads all funnel through `read_chunklet_user`).
+    /// Default false; never consulted on the write path.
+    read_faulting: std::sync::atomic::AtomicBool,
 }
 
 struct PdState {
@@ -138,6 +147,7 @@ impl PhysicalDisk {
             state: RwLock::new(state),
             numa_node: parking_lot::RwLock::new(numa_node),
             backend: parking_lot::RwLock::new(default_backend()),
+            read_faulting: std::sync::atomic::AtomicBool::new(false),
         });
         // Write initial state to slot A (head + tail).
         pd.write_initial()?;
@@ -189,6 +199,7 @@ impl PhysicalDisk {
             state: RwLock::new(state),
             numa_node: parking_lot::RwLock::new(numa_node),
             backend: parking_lot::RwLock::new(default_backend()),
+            read_faulting: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -202,6 +213,16 @@ impl PhysicalDisk {
     /// Current IO backend (cheap clone — `Arc<dyn IoBackend>`).
     pub fn backend(&self) -> std::sync::Arc<dyn crate::io::IoBackend> {
         self.backend.read().clone()
+    }
+
+    /// Install (or clear) the per-PD read-fault hook (see the `read_faulting`
+    /// field). While set, every `read_chunklet_user` on this PD returns a
+    /// `Device` error, simulating a member whose reads EIO in the window before
+    /// isolation. Used by fault-injection tests to exercise reconstruct-on-read;
+    /// not consulted on the write path.
+    pub fn set_read_faulting(&self, on: bool) {
+        self.read_faulting
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn numa_node(&self) -> Option<u16> {
@@ -370,6 +391,12 @@ impl PhysicalDisk {
         buf: &mut [u8],
     ) -> ChunkletResult<()> {
         self.bind_current_to_local_node();
+        if self.read_faulting.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ChunkletError::Device {
+                path: self.raw.path().to_path_buf(),
+                reason: "injected read fault (set_read_faulting)".into(),
+            });
+        }
         let abs = self.chunklet_user_abs_offset(chunklet_index, offset, buf.len() as u64)?;
         self.raw.read_at(buf, abs)
     }

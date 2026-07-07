@@ -70,7 +70,7 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 
 use crate::error::{ChunkletError, ChunkletResult};
-use crate::ld::degrade::{absorb_degraded, SuspectMember};
+use crate::ld::degrade::{absorb_degraded, is_runtime_read_fault, SuspectMember};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256;
 use crate::ld::{
@@ -230,6 +230,110 @@ impl LdRaid6 {
                 let _ = tx.try_send(s);
             }
         }
+    }
+
+    /// Report a member that faulted on the READ side (dead-but-not-yet-isolated),
+    /// so a fault surfaced only by reads still triggers fast isolation.
+    fn report_read_suspect(&self, member_idx: usize) {
+        if let Some(pd) = self.members[member_idx].as_ref() {
+            self.report_suspects(vec![SuspectMember {
+                pd_id: pd.pd_id(),
+                chunklet_index: self.desc.members[member_idx].chunklet_index,
+            }]);
+        }
+    }
+
+    /// Reconstruct a full data strip whose member faulted at RUNTIME while the LD
+    /// still believes it healthy (dead-but-not-yet-isolated). Treats that
+    /// position as failed IN ADDITION to any open-failed data positions (the
+    /// "effective failed set"), and dispatches to the P/Q reconstruct that fits
+    /// it — within R6's budget of 2. Unlike `reconstruct_unmodified_data`, which
+    /// derives its failed set from `failed_data_positions()` (is_none only) and
+    /// would wrongly re-read the still-`is_some` faulting member, this builds the
+    /// effective set explicitly. Errors (never returns wrong data) when the
+    /// effective set exceeds budget or a survivor read also faults. `out.len()`
+    /// must equal `strip_bytes`.
+    fn reconstruct_full_data_strip(
+        &self,
+        set_idx: usize,
+        data_pos: usize,
+        strip_base: u64,
+        out: &mut [u8],
+    ) -> ChunkletResult<()> {
+        let mut ef = self.failed_data_positions(set_idx);
+        if !ef.contains(&data_pos) {
+            ef.push(data_pos);
+        }
+        ef.sort_unstable();
+        let p_ok = !self.parity_p_failed(set_idx);
+        let q_ok = !self.parity_q_failed(set_idx);
+        match ef.len() {
+            1 => {
+                if p_ok {
+                    self.reconstruct_one_data(set_idx, data_pos, strip_base, out)
+                } else if q_ok {
+                    self.reconstruct_one_data_via_q(set_idx, data_pos, strip_base, out)
+                } else {
+                    Err(ChunkletError::Invariant(format!(
+                        "Raid6 set {}: 1 data + both parity unavailable — read reconstruct over budget",
+                        set_idx
+                    )))
+                }
+            }
+            2 if p_ok && q_ok => {
+                let (x, y) = (ef[0], ef[1]);
+                let (dx, dy) = self.reconstruct_two_data(set_idx, x, y, strip_base, out.len())?;
+                out.copy_from_slice(if data_pos == x { &dx } else { &dy });
+                Ok(())
+            }
+            _ => Err(ChunkletError::Invariant(format!(
+                "Raid6 set {}: effective failed data set {:?} + parity(P_ok={}, Q_ok={}) exceeds budget 2",
+                set_idx, ef, p_ok, q_ok
+            ))),
+        }
+    }
+
+    /// Fallback for the fast batched read (`read_many_at`) when a member faults:
+    /// re-read each full-strip op, reconstructing any that returns a runtime read
+    /// fault via [`Self::reconstruct_full_data_strip`]. Suspects reported on both
+    /// the Ok and Err paths so an over-budget read still drives isolation.
+    fn reconstruct_read_batch(
+        &self,
+        reads: &mut [StripRead<'_>],
+        ctxs: &[(usize, usize)],
+    ) -> ChunkletResult<()> {
+        debug_assert_eq!(reads.len(), ctxs.len());
+        let mut suspects: Vec<SuspectMember> = Vec::new();
+        let mut result = Ok(());
+        for (r, &(set_idx, data_pos)) in reads.iter_mut().zip(ctxs) {
+            match self.read_data_strip(set_idx, data_pos, r.in_chunklet_off, r.data) {
+                Ok(()) => {}
+                Err(e) if is_runtime_read_fault(&e) => {
+                    if let Err(e2) =
+                        self.reconstruct_full_data_strip(set_idx, data_pos, r.in_chunklet_off, r.data)
+                    {
+                        result = Err(e2);
+                        break;
+                    }
+                    let m = self.member_idx_data(set_idx, data_pos);
+                    if let Some(pd) = self.members[m].as_ref() {
+                        let pd_id = pd.pd_id();
+                        if !suspects.iter().any(|s| s.pd_id == pd_id) {
+                            suspects.push(SuspectMember {
+                                pd_id,
+                                chunklet_index: self.desc.members[m].chunklet_index,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        self.report_suspects(suspects);
+        result
     }
 
     /// Submit ONE set's strip writes with inline-degrade. All backends
@@ -759,12 +863,38 @@ impl LogicalDisk for LdRaid6 {
                     &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
                 );
             } else {
-                self.read_data_strip(
+                match self.read_data_strip(
                     addr.set_idx,
                     addr.data_pos,
                     addr.in_chunklet_off,
                     &mut buf[buf_start..buf_start + take],
-                )?;
+                ) {
+                    Ok(()) => {}
+                    Err(e) if is_runtime_read_fault(&e) => {
+                        // Data member faulted although the LD still believes it
+                        // healthy. Reconstruct via the effective-failed-set
+                        // dispatch (this position + any open-failed data), within
+                        // R6's budget of 2; over budget or a survivor fault
+                        // surfaces the error. Emit a suspect so the fault also
+                        // drives isolation from the read side.
+                        let strip_len = self.strip_bytes as usize;
+                        let strip_base = addr.in_chunklet_off - addr.in_strip_off;
+                        let mut tmp = vec![0u8; strip_len];
+                        self.reconstruct_full_data_strip(
+                            addr.set_idx,
+                            addr.data_pos,
+                            strip_base,
+                            &mut tmp,
+                        )?;
+                        buf[buf_start..buf_start + take].copy_from_slice(
+                            &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
+                        );
+                        self.report_read_suspect(
+                            self.member_idx_data(addr.set_idx, addr.data_pos),
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             buf_start += take;
             cursor += take as u64;
@@ -778,6 +908,9 @@ impl LogicalDisk for LdRaid6 {
             self.ensure_aligned(*offset, buf.len())?;
         }
         let mut reads = Vec::with_capacity(ops.len());
+        // Parallel to `reads`: (set_idx, data_pos) so reconstruct-on-EIO can
+        // rebuild a faulting full strip via the effective-failed-set dispatch.
+        let mut ctxs: Vec<(usize, usize)> = Vec::new();
         for (offset, buf) in ops.iter_mut() {
             if buf.len() != self.strip_bytes as usize {
                 self.read_at(*offset, buf)?;
@@ -799,8 +932,13 @@ impl LogicalDisk for LdRaid6 {
                 in_chunklet_off: addr.in_chunklet_off,
                 data: &mut **buf,
             });
+            ctxs.push((addr.set_idx, addr.data_pos));
         }
-        parallel_strip_reads(&mut reads)
+        match parallel_strip_reads(&mut reads) {
+            Ok(()) => Ok(()),
+            Err(e) if is_runtime_read_fault(&e) => self.reconstruct_read_batch(&mut reads, &ctxs),
+            Err(e) => Err(e),
+        }
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {

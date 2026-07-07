@@ -76,7 +76,7 @@ use std::sync::Arc;
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256::xor_into;
-use crate::ld::degrade::{absorb_degraded, SuspectMember};
+use crate::ld::degrade::{absorb_degraded, is_runtime_read_fault, SuspectMember};
 use crate::ld::{
     compute_strip_bytes, parallel_strip_reads, resolve_members, submit_strip_writes_detailed,
     LogicalDisk, ReconstructEngine, StripRead, StripWrite, StripeLockTable,
@@ -233,6 +233,18 @@ impl LdRaid5 {
         let suspects = absorb_degraded(&ops, &results, &group_of, &[max_fail])?;
         self.report_suspects(suspects);
         Ok(())
+    }
+
+    /// Report a member that faulted on the READ side (dead-but-not-yet-isolated),
+    /// so a fault surfaced only by reads still triggers fast isolation. Best
+    /// effort; a missing channel is ignored.
+    fn report_read_suspect(&self, member_idx: usize) {
+        if let Some(pd) = self.members[member_idx].as_ref() {
+            self.report_suspects(vec![SuspectMember {
+                pd_id: pd.pd_id(),
+                chunklet_index: self.desc.members[member_idx].chunklet_index,
+            }]);
+        }
     }
 
     fn set_being_rebuilt(&self, set_idx: usize) -> bool {
@@ -471,6 +483,56 @@ impl LdRaid5 {
         }
         Ok(())
     }
+
+    /// Fallback for the fast batched read (`read_many_at`) when a member returns
+    /// a runtime read fault: re-read each full-strip op, reconstructing any that
+    /// fault from parity + surviving data (R5 budget 1). Good ops just re-read
+    /// (bounded extra IO on the error path). A 2nd fault in a set — an
+    /// open-failed data member, or a fault on parity/another strip during
+    /// reconstruct — surfaces the error (over budget). Suspects are reported on
+    /// both the Ok and Err paths so an over-budget read still drives isolation.
+    fn reconstruct_read_batch(
+        &self,
+        reads: &mut [StripRead<'_>],
+        ctxs: &[(usize, usize)],
+    ) -> ChunkletResult<()> {
+        debug_assert_eq!(reads.len(), ctxs.len());
+        let mut suspects: Vec<SuspectMember> = Vec::new();
+        let mut result = Ok(());
+        for (r, &(set_idx, data_pos)) in reads.iter_mut().zip(ctxs) {
+            match self.read_data_strip(set_idx, data_pos, r.in_chunklet_off, r.data) {
+                Ok(()) => {}
+                Err(e) if is_runtime_read_fault(&e) => {
+                    if !self.failed_data_positions(set_idx).is_empty() {
+                        result = Err(e);
+                        break;
+                    }
+                    if let Err(e2) =
+                        self.reconstruct_data(set_idx, data_pos, r.in_chunklet_off, r.data)
+                    {
+                        result = Err(e2);
+                        break;
+                    }
+                    let m = self.member_idx_data(set_idx, data_pos);
+                    if let Some(pd) = self.members[m].as_ref() {
+                        let pd_id = pd.pd_id();
+                        if !suspects.iter().any(|s| s.pd_id == pd_id) {
+                            suspects.push(SuspectMember {
+                                pd_id,
+                                chunklet_index: self.desc.members[m].chunklet_index,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        self.report_suspects(suspects);
+        result
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -543,12 +605,40 @@ impl LogicalDisk for LdRaid5 {
                     &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
                 );
             } else {
-                self.read_data_strip(
+                match self.read_data_strip(
                     addr.set_idx,
                     addr.data_pos,
                     addr.in_chunklet_off,
                     &mut buf[buf_start..buf_start + take],
-                )?;
+                ) {
+                    Ok(()) => {}
+                    Err(e) if is_runtime_read_fault(&e) => {
+                        // The data member faulted although the LD still believes
+                        // it healthy (dead-but-not-yet-isolated). Within R5's
+                        // budget of 1 — i.e. no data position is already
+                        // open-failed — reconstruct the strip from parity + the
+                        // surviving data. A 2nd fault (open-failed member, or a
+                        // fault on parity/another strip mid-reconstruct) surfaces
+                        // the error (over budget). Emit a suspect so the fault
+                        // also drives isolation from the read side.
+                        if !self.failed_data_positions(addr.set_idx).is_empty() {
+                            return Err(e);
+                        }
+                        let strip_len = self.strip_bytes as usize;
+                        let mut tmp = vec![0u8; strip_len];
+                        self.reconstruct_data(
+                            addr.set_idx,
+                            addr.data_pos,
+                            addr.in_chunklet_off - addr.in_strip_off,
+                            &mut tmp,
+                        )?;
+                        buf[buf_start..buf_start + take].copy_from_slice(
+                            &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
+                        );
+                        self.report_read_suspect(self.member_idx_data(addr.set_idx, addr.data_pos));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             buf_start += take;
             cursor += take as u64;
@@ -562,6 +652,11 @@ impl LogicalDisk for LdRaid5 {
             self.ensure_aligned(*offset, buf.len())?;
         }
         let mut reads = Vec::with_capacity(ops.len());
+        // Parallel to `reads`: (set_idx, data_pos) so the reconstruct-on-EIO
+        // fallback can rebuild a faulting strip from parity + survivors. Every
+        // batched read is a full strip at a strip boundary of a healthy data
+        // position, so reconstruct writes straight into the read's buffer.
+        let mut ctxs: Vec<(usize, usize)> = Vec::new();
         for (offset, buf) in ops.iter_mut() {
             if buf.len() != self.strip_bytes as usize {
                 self.read_at(*offset, buf)?;
@@ -582,8 +677,13 @@ impl LogicalDisk for LdRaid5 {
                 in_chunklet_off: addr.in_chunklet_off,
                 data: &mut **buf,
             });
+            ctxs.push((addr.set_idx, addr.data_pos));
         }
-        parallel_strip_reads(&mut reads)
+        match parallel_strip_reads(&mut reads) {
+            Ok(()) => Ok(()),
+            Err(e) if is_runtime_read_fault(&e) => self.reconstruct_read_batch(&mut reads, &ctxs),
+            Err(e) => Err(e),
+        }
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {

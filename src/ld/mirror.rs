@@ -49,7 +49,7 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 
 use crate::error::{ChunkletError, ChunkletResult};
-use crate::ld::degrade::{absorb_degraded, SuspectMember};
+use crate::ld::degrade::{absorb_degraded, is_runtime_read_fault, SuspectMember};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{
     compute_strip_bytes, parallel_strip_reads, resolve_members, submit_strip_writes_detailed,
@@ -336,7 +336,11 @@ impl LdMirror {
     /// set's cursor, then walk the ring skipping missing/Failed copies.
     /// Errors only when every copy in the set is dead. Mirror "reconstruction"
     /// is just reading a surviving sibling — no parity math.
-    fn pick_read_copy(&self, row: usize, set: usize) -> ChunkletResult<(Arc<PhysicalDisk>, u32)> {
+    fn pick_read_copy(
+        &self,
+        row: usize,
+        set: usize,
+    ) -> ChunkletResult<(Arc<PhysicalDisk>, u32, usize)> {
         let row_size = self.desc.row_size as usize;
         let copies = self.member_indices_for(row, set);
         let n = copies.end - copies.start;
@@ -344,7 +348,7 @@ impl LdMirror {
         for off in 0..n {
             let m = copies.start + (start + off) % n;
             if let Some(pd) = self.members[m].as_ref() {
-                return Ok((pd.clone(), self.desc.members[m].chunklet_index));
+                return Ok((pd.clone(), self.desc.members[m].chunklet_index, m));
             }
         }
         Err(ChunkletError::Invariant(format!(
@@ -419,15 +423,16 @@ impl LdMirror {
         offset: u64,
         buf: &'b mut [u8],
         out: &mut Vec<StripRead<'b>>,
+        ctxs: &mut Vec<(usize, usize, usize)>,
     ) -> ChunkletResult<()> {
-        let mut layout: Vec<(u64, Arc<PhysicalDisk>, u32, usize)> = Vec::new();
+        let mut layout: Vec<(u64, Arc<PhysicalDisk>, u32, usize, usize, usize, usize)> = Vec::new();
         self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
-            let (pd, chunklet_index) = self.pick_read_copy(row, set)?;
-            layout.push((off_in_c, pd, chunklet_index, range.end - range.start));
+            let (pd, chunklet_index, chosen) = self.pick_read_copy(row, set)?;
+            layout.push((off_in_c, pd, chunklet_index, range.end - range.start, row, set, chosen));
             Ok(())
         })?;
         let mut rest: &mut [u8] = buf;
-        for (in_chunklet_off, pd, chunklet_index, seg_len) in layout {
+        for (in_chunklet_off, pd, chunklet_index, seg_len, row, set, chosen) in layout {
             let (head, tail) = rest.split_at_mut(seg_len);
             rest = tail;
             out.push(StripRead {
@@ -436,9 +441,95 @@ impl LdMirror {
                 in_chunklet_off,
                 data: head,
             });
+            // Parallel to `out`: the (row, set) each StripRead belongs to plus the
+            // member index the fast path chose, so the reconstruct-on-EIO fallback
+            // re-reads that (likely-faulting) copy first — guaranteeing the fault
+            // is recorded as a suspect — then walks the surviving siblings.
+            ctxs.push((row, set, chosen));
         }
         debug_assert!(rest.is_empty(), "segment lengths must sum to buf.len()");
         Ok(())
+    }
+
+    /// Fallback for the fast batched read when a member returns a runtime read
+    /// fault (dead-but-not-yet-isolated). Re-reads each segment from any live
+    /// copy, skipping copies that fault (recording each as a [`SuspectMember`]),
+    /// so a single-member fault is transparent on the READ side — no reliance on
+    /// an upper-layer journal. Suspects are reported on BOTH the Ok and Err
+    /// paths so an over-budget read still triggers isolation of the dead members.
+    /// Errors only when every live copy of some segment faults.
+    fn reconstruct_reads(
+        &self,
+        reads: &mut [StripRead<'_>],
+        ctxs: &[(usize, usize, usize)],
+    ) -> ChunkletResult<()> {
+        debug_assert_eq!(reads.len(), ctxs.len());
+        let mut suspects: Vec<SuspectMember> = Vec::new();
+        let mut result = Ok(());
+        for (r, &(row, set, chosen)) in reads.iter_mut().zip(ctxs) {
+            if let Err(e) = self.read_segment_reconstruct(
+                row,
+                set,
+                chosen,
+                r.in_chunklet_off,
+                r.data,
+                &mut suspects,
+            ) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.report_suspects(suspects);
+        result
+    }
+
+    /// Read one (row, set) segment for the reconstruct fallback. Tries the
+    /// fast-path `chosen` copy FIRST — if it faults (the reason we fell back),
+    /// that copy is recorded as a suspect and we walk the surviving siblings.
+    /// Any copy that returns a runtime read fault is skipped + recorded; a
+    /// structural error (Crc / Invariant / …) surfaces immediately (never
+    /// reconstructed over — that could mask corruption). Errors when no live
+    /// copy can serve the segment (every copy faulted / absent).
+    fn read_segment_reconstruct(
+        &self,
+        row: usize,
+        set: usize,
+        chosen: usize,
+        in_chunklet_off: u64,
+        out: &mut [u8],
+        suspects: &mut Vec<SuspectMember>,
+    ) -> ChunkletResult<()> {
+        let copies = self.member_indices_for(row, set);
+        let mut last_err: Option<ChunkletError> = None;
+        // Order: the fast-path copy first, then the rest of the set ring.
+        let order = std::iter::once(chosen).chain(copies.clone().filter(|&m| m != chosen));
+        for m in order {
+            let Some(pd) = self.members[m].as_ref() else {
+                continue;
+            };
+            let chunklet_idx = self.desc.members[m].chunklet_index;
+            match pd.read_chunklet_user(chunklet_idx, in_chunklet_off, out) {
+                Ok(()) => return Ok(()),
+                Err(e) if is_runtime_read_fault(&e) => {
+                    let pd_id = pd.pd_id();
+                    if !suspects.iter().any(|s| s.pd_id == pd_id) {
+                        suspects.push(SuspectMember {
+                            pd_id,
+                            chunklet_index: chunklet_idx,
+                        });
+                    }
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            ChunkletError::Invariant(format!(
+                "Mirror set (row={}, set={}) has no live copy for reconstruct-read",
+                row, set
+            ))
+        }))
     }
 }
 
@@ -479,8 +570,17 @@ impl LogicalDisk for LdMirror {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
         let mut reads: Vec<StripRead> = Vec::new();
-        self.carve_reads(offset, buf, &mut reads)?;
-        parallel_strip_reads(&mut reads)
+        let mut ctxs: Vec<(usize, usize, usize)> = Vec::new();
+        self.carve_reads(offset, buf, &mut reads, &mut ctxs)?;
+        // Fast path: one batched submit picking a single copy per segment. On a
+        // runtime member fault (dead-but-not-yet-isolated copy) fall back to a
+        // per-segment reconstruct that reads a surviving sibling — transparent
+        // to the caller, no upper-layer replay needed.
+        match parallel_strip_reads(&mut reads) {
+            Ok(()) => Ok(()),
+            Err(e) if is_runtime_read_fault(&e) => self.reconstruct_reads(&mut reads, &ctxs),
+            Err(e) => Err(e),
+        }
     }
 
     fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> ChunkletResult<()> {
@@ -492,11 +592,16 @@ impl LogicalDisk for LdMirror {
         // `&mut [u8]` out of `ops` at its original lifetime so the reads can
         // outlive the per-op iteration and submit together.
         let mut reads: Vec<StripRead> = Vec::with_capacity(ops.len());
+        let mut ctxs: Vec<(usize, usize, usize)> = Vec::new();
         for (offset, buf_ref) in ops.iter_mut() {
             let buf: &mut [u8] = std::mem::take(buf_ref);
-            self.carve_reads(*offset, buf, &mut reads)?;
+            self.carve_reads(*offset, buf, &mut reads, &mut ctxs)?;
         }
-        parallel_strip_reads(&mut reads)
+        match parallel_strip_reads(&mut reads) {
+            Ok(()) => Ok(()),
+            Err(e) if is_runtime_read_fault(&e) => self.reconstruct_reads(&mut reads, &ctxs),
+            Err(e) => Err(e),
+        }
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {

@@ -633,3 +633,189 @@ fn raid6_three_member_fault_exceeds_budget() {
         "3 failed members > R6 budget 2 ⇒ write must surface the error"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reconstruct-on-READ (a member faults on the READ side while the LD still
+// believes it healthy — the detection window before isolation). These use the
+// per-PD `set_read_faulting` hook (uniform across the fast read, sibling reads,
+// and RAID5/6 parity survivor reads, all of which funnel through
+// `read_chunklet_user`). They assert the read is TRANSPARENT (correct bytes,
+// no upper-layer replay), that the faulting member is reported as a suspect so
+// reads also drive fast isolation, and that an over-budget read surfaces an
+// error (never silently reconstructs wrong data).
+// ---------------------------------------------------------------------------
+
+/// 3-way mirror: the round-robin-chosen copy's reads fault → read reconstructs
+/// from a surviving sibling transparently, and the faulting copy is a suspect.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn mirror_read_eio_reconstructs_from_sibling_and_suspects() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 3);
+    let id = pool.create_ld(LdSpec::mirror(3, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let payload = pattern(1, 4096, 0);
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let target = desc.members[0].pd; // a fresh handle's first read picks copy 0
+    pool.pd(target).unwrap().set_read_faulting(true);
+
+    let ld = pool.open_ld(id).unwrap();
+    let mut buf = vec![0u8; 4096];
+    ld.read_at(0, &mut buf)
+        .expect("mirror read reconstructs from a live sibling transparently");
+    assert_eq!(buf, payload, "reconstruct-on-read returns the correct bytes");
+
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("the faulting copy must be reported as a suspect");
+    assert_eq!(ev.pd_id, target, "suspect is the faulting copy's PD");
+}
+
+/// 2-way mirror with BOTH copies' reads faulting → no live copy → the read
+/// surfaces an error (never fabricates data), and both are suspected.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn mirror_all_live_copies_fail_read_surfaces_error() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 2);
+    let id = pool.create_ld(LdSpec::mirror(2, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &vec![0x5au8; 4096]).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    pool.pd(desc.members[0].pd).unwrap().set_read_faulting(true);
+    pool.pd(desc.members[1].pd).unwrap().set_read_faulting(true);
+
+    let ld = pool.open_ld(id).unwrap();
+    let mut buf = vec![0u8; 4096];
+    assert!(
+        ld.read_at(0, &mut buf).is_err(),
+        "every live copy faulting ⇒ read must surface an error"
+    );
+    // Both faulting copies are reported (order-independent).
+    let mut seen = std::collections::BTreeSet::new();
+    while let Ok(ev) = pool.suspect_events().try_recv() {
+        seen.insert(ev.pd_id);
+    }
+    assert!(
+        seen.contains(&desc.members[0].pd) && seen.contains(&desc.members[1].pd),
+        "both faulting copies reported as suspects, got {:?}",
+        seen
+    );
+}
+
+/// RAID5: a data member's reads fault → read reconstructs via parity + the
+/// surviving data, transparently, and the faulting member is a suspect.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid5_read_eio_reconstructs_via_parity_and_suspects() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 3);
+    let id = pool.create_ld(LdSpec::raid5(2, 1, 1, 0)).unwrap(); // 2 data + 1 parity
+    let ld = pool.open_ld(id).unwrap();
+    let payload = pattern(7, 4096, 0);
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let target = desc.members[0].pd; // data position 0
+    pool.pd(target).unwrap().set_read_faulting(true);
+
+    let ld = pool.open_ld(id).unwrap();
+    let mut buf = vec![0u8; 4096];
+    ld.read_at(0, &mut buf)
+        .expect("R5 read reconstructs the faulting data strip from parity");
+    assert_eq!(buf, payload, "reconstruct-on-read returns the correct bytes");
+
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("the faulting data member must be reported as a suspect");
+    assert_eq!(ev.pd_id, target);
+}
+
+/// RAID5 over budget: a data read fault PLUS parity reads faulting = 2 faults
+/// in a set that tolerates 1 → the read surfaces an error, never wrong data.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid5_read_eio_second_failure_over_budget_errors() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 3);
+    let id = pool.create_ld(LdSpec::raid5(2, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &pattern(8, 4096, 0)).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    pool.pd(desc.members[0].pd).unwrap().set_read_faulting(true); // data 0
+    pool.pd(desc.members[2].pd).unwrap().set_read_faulting(true); // parity
+
+    let ld = pool.open_ld(id).unwrap();
+    let mut buf = vec![0u8; 4096];
+    assert!(
+        ld.read_at(0, &mut buf).is_err(),
+        "data + parity faulting = over R5 budget 1 ⇒ read must error"
+    );
+}
+
+/// RAID6: one data member's reads fault → read reconstructs via P + surviving
+/// data (effective failed set of size 1), transparently, and it is suspected.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid6_read_eio_one_data_reconstructs_and_suspects() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid6(2, 1, 1, 0)).unwrap(); // 2 data + P + Q
+    let ld = pool.open_ld(id).unwrap();
+    let payload = pattern(9, 4096, 0);
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let target = desc.members[0].pd; // data position 0
+    pool.pd(target).unwrap().set_read_faulting(true);
+
+    let ld = pool.open_ld(id).unwrap();
+    let mut buf = vec![0u8; 4096];
+    ld.read_at(0, &mut buf)
+        .expect("R6 read reconstructs the faulting data strip via parity");
+    assert_eq!(buf, payload, "reconstruct-on-read returns the correct bytes");
+
+    let ev = pool
+        .suspect_events()
+        .try_recv()
+        .expect("the faulting data member must be reported as a suspect");
+    assert_eq!(ev.pd_id, target);
+}
+
+/// RAID6 over budget: reading data 0 whose member faults, while a SECOND data
+/// member also faults its reads, exceeds what a single-position reconstruct can
+/// serve (the reconstruct read of the other data strip faults) → the read
+/// surfaces an error rather than returning wrong data.
+#[test]
+#[ignore = "fault-injection: installs a per-PD read fault on a live PD"]
+fn raid6_read_eio_two_data_faults_over_budget_errors() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid6(2, 1, 1, 0)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    ld.write_at(0, &pattern(10, 8192, 0)).unwrap(); // fill both data strips
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    pool.pd(desc.members[0].pd).unwrap().set_read_faulting(true); // data 0
+    pool.pd(desc.members[1].pd).unwrap().set_read_faulting(true); // data 1
+
+    let ld = pool.open_ld(id).unwrap();
+    let mut buf = vec![0u8; 4096];
+    assert!(
+        ld.read_at(0, &mut buf).is_err(),
+        "two data members faulting reads ⇒ single-position reconstruct can't \
+         serve it ⇒ read must error (no wrong data)"
+    );
+}
