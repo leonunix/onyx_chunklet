@@ -696,9 +696,12 @@ impl Pool {
 
         let existing: Vec<Arc<PhysicalDisk>> = {
             let s = self.state.read();
+            // Present PDs only — never index `s.pds[id]` for a possibly-missing
+            // declared PD (panics; see `list_pds`). admit commits the new pd_list
+            // to the live members; a missing PD reconciles on its return.
             s.pd_seq_to_id
                 .values()
-                .map(|id| s.pds[id].clone())
+                .filter_map(|id| s.pds.get(id).cloned())
                 .collect()
         };
         for pd in &existing {
@@ -737,7 +740,16 @@ impl Pool {
 
     pub fn list_pds(&self) -> Vec<PdInfo> {
         let s = self.state.read();
-        s.pd_seq_to_id.values().map(|id| s.pds[id].info()).collect()
+        // Only PDs with a live handle. A declared-but-missing PD (Failed
+        // tombstone after `open_with_missing`) is in `pd_seq_to_id` but NOT in
+        // `pds`, so indexing `s.pds[id]` would PANIC — which killed the whole
+        // watchdog thread (it calls this every sweep) on any degraded-open pool,
+        // silently disabling all auto failover/reintegrate/rebalance. Missing
+        // PDs surface via `failed_pds()` / `pd_health()` instead.
+        s.pd_seq_to_id
+            .values()
+            .filter_map(|id| s.pds.get(id).map(|pd| pd.info()))
+            .collect()
     }
 
     pub fn pd(&self, id: PdId) -> Option<Arc<PhysicalDisk>> {
@@ -1232,5 +1244,32 @@ mod tests {
             .err()
             .expect("expected open to fail");
         assert!(matches!(err, ChunkletError::PoolMismatch(_)));
+    }
+
+    /// Regression: `list_pds()` must not panic on a pool opened with a missing
+    /// PD. The missing PD is a Failed tombstone in `pd_seq_to_id` but absent
+    /// from `pds`; indexing `s.pds[id]` used to panic, killing the watchdog
+    /// thread (which calls list_pds every sweep) on any degraded-open pool.
+    #[test]
+    fn list_pds_tolerates_missing_pd() {
+        let dir = TempDir::new().unwrap();
+        let pool = Pool::create(
+            vec![
+                sparse(&dir, "pd0"),
+                sparse(&dir, "pd1"),
+                sparse(&dir, "pd2"),
+            ],
+            PoolConfig::default(),
+        )
+        .unwrap();
+        drop(pool);
+
+        // Open with pd1 absent (quorum 2-of-3 holds).
+        let paths = collect_paths(&dir, &["pd0", "pd2"]);
+        let pool = Pool::open_with_missing(open_paths(&paths).unwrap()).unwrap();
+        // Must NOT panic, and lists only the live PDs.
+        let live = pool.list_pds();
+        assert_eq!(live.len(), 2, "only the 2 present PDs are listed");
+        assert_eq!(pool.failed_pds().len(), 1, "the absent PD is a Failed tombstone");
     }
 }
