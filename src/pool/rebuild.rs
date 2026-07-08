@@ -189,8 +189,10 @@ impl Pool {
         for pd in &draining {
             working_free.remove(pd);
         }
+        // Shadow allocations per PD (Free->Migrating up front; flipped to Used
+        // per-set at commit). The freed-old-member set is computed per-set at
+        // commit time from `desc` vs `committed_desc`, not globally here.
         let mut new_alloc_by_pd: BTreeMap<PdId, Vec<(u32, LdRole, u8)>> = BTreeMap::new();
-        let mut freed_by_pd: BTreeMap<PdId, Vec<u32>> = BTreeMap::new();
         for (set_idx, failed) in failed_per_set.iter().enumerate() {
             if failed.is_empty() {
                 continue;
@@ -211,12 +213,6 @@ impl Pool {
                     .entry(target_pd)
                     .or_default()
                     .push((chunklet_idx, role, new_gen));
-                if pds_snapshot.contains_key(&old_member.pd) {
-                    freed_by_pd
-                        .entry(old_member.pd)
-                        .or_default()
-                        .push(old_member.chunklet_index);
-                }
                 let m = &mut new_desc.members[base + failed_pos];
                 m.pd = target_pd;
                 m.chunklet_index = chunklet_idx;
@@ -281,57 +277,70 @@ impl Pool {
         drop(io_a);
         drop(commit_a);
 
-        // ---------------------------- Phase B ----------------------------
-        // Backfill each shadow from current survivors, concurrent with fg IO.
-        {
-            let _io = runtime.io_lock.read();
-            let engine: Box<dyn ReconstructEngine> = match desc.raid_level {
-                RaidLevel::Mirror => {
-                    Box::new(LdMirror::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-                }
-                RaidLevel::Raid5 => {
-                    Box::new(LdRaid5::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-                }
-                RaidLevel::Raid6 => {
-                    Box::new(LdRaid6::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-                }
-                _ => unreachable!("online rebuild only reached for redundant levels"),
+        // ------------------- Phase B + per-set incremental commit -------------------
+        // Backfill each set from survivors, then commit THAT set right away: flip
+        // its shadows Migrating->Used, swap its members into the live descriptor,
+        // free its old members, bump the epoch. Unlike a single end-of-rebuild
+        // swap this makes `migrating_chunklets` fall set-by-set — real, observable
+        // progress instead of a flat count that looks hung for the whole (minutes-
+        // to-hours) backfill — AND makes the rebuild crash-resilient: a crash keeps
+        // every already-committed set, so only the in-flight + pending sets need
+        // re-rebuilding, not the whole LD.
+        //
+        // `committed_desc` accumulates the swapped sets; each commit writes it as
+        // the live descriptor. After a set commits, foreground reopens onto it (the
+        // set's member IS the shadow now). The rebuild cell still lists that set
+        // until the whole rebuild ends, so a foreground write to an already-
+        // committed set may redundantly write-forward the reconstructed strip to
+        // the shadow chunklet — but that chunklet is now the member itself and the
+        // bytes are identical, so it is a harmless idempotent double-write.
+        let engine: Box<dyn ReconstructEngine> = match desc.raid_level {
+            RaidLevel::Mirror => {
+                Box::new(LdMirror::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
+            }
+            RaidLevel::Raid5 => {
+                Box::new(LdRaid5::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
+            }
+            RaidLevel::Raid6 => {
+                Box::new(LdRaid6::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
+            }
+            _ => unreachable!("online rebuild only reached for redundant levels"),
+        };
+        let strip_bytes = engine.strip_bytes();
+        let stripes = engine.stripes_per_chunklet();
+        let batch_stripes = std::cmp::max(1, REBUILD_BATCH_BYTES / strip_bytes);
+        // One range buffer reused across batches, sized to a full batch so a batch
+        // is a single contiguous reconstruct-read per survivor + a single shadow
+        // write, not `batch_stripes` synchronous per-strip round-trips.
+        let mut buf = vec![0u8; (batch_stripes * strip_bytes) as usize];
+        let mut committed_desc = desc.clone();
+        let mut set_committed = vec![false; n_sets];
+
+        for set_idx in 0..n_sets {
+            let Some(sr) = progress.targets_by_set[set_idx].as_ref() else {
+                continue;
             };
-            let strip_bytes = engine.strip_bytes();
-            let stripes = engine.stripes_per_chunklet();
-            let batch_stripes = std::cmp::max(1, REBUILD_BATCH_BYTES / strip_bytes);
-            // One range buffer reused across batches, sized to a full batch so a
-            // batch is a single contiguous reconstruct-read per survivor + a
-            // single contiguous shadow write — not `batch_stripes` synchronous
-            // per-strip round-trips under the held stripe lock.
-            let mut buf = vec![0u8; (batch_stripes * strip_bytes) as usize];
-            'backfill: for (set_idx, sr) in progress.targets_by_set.iter().enumerate() {
-                let Some(sr) = sr else { continue };
+            // --- backfill this set (io_lock.read + shared stripe locks) ---
+            {
+                let _io = runtime.io_lock.read();
                 let mut s = 0u64;
                 while s < stripes {
                     if progress.aborted.load(Ordering::Relaxed) {
-                        break 'backfill;
+                        break;
                     }
                     let n = std::cmp::min(batch_stripes, stripes - s);
                     let range_len = (n * strip_bytes) as usize;
                     let base_off = s * strip_bytes;
-                    // Hold the SAME stripe locks foreground writes take, in the
-                    // same globally-sorted order, across reconstruct + shadow
-                    // write + cursor advance for this batch. Keeping the batch
-                    // small bounds both the hold TIME (one range-IO round-trip,
-                    // not `n` synchronous 4 KiB round-trips) and the hold BREADTH
-                    // (`n` of 1024 hashed buckets) so foreground writes are not
-                    // starved — see REBUILD_BATCH_BYTES.
+                    // Hold the SAME stripe locks foreground writes take, in the same
+                    // globally-sorted order, across reconstruct + shadow write +
+                    // cursor advance. The small batch bounds both hold TIME (one
+                    // range-IO round-trip) and BREADTH (`n` of 1024 buckets) so
+                    // foreground is not starved — see REBUILD_BATCH_BYTES.
                     let keys: Vec<u64> =
                         (s..s + n).map(|st| ((set_idx as u64) << 32) | st).collect();
                     let _guards = runtime.stripe_locks.write_keys(&keys);
                     for shadow in &sr.shadows {
                         let midx = set_idx * n_per_set + shadow.pos_in_set;
-                        // Range reconstruct: reconstruct_member_strip reads
-                        // `range_len` contiguous bytes from each survivor in one
-                        // syscall and reconstructs all `n` strips in memory. The
-                        // GF math is pointwise with position-indexed constants, so
-                        // a range buffer is byte-identical to `n` per-strip calls.
                         engine.reconstruct_member_strip(midx, base_off, &mut buf[..range_len])?;
                         if let Err(e) = shadow.pd.write_chunklet_user(
                             shadow.chunklet_index,
@@ -343,56 +352,69 @@ impl Pool {
                                 set_idx, shadow.pos_in_set, e
                             );
                             progress.aborted.store(true, Ordering::Relaxed);
-                            break 'backfill;
+                            break;
                         }
+                    }
+                    if progress.aborted.load(Ordering::Relaxed) {
+                        break;
                     }
                     sr.cursor.store(s + n, Ordering::Release);
                     s += n;
                 }
-            }
-            // Make the shadow data durable before the descriptor swap.
-            if !progress.aborted.load(Ordering::Relaxed) {
-                for sr in progress.targets_by_set.iter().flatten() {
+                // Make this set's shadow data durable before its descriptor swap.
+                if !progress.aborted.load(Ordering::Relaxed) {
                     for shadow in &sr.shadows {
                         shadow.pd.sync()?;
                     }
                 }
             }
+            if progress.aborted.load(Ordering::Relaxed) {
+                break;
+            }
+            // --- commit THIS set (manifest_lock + io_lock.write, brief) ---
+            {
+                let _commit_c = self.manifest_lock.lock();
+                let _io_c = runtime.io_lock.write();
+                let base = set_idx * n_per_set;
+                let mut set_alloc: BTreeMap<PdId, Vec<(u32, LdRole, u8)>> = BTreeMap::new();
+                let mut set_freed: BTreeMap<PdId, Vec<u32>> = BTreeMap::new();
+                for shadow in &sr.shadows {
+                    let m = new_desc.members[base + shadow.pos_in_set];
+                    set_alloc
+                        .entry(m.pd)
+                        .or_default()
+                        .push((m.chunklet_index, m.role, m.generation));
+                    committed_desc.members[base + shadow.pos_in_set] = m;
+                    let old = desc.members[base + shadow.pos_in_set];
+                    if pds_snapshot.contains_key(&old.pd) {
+                        set_freed.entry(old.pd).or_default().push(old.chunklet_index);
+                    }
+                }
+                // Clear the cell + reclaim not-yet-committed shadows on a torn
+                // cross-PD commit (already-committed sets stay live; a torn commit's
+                // Migrating leftovers are reconciled at next open).
+                if let Err(e) =
+                    self.commit_rebuild(&committed_desc, &set_alloc, &set_freed, &pds_snapshot)
+                {
+                    *runtime.rebuild.write() = None;
+                    reclaim_uncommitted_shadows(&progress, &set_committed);
+                    return Err(e);
+                }
+                set_committed[set_idx] = true;
+                runtime.bump();
+            }
         }
 
-        // ---------------------------- Phase C ----------------------------
-        let _commit_c = self.manifest_lock.lock();
-        let _io_c = runtime.io_lock.write();
+        // Teardown: clear the cell. On backfill abort, reclaim the shadows of every
+        // set that never committed (committed sets are live `Used` members now).
+        *runtime.rebuild.write() = None;
         if progress.aborted.load(Ordering::Relaxed) {
-            // Reclaim the Migrating spares → Free; leave the LD degraded (still
-            // redundant) and let a later rebuild retry.
-            for (pd_id, allocs) in &new_alloc_by_pd {
-                if let Some(pd) = pds_snapshot.get(pd_id) {
-                    let idxs: Vec<u32> = allocs.iter().map(|(i, _, _)| *i).collect();
-                    let _ = pd.commit_manifest(move |_body, bitmap| {
-                        for i in &idxs {
-                            bitmap.set(*i, ChunkletState::Free)?;
-                        }
-                        Ok(())
-                    });
-                }
-            }
-            *runtime.rebuild.write() = None;
+            reclaim_uncommitted_shadows(&progress, &set_committed);
             return Err(ChunkletError::Invariant(format!(
                 "online rebuild of LD {} aborted: shadow PD write failure",
                 ld_id
             )));
         }
-        // Atomic swap: spare Migrating→Used, descriptor→new_desc, old→Free.
-        // Clear the cell whether or not the commit succeeds: a mid-loop cross-PD
-        // commit failure otherwise returns via `?` BEFORE the clear, leaking the
-        // cell so the per-LD migration gate rejects every future rebuild/failover
-        // on this LD until restart. A torn cross-PD commit is reconciled at next
-        // open (forward_reconcile_bitmaps + reclaim_orphan_migrating).
-        let committed = self.commit_rebuild(&new_desc, &new_alloc_by_pd, &freed_by_pd, &pds_snapshot);
-        *runtime.rebuild.write() = None;
-        committed?;
-        runtime.bump();
 
         Ok(RebuildReport {
             ld_id,
@@ -473,6 +495,26 @@ impl Pool {
         }
         self.state.write().ld_list.upsert(new_desc.clone());
         Ok(())
+    }
+}
+
+/// Free (`Migrating`->`Free`) the shadow chunklets of every set that did NOT
+/// commit during a per-set online rebuild. Committed sets' shadows are live
+/// `Used` members and must never be touched. Best-effort: a failed reclaim is
+/// swept up by `reclaim_orphan_migrating` at the next open.
+fn reclaim_uncommitted_shadows(progress: &RebuildProgress, set_committed: &[bool]) {
+    for (set_idx, sr) in progress.targets_by_set.iter().enumerate() {
+        let Some(sr) = sr else { continue };
+        if set_committed.get(set_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for shadow in &sr.shadows {
+            let idx = shadow.chunklet_index;
+            let _ = shadow.pd.commit_manifest(move |_body, bitmap| {
+                bitmap.set(idx, ChunkletState::Free)?;
+                Ok(())
+            });
+        }
     }
 }
 
