@@ -335,6 +335,13 @@ impl PhysicalDisk {
         self.raw.sync()?;
 
         // Step 3: bump in-memory pointers. Only after both fsyncs succeed.
+        // Keep the top-level `pd_seq_in_pool` mirror in lock-step with the
+        // committed body: `retire_failed_pd` re-denses seqs by mutating
+        // `body.pd_seq_in_pool` in the closure, and `info()` reads this mirror,
+        // so it must track the body or a re-densed PD would report a stale seq
+        // until the next `open` (nothing mutated it before, so this is a no-op
+        // for every existing caller).
+        s.pd_seq_in_pool = new_body.pd_seq_in_pool;
         s.body = new_body;
         s.bitmap = new_bitmap;
         s.manifest_gen = new_gen;

@@ -289,6 +289,16 @@ pub struct RecoveryCyclePayload {
 }
 
 pub fn probe_pool_id(raw: &RawDevice) -> ChunkletResult<Option<PoolId>> {
+    Ok(probe_pool_and_pd_id(raw)?.map(|(pool_id, _)| pool_id))
+}
+
+/// Probe a raw device for its pool AND pd identity without claiming or opening
+/// it as a pool member. Returns `None` if no valid superblock is found (a blank
+/// or foreign device). Used by returned-disk reintegration (to match a device
+/// against the pool it belonged to and recover its old `PdId`) and by onyx's
+/// content-addressed device discovery (a PD's on-disk identity, not its
+/// re-enumerated `/dev/nvmeXnY` path, decides pool membership).
+pub fn probe_pool_and_pd_id(raw: &RawDevice) -> ChunkletResult<Option<(PoolId, PdId)>> {
     if raw.size() < 2 * PD_RESERVED_BYTES {
         return Ok(None);
     }
@@ -300,7 +310,7 @@ pub fn probe_pool_id(raw: &RawDevice) -> ChunkletResult<Option<PoolId>> {
         tail_base + SUPERBLOCK_SLOT_B_OFFSET,
     ] {
         if let Ok(slot) = crate::pd::read_superblock_slot(raw, offset) {
-            return Ok(Some(slot.pool_id));
+            return Ok(Some((slot.pool_id, slot.pd_id)));
         }
     }
     Ok(None)

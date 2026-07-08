@@ -29,6 +29,7 @@ mod fsck;
 mod ld_ops;
 mod rebalance;
 mod rebuild;
+mod reintegrate;
 mod scrub;
 
 pub use cpg::{CpgDescriptor, CpgList, CpgSpec};
@@ -38,6 +39,7 @@ pub use fsck::FsckReport;
 pub use ld_ops::LdSpec;
 pub use rebalance::{RebalanceOptions, RebalanceReport};
 pub use rebuild::RebuildReport;
+pub use reintegrate::ReintegrateReport;
 pub use scrub::{ScrubMismatch, ScrubMismatchKind, ScrubReport};
 
 use std::collections::{BTreeMap, BTreeSet};
