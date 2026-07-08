@@ -62,6 +62,9 @@ pub struct PoolSnapshot {
     pub bad_chunklets: u64,
     pub migrating_chunklets: u64,
     pub last_reconciliation_count: usize,
+    pub last_fsck_reclaimed: usize,
+    pub used_skew_chunklets: u32,
+    pub used_skew_pct: f64,
     pub pds: Vec<PdSnapshot>,
     pub lds: Vec<LdSnapshot>,
 }
@@ -353,6 +356,9 @@ impl PoolSnapshot {
             bad_chunklets: m.bad_chunklets,
             migrating_chunklets: m.migrating_chunklets,
             last_reconciliation_count: m.last_reconciliation_count,
+            last_fsck_reclaimed: m.last_fsck_reclaimed,
+            used_skew_chunklets: m.used_skew_chunklets,
+            used_skew_pct: m.used_skew_pct,
             pds: m.pds.iter().map(PdSnapshot::from_metrics).collect(),
             lds: m.lds.iter().map(LdSnapshot::from_metrics).collect(),
         }

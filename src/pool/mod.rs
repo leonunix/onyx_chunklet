@@ -25,6 +25,7 @@
 mod cpg;
 mod disk;
 mod drain;
+mod fsck;
 mod ld_ops;
 mod rebuild;
 mod scrub;
@@ -32,6 +33,7 @@ mod scrub;
 pub use cpg::{CpgDescriptor, CpgList, CpgSpec};
 pub use disk::{AutoRecoverReport, LdRecoverReport, PdSpareRebalance, SpareRebalanceReport};
 pub use drain::DrainReport;
+pub use fsck::FsckReport;
 pub use ld_ops::LdSpec;
 pub use rebuild::RebuildReport;
 pub use scrub::{ScrubMismatch, ScrubMismatchKind, ScrubReport};
@@ -111,6 +113,9 @@ pub(crate) struct PoolState {
     /// Number of bitmap entries fixed by forward reconciliation during the
     /// open that produced this Pool. 0 on a clean open.
     pub last_reconciliation_count: usize,
+    /// Number of Used-but-unreferenced chunklets reclaimed by the most recent
+    /// reverse-reconcile (at `Pool::open`) or `Pool::fsck`. 0 when clean.
+    pub last_fsck_reclaimed: usize,
 }
 
 /// Shared cell holding the in-progress online-rebuild plan for one LD, or
@@ -288,6 +293,7 @@ impl Pool {
                 ld_runtime: BTreeMap::new(),
                 cpg_list: cpg::CpgList::default(),
                 last_reconciliation_count: 0,
+                last_fsck_reclaimed: 0,
             }),
             manifest_lock: Mutex::new(()),
             suspect_tx,
@@ -400,6 +406,15 @@ impl Pool {
 
         let reconciled = forward_reconcile_bitmaps(&ld_list, &pds)?;
         reclaim_orphan_migrating(&ld_list, &pds)?;
+        // Pool::open is strict (declared == actual ⇒ no missing PD): the
+        // in-memory ld_list is authoritative, so reverse-reconcile is SAFE here
+        // (never in open_with_missing — see fsck.rs authority note). Reclaims
+        // Used-but-unreferenced orphans (rebuilt-away members left on a returned
+        // disk, drop_ld half-commits).
+        let fsck_reclaimed: usize = fsck::reverse_reconcile_bitmaps(&ld_list, &pds)?
+            .values()
+            .map(|&n| n as usize)
+            .sum();
 
         let (suspect_tx, suspect_rx) = crossbeam_channel::unbounded();
         Ok(Arc::new(Self {
@@ -427,6 +442,7 @@ impl Pool {
                 ld_list,
                 cpg_list,
                 last_reconciliation_count: reconciled,
+                last_fsck_reclaimed: fsck_reclaimed,
             }),
             manifest_lock: Mutex::new(()),
             suspect_tx,
@@ -544,6 +560,11 @@ impl Pool {
 
         let reconciled = forward_reconcile_bitmaps(&ld_list, &pds)?;
         reclaim_orphan_migrating(&ld_list, &pds)?;
+        // NO reverse-reconcile here: open_with_missing may run with a missing
+        // PD, so the in-memory ld_list is not guaranteed authoritative and a
+        // Used-but-locally-unreferenced chunklet could still be referenced by an
+        // absent higher-gen descriptor. Freeing it would be data loss.
+        let fsck_reclaimed: usize = 0;
 
         let (suspect_tx, suspect_rx) = crossbeam_channel::unbounded();
         Ok(Arc::new(Self {
@@ -557,6 +578,7 @@ impl Pool {
                 ld_list,
                 cpg_list,
                 last_reconciliation_count: reconciled,
+                last_fsck_reclaimed: fsck_reclaimed,
             }),
             manifest_lock: Mutex::new(()),
             suspect_tx,
@@ -940,13 +962,9 @@ fn reclaim_orphan_migrating(
     pds: &BTreeMap<PdId, Arc<PhysicalDisk>>,
 ) -> ChunkletResult<usize> {
     use crate::types::ChunkletState;
-    // All (pd, chunklet) referenced by any live descriptor member.
-    let mut referenced: std::collections::BTreeSet<(PdId, u32)> = std::collections::BTreeSet::new();
-    for ld in &ld_list.lds {
-        for m in &ld.members {
-            referenced.insert((m.pd, m.chunklet_index));
-        }
-    }
+    // All (pd, chunklet) referenced by any live descriptor member (shared with
+    // the Used-orphan reclaim in fsck.rs).
+    let referenced = fsck::referenced_chunklets(ld_list);
     let mut total = 0usize;
     for (pd_id, pd) in pds {
         let (_, bitmap, _) = pd.snapshot();

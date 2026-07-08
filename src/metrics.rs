@@ -40,6 +40,12 @@ pub struct PoolMetrics {
     pub bad_chunklets: u64,
     pub migrating_chunklets: u64,
     pub last_reconciliation_count: usize,
+    pub last_fsck_reclaimed: usize,
+    /// Worst-case per-PD used-chunklet skew over Healthy PDs (max - min). The
+    /// signal a data rebalance targets; worst-case, not an average.
+    pub used_skew_chunklets: u32,
+    /// `used_skew_chunklets` as a percentage of the mean Healthy-PD used count.
+    pub used_skew_pct: f64,
     pub pds: Vec<PdMetrics>,
     pub lds: Vec<LdMetrics>,
 }
@@ -214,6 +220,9 @@ impl Pool {
             bad_chunklets: 0,
             migrating_chunklets: 0,
             last_reconciliation_count: s.last_reconciliation_count,
+            last_fsck_reclaimed: s.last_fsck_reclaimed,
+            used_skew_chunklets: 0,
+            used_skew_pct: 0.0,
             pds,
             lds,
         };
@@ -231,6 +240,24 @@ impl Pool {
             out.spare_chunklets += pd.spare_chunklets as u64;
             out.bad_chunklets += pd.bad_chunklets as u64;
             out.migrating_chunklets += pd.migrating_chunklets as u64;
+        }
+        // Worst-case per-PD used skew over Healthy PDs (max - min) — the signal a
+        // data rebalance targets. Worst-case, not an average (per project convention).
+        let healthy_used: Vec<u32> = out
+            .pds
+            .iter()
+            .filter(|pd| pd.state == PdOperationalState::Healthy)
+            .map(|pd| pd.used_chunklets)
+            .collect();
+        if let (Some(&min), Some(&max)) = (healthy_used.iter().min(), healthy_used.iter().max()) {
+            out.used_skew_chunklets = max - min;
+            let mean =
+                healthy_used.iter().map(|&u| u as f64).sum::<f64>() / healthy_used.len() as f64;
+            out.used_skew_pct = if mean > 0.0 {
+                (max - min) as f64 / mean * 100.0
+            } else {
+                0.0
+            };
         }
         Ok(out)
     }
