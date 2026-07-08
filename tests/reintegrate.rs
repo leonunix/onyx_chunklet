@@ -11,7 +11,7 @@ mod common;
 
 use common::{make_pool, open_full, open_subset, path_for_member, pattern};
 use onyx_chunklet::io::RawDevice;
-use onyx_chunklet::pool::LdSpec;
+use onyx_chunklet::pool::{LdSpec, RebalanceOptions};
 use onyx_chunklet::{LdId, Pool, PoolConfig};
 use std::path::PathBuf;
 
@@ -183,6 +183,70 @@ fn reintegrate_rejects_foreign_pool() {
         "foreign device must be rejected, got: {}",
         msg
     );
+}
+
+/// Capstone: the full returned-disk lifecycle end to end on one pool —
+/// write → pull → reintegrate (safety-gate rebuild + wipe + slot reuse) →
+/// rebalance the now-empty disk back to balanced → strict reopen — with a CRC
+/// check at every stage. This is the sparse-file mirror of the nvme-box
+/// acceptance flow (the *concurrent-IO* aspect is covered by the `#[ignore]`
+/// online-rebalance cases in fault_injection.rs).
+#[test]
+fn full_lifecycle_pull_reintegrate_rebalance_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, paths) = make_pool(&dir, 10);
+    let ld = make_raid6(&pool, 3);
+    let data = write_pattern(&pool, ld, 0x77, 160 * 1024);
+
+    let victim_idx = path_for_member(&pool, &paths, 4);
+    let victim_pd = pool.list_lds()[0].members[4].pd;
+    drop(pool);
+
+    // 1) Pull the disk → degraded pool still serves data (reconstruct).
+    let pool = open_subset(&paths, &[victim_idx]);
+    assert_eq!(read_back(&pool, ld, data.len()), data, "degraded read ok");
+
+    // 2) Disk returns → reintegrate (safety gate rebuilds member[4] off it first,
+    //    then wipes + rejoins at the same slot; count restored to 10).
+    let returned = RawDevice::open(&paths[victim_idx]).unwrap();
+    let rep = pool.reintegrate_wipe(returned).unwrap();
+    assert_eq!(rep.replaced_pd_id, victim_pd);
+    assert_eq!(pool.pd_count(), 10);
+    assert_eq!(read_back(&pool, ld, data.len()), data, "data ok post-reintegrate");
+
+    // 3) The reintegrated disk is empty → skew is high; rebalance converges it
+    //    back down without losing data or breaking set-PD uniqueness.
+    let before = pool.metrics().unwrap().used_skew_chunklets;
+    let r = pool
+        .rebalance(RebalanceOptions {
+            target_skew_pct: 20.0,
+            max_moves: 64,
+        })
+        .unwrap();
+    assert!(!r.stuck, "rebalance must not be stuck: {:?}", r);
+    assert!(
+        r.skew_after <= before,
+        "skew must not grow: {} -> {}",
+        before,
+        r.skew_after
+    );
+    assert_eq!(read_back(&pool, ld, data.len()), data, "data ok post-rebalance");
+    // Set-PD uniqueness holds across every set after the moves.
+    let desc = pool.list_lds().into_iter().next().unwrap();
+    let set_size = desc.set_size as usize;
+    for set in desc.members.chunks(set_size) {
+        let mut pds: Vec<_> = set.iter().map(|m| m.pd).collect();
+        pds.sort();
+        let n = pds.len();
+        pds.dedup();
+        assert_eq!(pds.len(), n, "set-PD uniqueness preserved");
+    }
+    drop(pool);
+
+    // 4) Strict reopen with all devices: every manifest change is durable.
+    let pool = open_full(&paths);
+    assert_eq!(pool.pd_count(), 10);
+    assert_eq!(read_back(&pool, ld, data.len()), data, "data survives reopen");
 }
 
 /// A gone-for-good disk is retired: its tombstone drops, surviving seqs re-dense
