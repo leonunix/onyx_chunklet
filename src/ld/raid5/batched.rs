@@ -71,8 +71,12 @@ impl LdRaid5 {
                 let seg_buf = &buf[buf_start..buf_start + take];
 
                 // Degraded set → the serial path owns reconstruct reads.
+                // Rebuilding/rebalancing set → only the serial path write_forwards
+                // to the shadow (the batched path never does), so bail there to
+                // keep the shadow in sync below the cursor.
                 if !self.failed_data_positions(addr.set_idx).is_empty()
                     || self.parity_failed(addr.set_idx)
+                    || self.set_being_rebuilt(addr.set_idx)
                 {
                     serialize = true;
                     break 'outer;

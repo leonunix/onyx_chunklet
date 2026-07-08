@@ -71,7 +71,12 @@ impl LdRaid5 {
             return self.write_data_only(start.set_idx, strip_base, &positions, buf, budget);
         }
 
-        if f_data == 0 && !p_failed {
+        // A rebuilding/rebalancing set MUST take a write-forwarding path: RMW
+        // updates only the source data + parity and never write_forwards, so a
+        // below-cursor foreground write would leave the shadow stale and Phase C
+        // would swap onto stale data. RW materializes full new strips + parity
+        // and write_forwards, so force it (mirrors the write_data_only guard above).
+        if f_data == 0 && !p_failed && !self.set_being_rebuilt(start.set_idx) {
             // Healthy set — RMW vs RW based on M-vs-K threshold.
             // RW only beats RMW when modifications are full-strip; sub-strip
             // modifications add gap-fill reads to RW that wipe out the win.

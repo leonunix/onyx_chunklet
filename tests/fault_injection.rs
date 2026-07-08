@@ -522,6 +522,154 @@ fn raid5_online_rebuild_concurrent_writes_preserve_data() {
     run_online_rebuild_concurrent(8, LdSpec::raid5(3, 1, 1, 0), 0, 1);
 }
 
+/// Online REBALANCE under concurrent writes — the regression guard for the
+/// write-forward COVERAGE gap on HEALTHY sets. A rebalance moves a healthy
+/// member, so (unlike a rebuild's degraded target, which forces the forwarding
+/// RW path) foreground writes take the batched / PDW / RMW paths. Those must be
+/// forced onto the write-forwarding serial-RW path while the set is being
+/// rebuilt, else a below-cursor write is silently lost when Phase C swaps onto
+/// the shadow.
+///
+/// The writer checks `done` PER-OFFSET and stops the instant rebalance finishes,
+/// so it never issues a post-swap write that could overwrite (mask) a lost
+/// below-cursor write — the subtlety that makes the plain rebuild harness a loose
+/// guard here. Writes go through `write_many_at` (onyx's flusher batched hot
+/// path, which must bail to the forwarding serial path for a rebuilding set).
+fn run_online_rebalance_concurrent(spec: LdSpec) {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+    let dir = TempDir::new().unwrap();
+    let (pool, _paths) = make_pool(&dir, 10);
+    let id = pool.create_ld(spec).unwrap();
+
+    let ld = pool.open_ld(id).unwrap();
+    let cap = ld.capacity_bytes();
+    let block = 4096u64;
+    let n_off = 96usize;
+    let stride = ((cap / block / n_off as u64).max(1)) * block;
+    let offsets: Vec<u64> = (0..n_off as u64).map(|i| i * stride).collect();
+    for &off in &offsets {
+        ld.write_at(off, &pattern(0, block as usize, off)).unwrap();
+    }
+    ld.flush().unwrap();
+    drop(ld);
+
+    // Admit a fresh empty PD → per-PD used skew → rebalance moves members onto it.
+    let extra = dir.path().join("pd_extra");
+    let raw = onyx_chunklet::io::RawDevice::open_or_create(&extra, PD_SIZE).unwrap();
+    pool.admit(
+        raw,
+        onyx_chunklet::PoolConfig {
+            spare_pct: 0,
+            io_backend: onyx_chunklet::io::IoBackendKind::Sync,
+        },
+    )
+    .unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let pool_r = pool.clone();
+    let done_r = done.clone();
+    let reb = std::thread::spawn(move || {
+        let r = pool_r
+            .rebalance(onyx_chunklet::pool::RebalanceOptions {
+                target_skew_pct: 5.0,
+                max_moves: 100,
+            })
+            .unwrap();
+        done_r.store(true, Ordering::Release);
+        r
+    });
+
+    // Concurrent batched writer. PER-OFFSET-CHUNK done-check → no post-swap write
+    // masks a below-cursor loss on the final move.
+    let mut expected: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut ld = pool.open_ld(id).unwrap();
+    let mut counter: u64 = 1;
+    'writer: while !done.load(Ordering::Acquire) {
+        for chunk in offsets.chunks(8) {
+            if done.load(Ordering::Acquire) {
+                break 'writer;
+            }
+            let vals: Vec<(u64, Vec<u8>)> = chunk
+                .iter()
+                .map(|&off| {
+                    let v = pattern(counter, block as usize, off);
+                    counter += 1;
+                    (off, v)
+                })
+                .collect();
+            let ops: Vec<(u64, &[u8])> = vals.iter().map(|(o, v)| (*o, v.as_slice())).collect();
+            let landed = match ld.write_many_at(&ops) {
+                Ok(()) => true,
+                Err(_) => {
+                    // A rebalance move commit bumped the LD epoch — reopen + retry.
+                    ld = pool.open_ld(id).unwrap();
+                    ld.write_many_at(&ops).is_ok()
+                }
+            };
+            if landed {
+                for (o, v) in vals {
+                    expected.insert(o, v);
+                }
+            }
+        }
+    }
+
+    let report = reb.join().unwrap();
+    assert!(
+        report.moves_committed >= 1,
+        "rebalance must move at least one member (skew from the admitted empty PD)"
+    );
+
+    // Every offset must still read back its last acknowledged pre-swap write.
+    let ld = pool.open_ld(id).unwrap();
+    for &off in &offsets {
+        if let Some(exp) = expected.get(&off) {
+            let mut got = vec![0u8; block as usize];
+            ld.read_at(off, &mut got).unwrap();
+            assert_eq!(
+                &got, exp,
+                "offset {} lost its last concurrent write across the online rebalance",
+                off
+            );
+        }
+    }
+
+    // A parity-member move corrupts only P/Q (invisible to a healthy data read),
+    // so scrub the whole LD to verify parity/data consistency too.
+    let scrub = pool.scrub_ld(id).unwrap();
+    assert_eq!(
+        scrub.mismatches.len(),
+        0,
+        "rebalance left parity/data inconsistent (scrub found {} mismatches)",
+        scrub.mismatches.len()
+    );
+}
+
+/// RAID6 (LV3 shape) online rebalance under concurrent batched writes.
+#[test]
+#[ignore = "fault-injection: online rebalance backfills full 1 GiB chunklets under load"]
+fn raid6_online_rebalance_concurrent_writes_preserve_data() {
+    run_online_rebalance_concurrent(LdSpec::raid6(6, 1, 3, 12));
+}
+
+/// RAID5 online rebalance — guards the healthy-set RMW/batched write-forward fix.
+#[test]
+#[ignore = "fault-injection: online rebalance backfills full 1 GiB chunklets under load"]
+fn raid5_online_rebalance_concurrent_writes_preserve_data() {
+    run_online_rebalance_concurrent(LdSpec::raid5(3, 1, 3, 12));
+}
+
+/// Mirror (RAID10, LV2 + metadb shape) online rebalance — mirror already
+/// write-forwards on its batched path, so this is the consistency sanity check.
+#[test]
+#[ignore = "fault-injection: online rebalance backfills full 1 GiB chunklets under load"]
+fn mirror_online_rebalance_concurrent_writes_preserve_data() {
+    run_online_rebalance_concurrent(LdSpec::mirror(3, 1, 3, 0));
+}
+
 /// Budget boundary: when EVERY copy of a mirror segment fails, there is no
 /// survivor to hold the data, so inline-degrade must NOT absorb — the write
 /// surfaces the error exactly like the pre-fix all-or-nothing path.

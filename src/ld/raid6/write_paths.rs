@@ -79,7 +79,12 @@ impl LdRaid6 {
             return self.write_data_only(start.set_idx, strip_base, &positions, buf, budget);
         }
 
-        let healthy = f_data == 0 && !p_failed && !q_failed;
+        // A rebuilding/rebalancing set MUST take a write-forwarding path: PDW
+        // updates only source data + delta P/Q and never write_forwards, so a
+        // below-cursor foreground write would leave the shadow stale and Phase C
+        // would swap onto stale data. RW materializes full new strips + P + Q and
+        // write_forwards, so force it (mirrors the write_data_only guard above).
+        let healthy = f_data == 0 && !p_failed && !q_failed && !self.set_being_rebuilt(start.set_idx);
         if healthy {
             // Pick between Ceph FastEC-style parity-delta write (PDW)
             // and reconstruct-write (RW) by the number of strip reads

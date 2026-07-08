@@ -27,6 +27,7 @@ mod disk;
 mod drain;
 mod fsck;
 mod ld_ops;
+mod rebalance;
 mod rebuild;
 mod scrub;
 
@@ -35,6 +36,7 @@ pub use disk::{AutoRecoverReport, LdRecoverReport, PdSpareRebalance, SpareRebala
 pub use drain::DrainReport;
 pub use fsck::FsckReport;
 pub use ld_ops::LdSpec;
+pub use rebalance::{RebalanceOptions, RebalanceReport};
 pub use rebuild::RebuildReport;
 pub use scrub::{ScrubMismatch, ScrubMismatchKind, ScrubReport};
 
@@ -153,6 +155,12 @@ pub(crate) struct ShadowTarget {
     pub pos_in_set: usize,
     pub pd: Arc<PhysicalDisk>,
     pub chunklet_index: u32,
+    /// `Some((src_pd, src_idx))` for a data-rebalance move: Phase B backfills by
+    /// COPYING the healthy source chunklet instead of reconstructing from the
+    /// set. `None` for a rebuild (source member is gone → reconstruct). The
+    /// foreground `write_forward` path is identical either way — it mirrors the
+    /// just-written strip to the shadow — so only the backfill differs.
+    pub copy_source: Option<(Arc<PhysicalDisk>, u32)>,
 }
 
 pub(crate) struct LdRuntime {

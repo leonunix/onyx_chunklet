@@ -98,6 +98,18 @@ impl Pool {
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", ld_id)))?;
         let io_a = runtime.io_lock.write();
 
+        // Concurrency gate: the `rebuild` cell is the per-LD "migration in flight"
+        // mutex. Phase B runs under `io_lock.read()`, so without this a second
+        // rebuild / failover / rebalance entering Phase A could clobber the cell
+        // and race the first migration's shadow set. Refuse if one is already
+        // live. (Also hardens rebalance, which shares this cell.)
+        if runtime.rebuild.read().is_some() {
+            return Err(ChunkletError::Invariant(format!(
+                "LD {} already has an online migration (rebuild/rebalance) in flight",
+                ld_id
+            )));
+        }
+
         let desc = self
             .find_ld(ld_id)
             .ok_or_else(|| ChunkletError::Invariant(format!("LD {} not found", ld_id)))?;
@@ -251,6 +263,8 @@ impl Pool {
                     pos_in_set: pos,
                     pd: pd.clone(),
                     chunklet_index: m.chunklet_index,
+                    // Rebuild reconstructs from survivors; no copy source.
+                    copy_source: None,
                 });
             }
             targets_by_set.push(Some(SetRebuild {
@@ -370,8 +384,14 @@ impl Pool {
             )));
         }
         // Atomic swap: spare Migrating→Used, descriptor→new_desc, old→Free.
-        self.commit_rebuild(&new_desc, &new_alloc_by_pd, &freed_by_pd, &pds_snapshot)?;
+        // Clear the cell whether or not the commit succeeds: a mid-loop cross-PD
+        // commit failure otherwise returns via `?` BEFORE the clear, leaking the
+        // cell so the per-LD migration gate rejects every future rebuild/failover
+        // on this LD until restart. A torn cross-PD commit is reconciled at next
+        // open (forward_reconcile_bitmaps + reclaim_orphan_migrating).
+        let committed = self.commit_rebuild(&new_desc, &new_alloc_by_pd, &freed_by_pd, &pds_snapshot);
         *runtime.rebuild.write() = None;
+        committed?;
         runtime.bump();
 
         Ok(RebuildReport {
@@ -393,7 +413,7 @@ impl Pool {
         crate::pool::collect_free_indices_per_pd(pds_snapshot, /* include_spare */ true)
     }
 
-    fn write_header(
+    pub(super) fn write_header(
         &self,
         pd: &PhysicalDisk,
         chunklet_idx: u32,
@@ -415,7 +435,7 @@ impl Pool {
         Ok(())
     }
 
-    fn commit_rebuild(
+    pub(super) fn commit_rebuild(
         &self,
         new_desc: &LdDescriptor,
         new_alloc_by_pd: &BTreeMap<PdId, Vec<(u32, LdRole, u8)>>,
