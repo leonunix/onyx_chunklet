@@ -164,7 +164,11 @@ impl Pool {
             let s = self.state.read();
             let has_missing = s.pd_seq_to_id.values().any(|id| !s.pds.contains_key(id));
             let has_draining = !s.draining.is_empty();
-            (s.ld_list.clone(), s.pds.clone(), has_missing || has_draining)
+            (
+                s.ld_list.clone(),
+                s.pds.clone(),
+                has_missing || has_draining,
+            )
         };
         if skip {
             return Ok(FsckReport {

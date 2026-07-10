@@ -428,7 +428,15 @@ impl LdMirror {
         let mut layout: Vec<(u64, Arc<PhysicalDisk>, u32, usize, usize, usize, usize)> = Vec::new();
         self.for_each_segment(offset, buf.len(), |row, set, off_in_c, range| {
             let (pd, chunklet_index, chosen) = self.pick_read_copy(row, set)?;
-            layout.push((off_in_c, pd, chunklet_index, range.end - range.start, row, set, chosen));
+            layout.push((
+                off_in_c,
+                pd,
+                chunklet_index,
+                range.end - range.start,
+                row,
+                set,
+                chosen,
+            ));
             Ok(())
         })?;
         let mut rest: &mut [u8] = buf;

@@ -396,7 +396,12 @@ fn write_many_at_variable_length_multi_strip_round_trip() {
     ld.read_at(0, &mut whole).unwrap();
     for (&(off, len), expected) in regions.iter().zip(&payloads) {
         let o = off as usize;
-        assert_eq!(&whole[o..o + len], expected.as_slice(), "whole-span @ {}", off);
+        assert_eq!(
+            &whole[o..o + len],
+            expected.as_slice(),
+            "whole-span @ {}",
+            off
+        );
     }
 }
 
@@ -442,11 +447,7 @@ fn read_many_at_nonuniform_multi_strip_round_trip() {
     let id = pool.create_ld(LdSpec::mirror(2, 2, 1, 0)).unwrap();
     let ld = pool.open_ld(id).unwrap();
 
-    let regions: [(u64, usize); 3] = [
-        (0, 8 * 1024),
-        (8 * 1024, 4 * 1024),
-        (12 * 1024, 64 * 1024),
-    ];
+    let regions: [(u64, usize); 3] = [(0, 8 * 1024), (8 * 1024, 4 * 1024), (12 * 1024, 64 * 1024)];
     let payloads: Vec<Vec<u8>> = regions
         .iter()
         .enumerate()
@@ -463,10 +464,14 @@ fn read_many_at_nonuniform_multi_strip_round_trip() {
         .collect();
     ld.write_many_at(&wops).unwrap();
 
-    let mut bufs: Vec<(u64, Vec<u8>)> =
-        regions.iter().map(|&(o, len)| (o, vec![0u8; len])).collect();
-    let mut rops: Vec<(u64, &mut [u8])> =
-        bufs.iter_mut().map(|(o, b)| (*o, b.as_mut_slice())).collect();
+    let mut bufs: Vec<(u64, Vec<u8>)> = regions
+        .iter()
+        .map(|&(o, len)| (o, vec![0u8; len]))
+        .collect();
+    let mut rops: Vec<(u64, &mut [u8])> = bufs
+        .iter_mut()
+        .map(|(o, b)| (*o, b.as_mut_slice()))
+        .collect();
     ld.read_many_at(&mut rops).unwrap();
     drop(rops);
     for ((_, got), expected) in bufs.iter().zip(&payloads) {
@@ -523,8 +528,9 @@ fn rtd_concurrent_out_of_order_read_many_vs_write_many_no_deadlock() {
         .map(|w| {
             let ld = pool.open_ld(id).unwrap();
             thread::spawn(move || {
-                let bufs: Vec<Vec<u8>> =
-                    (0..nstrips).map(|i| vec![(w * 7 + i) as u8; strip]).collect();
+                let bufs: Vec<Vec<u8>> = (0..nstrips)
+                    .map(|i| vec![(w * 7 + i) as u8; strip])
+                    .collect();
                 // Ascending offsets → write_keys acquires buckets globally sorted.
                 let ops: Vec<(u64, &[u8])> = bufs
                     .iter()

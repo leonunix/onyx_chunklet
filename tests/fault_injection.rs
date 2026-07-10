@@ -165,8 +165,14 @@ fn mirror_partial_write_torn_state_multi_strip_then_scrub() {
         .unwrap();
     pd2.read_chunklet_user(desc.members[2].chunklet_index, 0, &mut buf2)
         .unwrap();
-    assert_eq!(buf0, new_payload, "surviving copy 0 has new multi-strip data");
-    assert_eq!(buf2, new_payload, "surviving copy 2 has new multi-strip data");
+    assert_eq!(
+        buf0, new_payload,
+        "surviving copy 0 has new multi-strip data"
+    );
+    assert_eq!(
+        buf2, new_payload,
+        "surviving copy 2 has new multi-strip data"
+    );
     let mut buf1 = vec![0u8; span];
     target_pd
         .read_chunklet_user(desc.members[1].chunklet_index, 0, &mut buf1)
@@ -488,7 +494,10 @@ fn run_online_rebuild_concurrent(
     }
     let report = rebuild_thread.join().unwrap();
     assert!(!report.skipped, "rebuild ran");
-    assert_eq!(report.rebuilt_members, expect_rebuilt, "rebuilt member count");
+    assert_eq!(
+        report.rebuilt_members, expect_rebuilt,
+        "rebuilt member count"
+    );
 
     let ld = pool.open_ld(id).unwrap();
     for &off in &offsets {
@@ -684,7 +693,11 @@ fn mirror_all_copies_fail_surfaces_error() {
     // Fail ALL three copies' PDs.
     let targets: std::collections::BTreeSet<_> = desc.members.iter().map(|m| m.pd).collect();
     let any_pd = pool.pd(desc.members[0].pd).unwrap();
-    let injector = Arc::new(FaultInjectingBackend::new_multi(any_pd.backend(), targets, 0));
+    let injector = Arc::new(FaultInjectingBackend::new_multi(
+        any_pd.backend(),
+        targets,
+        0,
+    ));
     for info in pool.list_pds() {
         pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
     }
@@ -716,8 +729,11 @@ fn raid6_two_member_fault_absorbed_then_reconstructs_new_data() {
     let data0_pd = desc.members[0].pd; // a data member
     let q_pd = desc.members[4].pd; // Q parity
     let targets: std::collections::BTreeSet<_> = [data0_pd, q_pd].into_iter().collect();
-    let injector =
-        Arc::new(FaultInjectingBackend::new_multi(pool.pd(data0_pd).unwrap().backend(), targets, 0));
+    let injector = Arc::new(FaultInjectingBackend::new_multi(
+        pool.pd(data0_pd).unwrap().backend(),
+        targets,
+        0,
+    ));
     for info in pool.list_pds() {
         pool.pd(info.pd_id).unwrap().set_backend(injector.clone());
     }
@@ -747,7 +763,10 @@ fn raid6_two_member_fault_absorbed_then_reconstructs_new_data() {
     let ld = pool.open_ld(id).unwrap();
     let mut got = vec![0u8; 12 * 4096];
     ld.read_at(0, &mut got).unwrap();
-    assert_eq!(got, new_payload, "degraded read reconstructs the new data after F=2 absorb");
+    assert_eq!(
+        got, new_payload,
+        "degraded read reconstructs the new data after F=2 absorb"
+    );
 }
 
 /// Budget boundary: R6 tolerates 2, so failing 3 members in one write exceeds
@@ -814,7 +833,10 @@ fn mirror_read_eio_reconstructs_from_sibling_and_suspects() {
     let mut buf = vec![0u8; 4096];
     ld.read_at(0, &mut buf)
         .expect("mirror read reconstructs from a live sibling transparently");
-    assert_eq!(buf, payload, "reconstruct-on-read returns the correct bytes");
+    assert_eq!(
+        buf, payload,
+        "reconstruct-on-read returns the correct bytes"
+    );
 
     let ev = pool
         .suspect_events()
@@ -878,7 +900,10 @@ fn raid5_read_eio_reconstructs_via_parity_and_suspects() {
     let mut buf = vec![0u8; 4096];
     ld.read_at(0, &mut buf)
         .expect("R5 read reconstructs the faulting data strip from parity");
-    assert_eq!(buf, payload, "reconstruct-on-read returns the correct bytes");
+    assert_eq!(
+        buf, payload,
+        "reconstruct-on-read returns the correct bytes"
+    );
 
     let ev = pool
         .suspect_events()
@@ -932,7 +957,10 @@ fn raid6_read_eio_one_data_reconstructs_and_suspects() {
     let mut buf = vec![0u8; 4096];
     ld.read_at(0, &mut buf)
         .expect("R6 read reconstructs the faulting data strip via parity");
-    assert_eq!(buf, payload, "reconstruct-on-read returns the correct bytes");
+    assert_eq!(
+        buf, payload,
+        "reconstruct-on-read returns the correct bytes"
+    );
 
     let ev = pool
         .suspect_events()
@@ -1008,7 +1036,10 @@ fn raid5_rmw_old_data_read_eio_recomputes_via_rw() {
     let ld = pool.open_ld(id).unwrap();
     let mut rb = vec![0u8; 4096];
     ld.read_at(0, &mut rb).unwrap();
-    assert_eq!(rb, new0, "data0 durable with the new value after RW recompute");
+    assert_eq!(
+        rb, new0,
+        "data0 durable with the new value after RW recompute"
+    );
     drop(ld);
 
     // Parity consistency: re-fault data0 and read → reconstruct via parity must
@@ -1018,7 +1049,10 @@ fn raid5_rmw_old_data_read_eio_recomputes_via_rw() {
     let mut rc = vec![0u8; 4096];
     ld.read_at(0, &mut rc)
         .expect("reconstruct via parity after RW recompute");
-    assert_eq!(rc, new0, "parity is consistent with the RW-recomputed stripe");
+    assert_eq!(
+        rc, new0,
+        "parity is consistent with the RW-recomputed stripe"
+    );
 }
 
 /// Batched (`write_many_at`) RMW where a Phase-1 old-data read faults: the batch
@@ -1051,7 +1085,10 @@ fn raid5_write_many_rmw_read_eio_bails_to_serial_and_recomputes() {
     let ld = pool.open_ld(id).unwrap();
     let mut rb = vec![0u8; 4096];
     ld.read_at(0, &mut rb).unwrap();
-    assert_eq!(rb, new0, "data0 durable with the new value after serial RW replay");
+    assert_eq!(
+        rb, new0,
+        "data0 durable with the new value after serial RW replay"
+    );
 }
 
 /// RAID6 partial write where an old-data / old-P / old-Q read faults: PDW
@@ -1085,7 +1122,10 @@ fn raid6_partial_write_read_eio_recomputes_via_rw() {
     let ld = pool.open_ld(id).unwrap();
     let mut rb = vec![0u8; 4096];
     ld.read_at(0, &mut rb).unwrap();
-    assert_eq!(rb, new0, "data0 durable with the new value after RW recompute");
+    assert_eq!(
+        rb, new0,
+        "data0 durable with the new value after RW recompute"
+    );
     drop(ld);
 
     // Parity consistency: re-fault data0 → read reconstructs the new value.
@@ -1139,8 +1179,16 @@ fn raid6_rw_faulting_unmodified_member_reconstructs() {
     let ld = pool.open_ld(id).unwrap();
     let mut rb = vec![0u8; 4 * 4096];
     ld.read_at(0, &mut rb).unwrap();
-    assert_eq!(&rb[..4096], &base[..4096], "unmodified position 0 preserved");
-    assert_eq!(&rb[4096..], &new[..], "positions 1..3 durable with new data");
+    assert_eq!(
+        &rb[..4096],
+        &base[..4096],
+        "unmodified position 0 preserved"
+    );
+    assert_eq!(
+        &rb[4096..],
+        &new[..],
+        "positions 1..3 durable with new data"
+    );
     drop(ld);
 
     // Parity consistency: re-fault data0 → degraded read reconstructs position 0's
@@ -1150,7 +1198,11 @@ fn raid6_rw_faulting_unmodified_member_reconstructs() {
     let mut rc = vec![0u8; 4096];
     ld.read_at(0, &mut rc)
         .expect("reconstruct position 0 via P/Q after RW");
-    assert_eq!(rc, base[..4096], "parity consistent with the RW-recomputed stripe");
+    assert_eq!(
+        rc,
+        base[..4096],
+        "parity consistent with the RW-recomputed stripe"
+    );
 }
 
 /// RAID5 RW that must READ an UNMODIFIED data position on the still-`is_some`
@@ -1188,8 +1240,16 @@ fn raid5_rw_faulting_unmodified_member_reconstructs() {
     let ld = pool.open_ld(id).unwrap();
     let mut rb = vec![0u8; 4 * 4096];
     ld.read_at(0, &mut rb).unwrap();
-    assert_eq!(&rb[..4096], &base[..4096], "unmodified position 0 preserved");
-    assert_eq!(&rb[4096..], &new[..], "positions 1..3 durable with new data");
+    assert_eq!(
+        &rb[..4096],
+        &base[..4096],
+        "unmodified position 0 preserved"
+    );
+    assert_eq!(
+        &rb[4096..],
+        &new[..],
+        "positions 1..3 durable with new data"
+    );
     drop(ld);
 
     // Parity consistency: re-fault data0 → reconstruct returns position 0's old value.
@@ -1198,7 +1258,11 @@ fn raid5_rw_faulting_unmodified_member_reconstructs() {
     let mut rc = vec![0u8; 4096];
     ld.read_at(0, &mut rc)
         .expect("reconstruct position 0 via parity after RW");
-    assert_eq!(rc, base[..4096], "parity consistent with the RW-recomputed stripe");
+    assert_eq!(
+        rc,
+        base[..4096],
+        "parity consistent with the RW-recomputed stripe"
+    );
 }
 
 /// RAID5 RW with TWO data members faulting reads = a 2-member loss in a set that

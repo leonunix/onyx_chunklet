@@ -313,9 +313,12 @@ impl LdRaid6 {
             match self.read_data_strip(set_idx, data_pos, r.in_chunklet_off, r.data) {
                 Ok(()) => {}
                 Err(e) if is_runtime_read_fault(&e) => {
-                    if let Err(e2) =
-                        self.reconstruct_full_data_strip(set_idx, data_pos, r.in_chunklet_off, r.data)
-                    {
+                    if let Err(e2) = self.reconstruct_full_data_strip(
+                        set_idx,
+                        data_pos,
+                        r.in_chunklet_off,
+                        r.data,
+                    ) {
                         result = Err(e2);
                         break;
                     }
@@ -389,7 +392,11 @@ impl LdRaid6 {
         if progress.aborted.load(Ordering::Relaxed) {
             return;
         }
-        let Some(sr) = progress.targets_by_set.get(set_idx).and_then(|o| o.as_ref()) else {
+        let Some(sr) = progress
+            .targets_by_set
+            .get(set_idx)
+            .and_then(|o| o.as_ref())
+        else {
             return;
         };
         let set_stripe_n = strip_base / self.strip_bytes;
@@ -398,10 +405,9 @@ impl LdRaid6 {
         }
         for shadow in &sr.shadows {
             let bytes = strip_for(shadow.pos_in_set);
-            if let Err(e) =
-                shadow
-                    .pd
-                    .write_chunklet_user(shadow.chunklet_index, strip_base, &bytes)
+            if let Err(e) = shadow
+                .pd
+                .write_chunklet_user(shadow.chunklet_index, strip_base, &bytes)
             {
                 tracing::error!(
                     "online rebuild: shadow write-forward failed (set {} pos {} chunklet {}): {} — aborting rebuild",
@@ -525,7 +531,6 @@ impl LdRaid6 {
     }
 }
 
-
 #[derive(Clone, Copy, Debug)]
 struct StripeAddr {
     set_idx: usize,
@@ -622,9 +627,7 @@ impl LogicalDisk for LdRaid6 {
                         buf[buf_start..buf_start + take].copy_from_slice(
                             &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
                         );
-                        self.report_read_suspect(
-                            self.member_idx_data(addr.set_idx, addr.data_pos),
-                        );
+                        self.report_read_suspect(self.member_idx_data(addr.set_idx, addr.data_pos));
                     }
                     Err(e) => return Err(e),
                 }
@@ -700,5 +703,3 @@ impl LogicalDisk for LdRaid6 {
         crate::ld::flush_members(&self.members)
     }
 }
-
-

@@ -159,11 +159,7 @@ impl LdDescriptor {
 
     pub fn encoded_len(&self) -> usize {
         let runs = self.position_runs();
-        DESC_HEADER_BYTES
-            + runs
-                .iter()
-                .map(|r| 2 + r.len() * RUN_BYTES)
-                .sum::<usize>()
+        DESC_HEADER_BYTES + runs.iter().map(|r| 2 + r.len() * RUN_BYTES).sum::<usize>()
     }
 
     /// Logical user-addressable capacity (bytes), derived purely from the
@@ -209,11 +205,7 @@ impl LdDescriptor {
             )));
         }
         let runs = self.position_runs();
-        let total = DESC_HEADER_BYTES
-            + runs
-                .iter()
-                .map(|r| 2 + r.len() * RUN_BYTES)
-                .sum::<usize>();
+        let total = DESC_HEADER_BYTES + runs.iter().map(|r| 2 + r.len() * RUN_BYTES).sum::<usize>();
         if total > u16::MAX as usize {
             return Err(ChunkletError::Format(format!(
                 "LD descriptor too large: {} bytes (fragmentation exceeds slot; \
@@ -322,14 +314,18 @@ impl LdDescriptor {
         let mut off = DESC_HEADER_BYTES;
         for p in 0..p_count {
             if off + 2 > total {
-                return Err(ChunkletError::Format("ld descriptor truncated at run_count".into()));
+                return Err(ChunkletError::Format(
+                    "ld descriptor truncated at run_count".into(),
+                ));
             }
             let run_count = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap()) as usize;
             off += 2;
             let mut row_n: usize = 0;
             for _ in 0..run_count {
                 if off + RUN_BYTES > total {
-                    return Err(ChunkletError::Format("ld descriptor truncated at run".into()));
+                    return Err(ChunkletError::Format(
+                        "ld descriptor truncated at run".into(),
+                    ));
                 }
                 let pd = PdId::from_bytes(bytes[off..off + 16].try_into().unwrap());
                 let base = u32::from_le_bytes(bytes[off + 16..off + 20].try_into().unwrap());
@@ -531,7 +527,12 @@ mod tests {
             }
         };
         let mut members = vec![
-            LdMember { pd: PdId::nil(), chunklet_index: 0, role: LdRole::Data, generation: 0 };
+            LdMember {
+                pd: PdId::nil(),
+                chunklet_index: 0,
+                role: LdRole::Data,
+                generation: 0
+            };
             p_count * num_rows as usize
         ];
         for row_n in 0..num_rows as usize {
@@ -605,7 +606,11 @@ mod tests {
         let decoded = rt(&d);
         assert_eq!(decoded, d);
         let runs: usize = d.position_runs().iter().map(|r| r.len()).sum();
-        assert!(runs > 8, "fragmentation yields more than 1 run/position: {}", runs);
+        assert!(
+            runs > 8,
+            "fragmentation yields more than 1 run/position: {}",
+            runs
+        );
     }
 
     #[test]

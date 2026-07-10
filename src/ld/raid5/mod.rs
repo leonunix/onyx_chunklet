@@ -74,19 +74,19 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::error::{ChunkletError, ChunkletResult};
+use crate::ld::degrade::{absorb_degraded, is_runtime_read_fault, SuspectMember};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256::xor_into;
-use crate::ld::degrade::{absorb_degraded, is_runtime_read_fault, SuspectMember};
 use crate::ld::{
     compute_strip_bytes, parallel_strip_reads, resolve_members, submit_strip_writes_detailed,
     LogicalDisk, ReconstructEngine, StripRead, StripWrite, StripeLockTable,
 };
 use crate::pd::PhysicalDisk;
 use crate::pool::{new_rebuild_cell, PdHealth, RebuildCell};
-use crossbeam_channel::Sender;
 use crate::types::{
     LdId, LdRole, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
 };
+use crossbeam_channel::Sender;
 
 mod batched;
 mod reconstruct;
@@ -267,7 +267,12 @@ impl LdRaid5 {
     /// Mirror this stripe's computed strips to the online-rebuild shadow(s) for
     /// `set_idx`, below the set cursor, while holding the stripe lock. See
     /// `LdRaid6::write_forward`. `strip_for(pos_in_set)`: data `0..K`, parity=`K`.
-    fn write_forward(&self, set_idx: usize, strip_base: u64, mut strip_for: impl FnMut(usize) -> Vec<u8>) {
+    fn write_forward(
+        &self,
+        set_idx: usize,
+        strip_base: u64,
+        mut strip_for: impl FnMut(usize) -> Vec<u8>,
+    ) {
         let guard = self.rebuild.read();
         let Some(progress) = guard.as_ref() else {
             return;
@@ -275,7 +280,11 @@ impl LdRaid5 {
         if progress.aborted.load(Ordering::Relaxed) {
             return;
         }
-        let Some(sr) = progress.targets_by_set.get(set_idx).and_then(|o| o.as_ref()) else {
+        let Some(sr) = progress
+            .targets_by_set
+            .get(set_idx)
+            .and_then(|o| o.as_ref())
+        else {
             return;
         };
         let set_stripe_n = strip_base / self.strip_bytes;
@@ -284,10 +293,9 @@ impl LdRaid5 {
         }
         for shadow in &sr.shadows {
             let bytes = strip_for(shadow.pos_in_set);
-            if let Err(e) =
-                shadow
-                    .pd
-                    .write_chunklet_user(shadow.chunklet_index, strip_base, &bytes)
+            if let Err(e) = shadow
+                .pd
+                .write_chunklet_user(shadow.chunklet_index, strip_base, &bytes)
             {
                 tracing::error!(
                     "online rebuild (r5): shadow write-forward failed (set {} pos {}): {} — aborting",
@@ -405,7 +413,6 @@ impl LdRaid5 {
     fn parity_failed(&self, set_idx: usize) -> bool {
         self.members[self.member_idx_parity(set_idx)].is_none()
     }
-
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -588,5 +595,3 @@ impl LogicalDisk for LdRaid5 {
         crate::ld::flush_members(&self.members)
     }
 }
-
-

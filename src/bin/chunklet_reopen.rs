@@ -166,7 +166,11 @@ fn run() -> ChunkletResult<()> {
                 crc = crc32c::crc32c_append(crc, &buf[..n * bs]);
                 b0 += n as u64;
                 if b0 % (chunk_blocks * 64) == 0 {
-                    eprint!("\r  wrote {:.1}/{:.1} GiB", (b0 * bs as u64) as f64 / 1e9, cap as f64 / 1e9);
+                    eprint!(
+                        "\r  wrote {:.1}/{:.1} GiB",
+                        (b0 * bs as u64) as f64 / 1e9,
+                        cap as f64 / 1e9
+                    );
                 }
             }
             ld.flush()?;
@@ -279,15 +283,17 @@ fn run() -> ChunkletResult<()> {
                         if first.len() < 30 {
                             let gb = u64::from_le_bytes(blk[0..8].try_into().unwrap());
                             let gv = u32::from_le_bytes(blk[8..12].try_into().unwrap());
-                            first.push(format!(
-                                "block {b} want(v{want_v}) got(block={gb},v{gv})"
-                            ));
+                            first.push(format!("block {b} want(v{want_v}) got(block={gb},v{gv})"));
                         }
                     }
                 }
                 b0 += n as u64;
                 if b0 % (chunk_blocks * 64) == 0 {
-                    eprint!("\r  read {:.1}/{:.1} GiB, {mism} mism", (b0 * bs as u64) as f64 / 1e9, cap as f64 / 1e9);
+                    eprint!(
+                        "\r  read {:.1}/{:.1} GiB, {mism} mism",
+                        (b0 * bs as u64) as f64 / 1e9,
+                        cap as f64 / 1e9
+                    );
                 }
             }
             eprintln!();

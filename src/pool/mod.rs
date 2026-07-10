@@ -1125,14 +1125,20 @@ mod tests {
         let err = Pool::open(open_paths(&paths).unwrap())
             .err()
             .expect("expected second open to fail while pool is live");
-        assert!(matches!(err, ChunkletError::PoolLocked { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ChunkletError::PoolLocked { .. }),
+            "got {err:?}"
+        );
 
         // Even a single overlapping device is enough to reject the open.
         let one = collect_paths(&dir, &["pd1"]);
         let err = Pool::open_with_missing(open_paths(&one).unwrap())
             .err()
             .expect("expected degraded open to fail while pool is live");
-        assert!(matches!(err, ChunkletError::PoolLocked { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ChunkletError::PoolLocked { .. }),
+            "got {err:?}"
+        );
 
         // Dropping the live pool releases the kernel flocks; reopen succeeds.
         drop(pool);
@@ -1270,6 +1276,10 @@ mod tests {
         // Must NOT panic, and lists only the live PDs.
         let live = pool.list_pds();
         assert_eq!(live.len(), 2, "only the 2 present PDs are listed");
-        assert_eq!(pool.failed_pds().len(), 1, "the absent PD is a Failed tombstone");
+        assert_eq!(
+            pool.failed_pds().len(),
+            1,
+            "the absent PD is a Failed tombstone"
+        );
     }
 }

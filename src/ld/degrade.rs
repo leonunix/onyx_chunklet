@@ -163,7 +163,10 @@ mod tests {
         let buf = [0u8; 4096];
         let ops = vec![sw(&pd0, &buf), sw(&pd1, &buf)];
         // pd1's leg failed; the 2-copy group tolerates 1 failure.
-        let results = vec![Ok(()), Err(ChunkletError::Io(std::io::Error::from_raw_os_error(5)))];
+        let results = vec![
+            Ok(()),
+            Err(ChunkletError::Io(std::io::Error::from_raw_os_error(5))),
+        ];
         let suspects = absorb_degraded(&ops, &results, &[0, 0], &[1]).unwrap();
         assert_eq!(suspects.len(), 1);
         assert_eq!(suspects[0].pd_id, pd1.pd_id());
@@ -192,7 +195,12 @@ mod tests {
         let buf = [0u8; 4096];
         // Two stripe segments (groups 0 and 1), each a 2-copy mirror on the same
         // two PDs. pd1 fails in BOTH segments — should surface as ONE suspect.
-        let ops = vec![sw(&pd0, &buf), sw(&pd1, &buf), sw(&pd0, &buf), sw(&pd1, &buf)];
+        let ops = vec![
+            sw(&pd0, &buf),
+            sw(&pd1, &buf),
+            sw(&pd0, &buf),
+            sw(&pd1, &buf),
+        ];
         let results = vec![
             Ok(()),
             Err(ChunkletError::Io(std::io::Error::from_raw_os_error(5))),
@@ -200,7 +208,11 @@ mod tests {
             Err(ChunkletError::Io(std::io::Error::from_raw_os_error(5))),
         ];
         let suspects = absorb_degraded(&ops, &results, &[0, 0, 1, 1], &[1, 1]).unwrap();
-        assert_eq!(suspects.len(), 1, "same PD failing in two groups dedups to one suspect");
+        assert_eq!(
+            suspects.len(),
+            1,
+            "same PD failing in two groups dedups to one suspect"
+        );
         assert_eq!(suspects[0].pd_id, pd1.pd_id());
     }
 
@@ -211,7 +223,12 @@ mod tests {
         let pd1 = test_pd(&dir, "pd1");
         let buf = [0u8; 4096];
         // group 0 within budget (1 fail), group 1 over budget (2 fails).
-        let ops = vec![sw(&pd0, &buf), sw(&pd1, &buf), sw(&pd0, &buf), sw(&pd1, &buf)];
+        let ops = vec![
+            sw(&pd0, &buf),
+            sw(&pd1, &buf),
+            sw(&pd0, &buf),
+            sw(&pd1, &buf),
+        ];
         let results = vec![
             Ok(()),
             Err(ChunkletError::Io(std::io::Error::from_raw_os_error(5))),

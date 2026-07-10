@@ -398,7 +398,10 @@ impl PhysicalDisk {
         buf: &mut [u8],
     ) -> ChunkletResult<()> {
         self.bind_current_to_local_node();
-        if self.read_faulting.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .read_faulting
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(ChunkletError::Device {
                 path: self.raw.path().to_path_buf(),
                 reason: "injected read fault (set_read_faulting)".into(),

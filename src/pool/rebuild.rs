@@ -295,15 +295,21 @@ impl Pool {
         // the shadow chunklet — but that chunklet is now the member itself and the
         // bytes are identical, so it is a harmless idempotent double-write.
         let engine: Box<dyn ReconstructEngine> = match desc.raid_level {
-            RaidLevel::Mirror => {
-                Box::new(LdMirror::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-            }
-            RaidLevel::Raid5 => {
-                Box::new(LdRaid5::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-            }
-            RaidLevel::Raid6 => {
-                Box::new(LdRaid6::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-            }
+            RaidLevel::Mirror => Box::new(LdMirror::open_with_health(
+                desc.clone(),
+                &pds_snapshot,
+                &pd_health,
+            )?),
+            RaidLevel::Raid5 => Box::new(LdRaid5::open_with_health(
+                desc.clone(),
+                &pds_snapshot,
+                &pd_health,
+            )?),
+            RaidLevel::Raid6 => Box::new(LdRaid6::open_with_health(
+                desc.clone(),
+                &pds_snapshot,
+                &pd_health,
+            )?),
             _ => unreachable!("online rebuild only reached for redundant levels"),
         };
         let strip_bytes = engine.strip_bytes();
@@ -380,14 +386,18 @@ impl Pool {
                 let mut set_freed: BTreeMap<PdId, Vec<u32>> = BTreeMap::new();
                 for shadow in &sr.shadows {
                     let m = new_desc.members[base + shadow.pos_in_set];
-                    set_alloc
-                        .entry(m.pd)
-                        .or_default()
-                        .push((m.chunklet_index, m.role, m.generation));
+                    set_alloc.entry(m.pd).or_default().push((
+                        m.chunklet_index,
+                        m.role,
+                        m.generation,
+                    ));
                     committed_desc.members[base + shadow.pos_in_set] = m;
                     let old = desc.members[base + shadow.pos_in_set];
                     if pds_snapshot.contains_key(&old.pd) {
-                        set_freed.entry(old.pd).or_default().push(old.chunklet_index);
+                        set_freed
+                            .entry(old.pd)
+                            .or_default()
+                            .push(old.chunklet_index);
                     }
                 }
                 // Clear the cell + reclaim not-yet-committed shadows on a torn
@@ -422,7 +432,6 @@ impl Pool {
             skipped: false,
         })
     }
-
 
     /// Snapshot per-live-PD free chunklet index lists. Spare-state chunklets
     /// are folded in as well so rebuild can dip into the spare pool when free

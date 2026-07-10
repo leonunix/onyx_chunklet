@@ -8,7 +8,11 @@ impl LdRaid5 {
     ///
     /// The segment may cover anywhere from one byte of one data position up
     /// to the full stripe across all K data positions.
-    pub(super) fn write_one_stripe_segment(&self, start: StripeAddr, buf: &[u8]) -> ChunkletResult<()> {
+    pub(super) fn write_one_stripe_segment(
+        &self,
+        start: StripeAddr,
+        buf: &[u8],
+    ) -> ChunkletResult<()> {
         // Compute failure pattern once and reuse for the F-budget check
         // and the path dispatch below.
         let f_data = self.failed_data_positions(start.set_idx).len();
@@ -211,7 +215,8 @@ impl LdRaid5 {
                     // follow-on write to this still-is_some member is absorbed by
                     // submit_set_absorb within `budget`. Report a read suspect.
                     self.report_read_suspect(self.member_idx_data(set_idx, *pos));
-                    return self.write_partial_stripe_rw(set_idx, strip_base, positions, buf, budget);
+                    return self
+                        .write_partial_stripe_rw(set_idx, strip_base, positions, buf, budget);
                 }
                 Err(e) => return Err(e),
             }
@@ -301,7 +306,12 @@ impl LdRaid5 {
                         if pd_failed {
                             self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
                         } else {
-                            match self.read_data_strip(set_idx, pos, strip_base, &mut new_strips[pos]) {
+                            match self.read_data_strip(
+                                set_idx,
+                                pos,
+                                strip_base,
+                                &mut new_strips[pos],
+                            ) {
                                 Ok(()) => {}
                                 Err(e) if is_runtime_read_fault(&e) => {
                                     // Old strip on a still-is_some member that is faulting at runtime.
@@ -311,7 +321,12 @@ impl LdRaid5 {
                                     if !self.failed_data_positions(set_idx).is_empty() {
                                         return Err(e);
                                     }
-                                    self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
+                                    self.reconstruct_data(
+                                        set_idx,
+                                        pos,
+                                        strip_base,
+                                        &mut new_strips[pos],
+                                    )?;
                                     self.report_read_suspect(self.member_idx_data(set_idx, pos));
                                 }
                                 Err(e) => return Err(e),
@@ -330,7 +345,12 @@ impl LdRaid5 {
                                 if !self.failed_data_positions(set_idx).is_empty() {
                                     return Err(e);
                                 }
-                                self.reconstruct_data(set_idx, pos, strip_base, &mut new_strips[pos])?;
+                                self.reconstruct_data(
+                                    set_idx,
+                                    pos,
+                                    strip_base,
+                                    &mut new_strips[pos],
+                                )?;
                                 self.report_read_suspect(self.member_idx_data(set_idx, pos));
                             }
                             Err(e) => return Err(e),

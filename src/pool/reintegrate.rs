@@ -204,12 +204,15 @@ impl Pool {
                 })?;
             let (body, _, _) = survivor.snapshot();
             let mut list = body.pd_list.clone();
-            let entry = list.iter_mut().find(|e| e.pd_id == old_pd_id).ok_or_else(|| {
-                ChunkletError::Invariant(format!(
-                    "reintegrate: PD {} vanished from pd_list",
-                    old_pd_id
-                ))
-            })?;
+            let entry = list
+                .iter_mut()
+                .find(|e| e.pd_id == old_pd_id)
+                .ok_or_else(|| {
+                    ChunkletError::Invariant(format!(
+                        "reintegrate: PD {} vanished from pd_list",
+                        old_pd_id
+                    ))
+                })?;
             entry.pd_id = new_pd_id;
             entry.pd_seq = seq;
             entry.flags = 0;
@@ -340,11 +343,7 @@ impl Pool {
         // descriptor changes — only the pool bookkeeping does.
         let (new_pd_list, new_count, survivors) = {
             let s = self.state.read();
-            let survivor_pd = s
-                .pds
-                .values()
-                .next()
-                .expect("checked non-empty above");
+            let survivor_pd = s.pds.values().next().expect("checked non-empty above");
             let (body, _, _) = survivor_pd.snapshot();
             let mut kept: Vec<PoolPdEntry> = body
                 .pd_list

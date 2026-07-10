@@ -7,9 +7,9 @@ use std::thread;
 
 use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::ld::raid6::LdRaid6;
-use onyx_chunklet::LogicalDisk;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE};
+use onyx_chunklet::LogicalDisk;
 use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
@@ -351,7 +351,10 @@ fn raid6_multirow_reopen_onyx_geometry() {
     let cap = ld.capacity_bytes();
     let stripe = 6 * bs; // full-stripe data = 6 data strips * 4 KiB = 24 KiB
     let n_stripes = cap / stripe as u64;
-    assert!(n_stripes > 12, "expected many stripes across 12 rows, got {n_stripes}");
+    assert!(
+        n_stripes > 12,
+        "expected many stripes across 12 rows, got {n_stripes}"
+    );
 
     // Unique per-stripe pattern so a misplaced read is detectable.
     let pat = |s: u64| -> Vec<u8> {
@@ -390,7 +393,8 @@ fn raid6_multirow_reopen_onyx_geometry() {
         }
     }
     assert_eq!(
-        mismatches, 0,
+        mismatches,
+        0,
         "{}/{} sampled stripes mismatched after reopen (first bad stripe={:?}); \
          descriptor round-trip corrupts the offset->chunklet mapping at num_rows=12",
         mismatches,
@@ -434,9 +438,7 @@ fn raid6_multirow_reopen_partial_overwrite() {
     // Per-(stripe, strip) base pattern.
     let base = |s: u64, j: usize| -> Vec<u8> {
         let mut b = vec![0u8; bs];
-        let seed = s
-            .wrapping_mul(0x100_0000_01B3)
-            .wrapping_add(j as u64 + 1);
+        let seed = s.wrapping_mul(0x100_0000_01B3).wrapping_add(j as u64 + 1);
         for (i, x) in b.iter_mut().enumerate() {
             *x = ((seed >> ((i % 8) * 8)) as u8) ^ (i as u8) ^ (j as u8);
         }
@@ -759,7 +761,8 @@ fn raid6_write_many_batched_pdw_substrip() {
 
     // Sub-strip overwrite of D0's first block (len < strip) → PDW path.
     let sub: Vec<u8> = vec![0x5Au8; BLOCK_SIZE as usize];
-    ld.write_many_at(&[((2 * fs) as u64, sub.as_slice())]).unwrap();
+    ld.write_many_at(&[((2 * fs) as u64, sub.as_slice())])
+        .unwrap();
 
     let mut expect = seed.clone();
     expect[0..BLOCK_SIZE as usize].copy_from_slice(&sub);
@@ -875,8 +878,15 @@ fn raid6_write_many_batched_same_stripe_merge_partial_preserves_untouched() {
     let mut rb = vec![0u8; 3 * strip];
     ld.read_at(0, &mut rb).unwrap();
     assert!(rb[0..strip].iter().all(|&x| x == 0x11), "D0 overwritten");
-    assert_eq!(&rb[strip..2 * strip], &seed[strip..2 * strip], "D1 preserved");
-    assert!(rb[2 * strip..3 * strip].iter().all(|&x| x == 0x33), "D2 overwritten");
+    assert_eq!(
+        &rb[strip..2 * strip],
+        &seed[strip..2 * strip],
+        "D1 preserved"
+    );
+    assert!(
+        rb[2 * strip..3 * strip].iter().all(|&x| x == 0x33),
+        "D2 overwritten"
+    );
 
     drop(ld);
     assert_r6_stripe_parity(&pool, id, 0, strip);

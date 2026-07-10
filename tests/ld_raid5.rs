@@ -13,9 +13,9 @@ use std::thread;
 
 use onyx_chunklet::io::RawDevice;
 use onyx_chunklet::ld::raid5::LdRaid5;
-use onyx_chunklet::LogicalDisk;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE};
+use onyx_chunklet::LogicalDisk;
 use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
@@ -525,7 +525,8 @@ fn raid5_write_many_batched_rmw_substrip() {
 
     // Sub-strip overwrite (len < strip) → RMW.
     let sub: Vec<u8> = vec![0x5Au8; BLOCK_SIZE as usize];
-    ld.write_many_at(&[((2 * fs) as u64, sub.as_slice())]).unwrap();
+    ld.write_many_at(&[((2 * fs) as u64, sub.as_slice())])
+        .unwrap();
 
     let mut expect = seed.clone();
     expect[0..BLOCK_SIZE as usize].copy_from_slice(&sub);
@@ -635,8 +636,15 @@ fn raid5_write_many_batched_same_stripe_merge_partial_preserves_untouched() {
     let mut rb = vec![0u8; 3 * strip];
     ld.read_at(0, &mut rb).unwrap();
     assert!(rb[0..strip].iter().all(|&x| x == 0x11), "D0 overwritten");
-    assert_eq!(&rb[strip..2 * strip], &seed[strip..2 * strip], "D1 preserved");
-    assert!(rb[2 * strip..3 * strip].iter().all(|&x| x == 0x33), "D2 overwritten");
+    assert_eq!(
+        &rb[strip..2 * strip],
+        &seed[strip..2 * strip],
+        "D1 preserved"
+    );
+    assert!(
+        rb[2 * strip..3 * strip].iter().all(|&x| x == 0x33),
+        "D2 overwritten"
+    );
 
     drop(ld);
     assert_r5_stripe_parity(&pool, id, 0, strip);

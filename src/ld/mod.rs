@@ -132,9 +132,7 @@ pub trait LogicalDisk: Send + Sync {
 /// chunklet) are skipped — a redundant LD reconstructs them on read, and a
 /// non-redundant LD would already have errored on the write that preceded
 /// this flush. Shared by every `LogicalDisk::flush` implementation.
-pub(crate) fn flush_members(
-    members: &[Option<Arc<PhysicalDisk>>],
-) -> ChunkletResult<()> {
+pub(crate) fn flush_members(members: &[Option<Arc<PhysicalDisk>>]) -> ChunkletResult<()> {
     let mut synced: Vec<crate::types::PdId> = Vec::new();
     for pd in members.iter().flatten() {
         let id = pd.pd_id();

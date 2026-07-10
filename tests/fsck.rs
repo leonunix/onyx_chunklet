@@ -89,7 +89,11 @@ fn fsck_reclaims_orphan_after_rebuild() {
     );
 
     // Live data is untouched by the reclaim.
-    assert_eq!(read_back(&pool, ld, data.len()), data, "data must survive fsck");
+    assert_eq!(
+        read_back(&pool, ld, data.len()),
+        data,
+        "data must survive fsck"
+    );
 }
 
 /// The open-time reverse-reconcile hook (Pool::open only) reclaims the stale

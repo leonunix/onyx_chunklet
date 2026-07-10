@@ -83,9 +83,7 @@ enum RingAccess<'a> {
 
 /// Borrow (lazily creating) this thread's ring, or report that the thread has
 /// degraded to sync. A genuine non-exhaustion init error is returned as `Err`.
-fn with_ring<R>(
-    f: impl FnOnce(RingAccess<'_>) -> ChunkletResult<R>,
-) -> ChunkletResult<R> {
+fn with_ring<R>(f: impl FnOnce(RingAccess<'_>) -> ChunkletResult<R>) -> ChunkletResult<R> {
     URING.with(|cell| {
         let mut slot = cell.borrow_mut();
         if matches!(&*slot, RingState::Uninit) {
@@ -431,10 +429,14 @@ mod tests {
     #[test]
     fn resource_exhaustion_matches_fd_and_mem_errnos() {
         for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM] {
-            assert!(is_resource_exhaustion(&std::io::Error::from_raw_os_error(errno)));
+            assert!(is_resource_exhaustion(&std::io::Error::from_raw_os_error(
+                errno
+            )));
         }
         for errno in [libc::EINVAL, libc::EIO, libc::EPERM] {
-            assert!(!is_resource_exhaustion(&std::io::Error::from_raw_os_error(errno)));
+            assert!(!is_resource_exhaustion(&std::io::Error::from_raw_os_error(
+                errno
+            )));
         }
         // A non-OS error (no errno) is not exhaustion.
         assert!(!is_resource_exhaustion(&std::io::Error::other("nope")));
@@ -446,14 +448,21 @@ mod tests {
     #[test]
     fn degrades_to_sync_when_ring_disabled() {
         let dir = TempDir::new().unwrap();
-        let raw = crate::io::RawDevice::open_or_create(
-            &dir.path().join("pd0"),
-            4 * 1024 * 1024 * 1024,
+        let raw =
+            crate::io::RawDevice::open_or_create(&dir.path().join("pd0"), 4 * 1024 * 1024 * 1024)
+                .unwrap();
+        let pd: Arc<PhysicalDisk> = PhysicalDisk::init(
+            raw,
+            PoolId::new_v4(),
+            PdId::new_v4(),
+            0,
+            1,
+            vec![],
+            0,
+            vec![],
+            vec![],
         )
         .unwrap();
-        let pd: Arc<PhysicalDisk> =
-            PhysicalDisk::init(raw, PoolId::new_v4(), PdId::new_v4(), 0, 1, vec![], 0, vec![], vec![])
-                .unwrap();
 
         force_ring_disabled_for_test();
 
@@ -478,6 +487,9 @@ mod tests {
             }];
             UringBackend.submit_reads(&mut reads).unwrap();
         }
-        assert_eq!(got, payload, "degraded read-back must match the degraded write");
+        assert_eq!(
+            got, payload,
+            "degraded read-back must match the degraded write"
+        );
     }
 }

@@ -85,7 +85,11 @@ fn reintegrate_replace_in_place_keeps_count_and_data() {
         "already unreferenced → no safety-gate rebuild"
     );
     assert_eq!(report.referenced_members_blocking, 0);
-    assert_eq!(pool2.pd_count(), 10, "replace-in-place → count restored to 10");
+    assert_eq!(
+        pool2.pd_count(),
+        10,
+        "replace-in-place → count restored to 10"
+    );
 
     // The reintegrated PD is fresh/near-empty (the rebalance opportunity).
     let new_used = pool2
@@ -98,7 +102,11 @@ fn reintegrate_replace_in_place_keeps_count_and_data() {
         .unwrap();
     assert_eq!(new_used, 0, "wiped disk rejoins empty");
 
-    assert_eq!(read_back(&pool2, ld, data.len()), data, "data survives reintegrate");
+    assert_eq!(
+        read_back(&pool2, ld, data.len()),
+        data,
+        "data survives reintegrate"
+    );
     drop(pool2);
 
     // Strict reopen with ALL devices: the swapped pd_list (new PdId at the reused
@@ -109,7 +117,11 @@ fn reintegrate_replace_in_place_keeps_count_and_data() {
         pool3.list_pds().iter().all(|p| p.pd_id != victim_pd),
         "old tombstone is gone from the pd_list"
     );
-    assert_eq!(read_back(&pool3, ld, data.len()), data, "data survives reopen");
+    assert_eq!(
+        read_back(&pool3, ld, data.len()),
+        data,
+        "data survives reopen"
+    );
 }
 
 /// Safety gate: a returned disk whose member is STILL referenced (auto-failover
@@ -130,7 +142,10 @@ fn reintegrate_safety_gate_rebuilds_before_wipe() {
     // (served degraded from RAID6 redundancy).
     let pool2 = open_subset(&paths, &[victim_idx]);
     assert!(
-        pool2.list_lds()[0].members.iter().any(|m| m.pd == victim_pd),
+        pool2.list_lds()[0]
+            .members
+            .iter()
+            .any(|m| m.pd == victim_pd),
         "member still references the victim before reintegrate"
     );
     assert_eq!(
@@ -152,10 +167,17 @@ fn reintegrate_safety_gate_rebuilds_before_wipe() {
     );
     assert_eq!(pool2.pd_count(), 10);
     assert!(
-        pool2.list_lds()[0].members.iter().all(|m| m.pd != victim_pd),
+        pool2.list_lds()[0]
+            .members
+            .iter()
+            .all(|m| m.pd != victim_pd),
         "no member references the old PD after reintegrate"
     );
-    assert_eq!(read_back(&pool2, ld, data.len()), data, "live data preserved");
+    assert_eq!(
+        read_back(&pool2, ld, data.len()),
+        data,
+        "live data preserved"
+    );
 }
 
 /// A device from a DIFFERENT pool is never auto-reintegrated.
@@ -212,7 +234,11 @@ fn full_lifecycle_pull_reintegrate_rebalance_reopen() {
     let rep = pool.reintegrate_wipe(returned).unwrap();
     assert_eq!(rep.replaced_pd_id, victim_pd);
     assert_eq!(pool.pd_count(), 10);
-    assert_eq!(read_back(&pool, ld, data.len()), data, "data ok post-reintegrate");
+    assert_eq!(
+        read_back(&pool, ld, data.len()),
+        data,
+        "data ok post-reintegrate"
+    );
 
     // 3) The reintegrated disk is empty → skew is high; rebalance converges it
     //    back down without losing data or breaking set-PD uniqueness.
@@ -230,7 +256,11 @@ fn full_lifecycle_pull_reintegrate_rebalance_reopen() {
         before,
         r.skew_after
     );
-    assert_eq!(read_back(&pool, ld, data.len()), data, "data ok post-rebalance");
+    assert_eq!(
+        read_back(&pool, ld, data.len()),
+        data,
+        "data ok post-rebalance"
+    );
     // Set-PD uniqueness holds across every set after the moves.
     let desc = pool.list_lds().into_iter().next().unwrap();
     let set_size = desc.set_size as usize;
@@ -246,7 +276,11 @@ fn full_lifecycle_pull_reintegrate_rebalance_reopen() {
     // 4) Strict reopen with all devices: every manifest change is durable.
     let pool = open_full(&paths);
     assert_eq!(pool.pd_count(), 10);
-    assert_eq!(read_back(&pool, ld, data.len()), data, "data survives reopen");
+    assert_eq!(
+        read_back(&pool, ld, data.len()),
+        data,
+        "data survives reopen"
+    );
 }
 
 /// A gone-for-good disk is retired: its tombstone drops, surviving seqs re-dense
@@ -269,7 +303,11 @@ fn retire_failed_pd_redenses_and_reopens_smaller() {
     let pool2 = open_subset(&paths, &[victim_idx]);
     assert_eq!(pool2.pd_count(), 9);
     pool2.retire_failed_pd(victim_pd).unwrap();
-    assert_eq!(pool2.pd_count(), 9, "retire doesn't add/remove live handles");
+    assert_eq!(
+        pool2.pd_count(),
+        9,
+        "retire doesn't add/remove live handles"
+    );
 
     // Surviving seqs are dense [0, 9) with no gap, victim gone.
     let mut seqs: Vec<u32> = pool2.list_pds().iter().map(|p| p.pd_seq_in_pool).collect();
@@ -287,5 +325,9 @@ fn retire_failed_pd_redenses_and_reopens_smaller() {
     let mut seqs3: Vec<u32> = pool3.list_pds().iter().map(|p| p.pd_seq_in_pool).collect();
     seqs3.sort_unstable();
     assert_eq!(seqs3, (0..9).collect::<Vec<_>>());
-    assert_eq!(read_back(&pool3, ld, data.len()), data, "data survives retire+reopen");
+    assert_eq!(
+        read_back(&pool3, ld, data.len()),
+        data,
+        "data survives retire+reopen"
+    );
 }

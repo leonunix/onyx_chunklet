@@ -213,7 +213,9 @@ impl Pool {
             .ld_runtime
             .get(&mv.ld_id)
             .cloned()
-            .ok_or_else(|| ChunkletError::Invariant(format!("LD {} runtime not found", mv.ld_id)))?;
+            .ok_or_else(|| {
+                ChunkletError::Invariant(format!("LD {} runtime not found", mv.ld_id))
+            })?;
         let io_a = runtime.io_lock.write();
         if runtime.rebuild.read().is_some() {
             return Err(ChunkletError::Invariant(format!(
@@ -333,15 +335,21 @@ impl Pool {
         {
             let _io = runtime.io_lock.read();
             let engine: Box<dyn ReconstructEngine> = match desc.raid_level {
-                RaidLevel::Mirror => {
-                    Box::new(LdMirror::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-                }
-                RaidLevel::Raid5 => {
-                    Box::new(LdRaid5::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-                }
-                RaidLevel::Raid6 => {
-                    Box::new(LdRaid6::open_with_health(desc.clone(), &pds_snapshot, &pd_health)?)
-                }
+                RaidLevel::Mirror => Box::new(LdMirror::open_with_health(
+                    desc.clone(),
+                    &pds_snapshot,
+                    &pd_health,
+                )?),
+                RaidLevel::Raid5 => Box::new(LdRaid5::open_with_health(
+                    desc.clone(),
+                    &pds_snapshot,
+                    &pd_health,
+                )?),
+                RaidLevel::Raid6 => Box::new(LdRaid6::open_with_health(
+                    desc.clone(),
+                    &pds_snapshot,
+                    &pd_health,
+                )?),
                 other => {
                     *runtime.rebuild.write() = None;
                     return Err(ChunkletError::Unsupported(format!(
@@ -392,11 +400,11 @@ impl Pool {
                     progress.aborted.store(true, Ordering::Relaxed);
                     break;
                 }
-                if let Err(e) =
-                    shadow
-                        .pd
-                        .write_chunklet_user(shadow.chunklet_index, base_off, &buf[..range_len])
-                {
+                if let Err(e) = shadow.pd.write_chunklet_user(
+                    shadow.chunklet_index,
+                    base_off,
+                    &buf[..range_len],
+                ) {
                     tracing::error!(
                         "rebalance: shadow write failed (ld {} set {}): {} — aborting",
                         mv.ld_id,
@@ -447,7 +455,8 @@ impl Pool {
         // cell and tripping the per-LD "migration in flight" gate forever. A torn
         // cross-PD commit is reconciled at next open (forward_reconcile_bitmaps +
         // reclaim_orphan_migrating reclaims the Migrating shadow).
-        let committed = self.commit_rebuild(&new_desc, &new_alloc_by_pd, &freed_by_pd, &pds_snapshot);
+        let committed =
+            self.commit_rebuild(&new_desc, &new_alloc_by_pd, &freed_by_pd, &pds_snapshot);
         *runtime.rebuild.write() = None;
         committed?;
         runtime.bump();

@@ -142,7 +142,11 @@ pub fn submit_strip_writes_detailed(ops: &[StripWrite<'_>]) -> Vec<ChunkletResul
     let backend = ops[0].pd.backend();
     let sorted: Vec<StripWrite<'_>> = order.iter().map(|&i| ops[i].clone()).collect();
     let sorted_results = backend.submit_writes_detailed(&sorted);
-    debug_assert_eq!(sorted_results.len(), n, "backend must return one result per op");
+    debug_assert_eq!(
+        sorted_results.len(),
+        n,
+        "backend must return one result per op"
+    );
     let mut out: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
     for (pos, res) in sorted_results.into_iter().enumerate() {
         out[order[pos]] = Some(res);

@@ -304,10 +304,7 @@ fn plan_pd_banded(
 
     // Stable PD order (most-free first, tie by id) to index the rotation. All
     // PDs with any free space participate — that is the whole point.
-    let mut pd_order: Vec<PdId> = state
-        .candidate_pds(None)
-        .map(|(pd, _)| *pd)
-        .collect();
+    let mut pd_order: Vec<PdId> = state.candidate_pds(None).map(|(pd, _)| *pd).collect();
     pd_order.sort_by_key(|pd| {
         let free = state.free_by_pd.get(pd).map(|q| q.len()).unwrap_or(0);
         (std::cmp::Reverse(free), *pd)
@@ -574,7 +571,12 @@ mod tests {
         for m in &plan.members {
             *per_pd.entry(m.pd).or_insert(0) += 1;
         }
-        assert_eq!(per_pd.len(), 9, "all 9 PDs must be used, got {}", per_pd.len());
+        assert_eq!(
+            per_pd.len(),
+            9,
+            "all 9 PDs must be used, got {}",
+            per_pd.len()
+        );
         let total = (8 * num_rows as u32) as f64;
         let avg = total / 9.0;
         let (min, max) = (

@@ -60,7 +60,10 @@ fn flush_roundtrip(label: &str, n_pds: usize, spec: LdSpec) {
     let ld2 = pool2.open_ld(ld_id).unwrap();
     let mut readback = vec![0u8; payload.len()];
     ld2.read_at(0, &mut readback).unwrap();
-    assert_eq!(readback, payload, "{label}: data lost across flush + reopen");
+    assert_eq!(
+        readback, payload,
+        "{label}: data lost across flush + reopen"
+    );
 }
 
 #[test]

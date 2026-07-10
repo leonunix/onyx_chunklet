@@ -20,7 +20,11 @@ fn reconstruct_write_read_cost(
 }
 
 impl LdRaid6 {
-    pub(super) fn write_one_stripe_segment(&self, start: StripeAddr, buf: &[u8]) -> ChunkletResult<()> {
+    pub(super) fn write_one_stripe_segment(
+        &self,
+        start: StripeAddr,
+        buf: &[u8],
+    ) -> ChunkletResult<()> {
         // Compute failure pattern once and reuse for the F-budget check
         // and the path dispatch below.
         let f_data = self.failed_data_positions(start.set_idx).len();
@@ -84,7 +88,8 @@ impl LdRaid6 {
         // below-cursor foreground write would leave the shadow stale and Phase C
         // would swap onto stale data. RW materializes full new strips + P + Q and
         // write_forwards, so force it (mirrors the write_data_only guard above).
-        let healthy = f_data == 0 && !p_failed && !q_failed && !self.set_being_rebuilt(start.set_idx);
+        let healthy =
+            f_data == 0 && !p_failed && !q_failed && !self.set_being_rebuilt(start.set_idx);
         if healthy {
             // Pick between Ceph FastEC-style parity-delta write (PDW)
             // and reconstruct-write (RW) by the number of strip reads

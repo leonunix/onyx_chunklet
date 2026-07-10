@@ -107,8 +107,7 @@ impl LdRaid6 {
                 let mut cur_off = addr.in_strip_off;
                 while consumed < seg_buf.len() {
                     let strip_remain = self.strip_bytes - cur_off;
-                    let t =
-                        std::cmp::min((seg_buf.len() - consumed) as u64, strip_remain) as usize;
+                    let t = std::cmp::min((seg_buf.len() - consumed) as u64, strip_remain) as usize;
                     entry
                         .mods
                         .push((cur_pos, cur_off, &seg_buf[consumed..consumed + t]));
