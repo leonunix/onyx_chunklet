@@ -119,14 +119,14 @@ pub trait LogicalDisk: Send + Sync {
 
     /// Make every prior `write_at` / `write_many_at` durable.
     ///
-    /// `write_at` issues O_DIRECT `pwrite`s to the member PDs, which bypasses
-    /// the page cache but does **not** flush each drive's write cache — the
-    /// data is not yet crash-durable when the call returns. `flush` is the
-    /// persistence barrier: upstream durability gates (onyx's LV2
-    /// ack-after-durable, metadb checkpoint sync) call it before treating a
-    /// write as committed. Implementations fan `PhysicalDisk::sync()` out
-    /// across the LD's distinct member PDs; degraded (absent) members are
-    /// skipped, their data being reconstructed on read.
+    /// `write_at` issues O_DIRECT `pwrite`s to the member PDs. `flush` is the
+    /// persistence barrier used by upstream durability gates (onyx's LV2
+    /// ack-after-durable, metadb checkpoint sync). Implementations fan
+    /// `PhysicalDisk::sync()` out across the LD's distinct member PDs. A PD
+    /// explicitly reported by Linux as `write through` needs no additional
+    /// cache command because write completion is already durable; unknown and
+    /// write-back devices retain the explicit sync. Degraded (absent) members
+    /// are skipped, their data being reconstructed on read.
     fn flush(&self) -> ChunkletResult<()>;
 }
 

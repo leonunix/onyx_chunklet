@@ -647,9 +647,8 @@ fn write_batch_worker_loop(
     // Give every batched lane a disjoint sequential region. Offsetting lanes by
     // one IO makes adjacent iodepth-wide batches overlap almost completely,
     // turning a sequential throughput test into a stripe-lock collision test.
-    let lane_region = (job.work_bytes / job.workers.max(1) as u64)
-        / job.io_len as u64
-        * job.io_len as u64;
+    let lane_region =
+        (job.work_bytes / job.workers.max(1) as u64) / job.io_len as u64 * job.io_len as u64;
     let mut seq = job.offset_bytes + lane as u64 * lane_region;
     let mut stats = WorkerStats {
         job: job.name.clone(),

@@ -633,6 +633,7 @@ impl LogicalDisk for LdMirror {
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
+        let total_started = std::time::Instant::now();
         for (offset, buf) in ops {
             self.ensure_aligned(*offset, buf.len())?;
         }
@@ -651,6 +652,7 @@ impl LogicalDisk for LdMirror {
         }
 
         let total_bytes: usize = ops.iter().map(|(_, data)| data.len()).sum();
+        let coalesce_started = std::time::Instant::now();
         let mut logical_writes = Vec::new();
         if total_bytes <= MAX_LOGICAL_COALESCE_BYTES {
             for group in adjacent_write_groups(ops) {
@@ -696,15 +698,41 @@ impl LogicalDisk for LdMirror {
         } else {
             coalesced_ops.as_slice()
         };
+        let coalesce_elapsed = coalesce_started.elapsed();
 
         // One StripWrite per (segment × live copy) across the whole batch, so
         // a coalesced multi-strip flush span becomes ONE cross-PD submit
         // instead of one submit per 4 KiB page.
+        let plan_started = std::time::Instant::now();
         let (writes, stripe_keys, group_of, max_fail) = self.collect_strip_writes(effective_ops)?;
+        let plan_elapsed = plan_started.elapsed();
+        let stripe_started = std::time::Instant::now();
         let stripe_guards = self.stripe_locks.write_keys(&stripe_keys);
+        let stripe_wait = stripe_started.elapsed();
+        let submit_started = std::time::Instant::now();
         let results = submit_strip_writes_detailed(&writes);
+        let submit_elapsed = submit_started.elapsed();
+        let absorb_started = std::time::Instant::now();
         let outcome = absorb_degraded(&writes, &results, &group_of, &max_fail);
+        let absorb_elapsed = absorb_started.elapsed();
         drop(stripe_guards);
+        let total_elapsed = total_started.elapsed();
+        if total_elapsed >= std::time::Duration::from_millis(5) {
+            tracing::warn!(
+                ld = %self.id(),
+                ops = ops.len(),
+                effective_ops = effective_ops.len(),
+                strip_writes = writes.len(),
+                bytes = total_bytes,
+                coalesce_us = coalesce_elapsed.as_micros() as u64,
+                plan_us = plan_elapsed.as_micros() as u64,
+                stripe_wait_us = stripe_wait.as_micros() as u64,
+                submit_us = submit_elapsed.as_micros() as u64,
+                absorb_us = absorb_elapsed.as_micros() as u64,
+                total_us = total_elapsed.as_micros() as u64,
+                "slow mirror write_many"
+            );
+        }
         match outcome {
             Ok(suspects) => {
                 self.report_suspects(suspects);

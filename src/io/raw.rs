@@ -18,6 +18,7 @@ pub struct RawDevice {
     size_bytes: u64,
     path: PathBuf,
     direct_io: bool,
+    sync_required: bool,
 }
 
 impl RawDevice {
@@ -25,11 +26,13 @@ impl RawDevice {
     pub fn open(path: &Path) -> ChunkletResult<Self> {
         let (file, direct_io) = Self::open_direct(path)?;
         let size_bytes = Self::query_size(&file, path)?;
+        let sync_required = Self::detect_sync_required(&file, path);
         Ok(Self {
             file,
             size_bytes,
             path: path.to_path_buf(),
             direct_io,
+            sync_required,
         })
     }
 
@@ -109,6 +112,12 @@ impl RawDevice {
         self.direct_io
     }
 
+    /// Whether this device needs an explicit cache flush after completed
+    /// O_DIRECT writes. Unknown modes remain conservative.
+    pub fn sync_required(&self) -> bool {
+        self.sync_required
+    }
+
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> ChunkletResult<()> {
         if buf.is_empty() {
             return Ok(());
@@ -142,10 +151,46 @@ impl RawDevice {
     }
 
     pub fn sync(&self) -> ChunkletResult<()> {
+        if !self.sync_required {
+            return Ok(());
+        }
         self.file.sync_all().map_err(|e| ChunkletError::Device {
             path: self.path.clone(),
             reason: format!("sync_all: {}", e),
         })
+    }
+
+    fn detect_sync_required(file: &File, path: &Path) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+
+        let Ok(metadata) = file.metadata() else {
+            return true;
+        };
+        if !metadata.file_type().is_block_device() {
+            return true;
+        }
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let Some(block_name) = canonical.file_name() else {
+            return true;
+        };
+        let mode_path = Path::new("/sys/class/block")
+            .join(block_name)
+            .join("queue/write_cache");
+        let Ok(mode) = std::fs::read_to_string(mode_path) else {
+            return true;
+        };
+        let write_through = !Self::cache_mode_requires_sync(&mode);
+        if write_through {
+            tracing::info!(
+                path = %path.display(),
+                "block device is write-through; explicit cache flush is unnecessary"
+            );
+        }
+        !write_through
+    }
+
+    fn cache_mode_requires_sync(mode: &str) -> bool {
+        !mode.trim().eq_ignore_ascii_case("write through")
     }
 
     fn read_loop(&self, buf: &mut [u8], offset: u64) -> ChunkletResult<()> {
@@ -250,5 +295,26 @@ fn aligned_io_window(offset: u64, len: u64) -> ChunkletResult<(u64, usize, usize
 impl AsRawFd for RawDevice {
     fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_mode_only_skips_explicit_write_through() {
+        assert!(!RawDevice::cache_mode_requires_sync("write through\n"));
+        assert!(!RawDevice::cache_mode_requires_sync("WRITE THROUGH"));
+        assert!(RawDevice::cache_mode_requires_sync("write back\n"));
+        assert!(RawDevice::cache_mode_requires_sync("unknown"));
+    }
+
+    #[test]
+    fn regular_files_always_require_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pd");
+        let raw = RawDevice::open_or_create(&path, 8 * 1024 * 1024).unwrap();
+        assert!(raw.sync_required());
     }
 }

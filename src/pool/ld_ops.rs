@@ -98,18 +98,41 @@ impl LogicalDisk for RuntimeLogicalDisk {
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> ChunkletResult<()> {
+        let total_started = std::time::Instant::now();
         self.runtime.check_open(self.id(), self.opened_epoch)?;
+        let lifecycle_started = std::time::Instant::now();
         let _lifecycle = self.runtime.io_lock.read();
+        let lifecycle_wait = lifecycle_started.elapsed();
+        let keys_started = std::time::Instant::now();
         let mut keys = Vec::new();
         for (offset, buf) in ops {
             let (first, last) = self.range_keys(*offset, buf.len());
             keys.extend(first..=last);
         }
+        let key_build = keys_started.elapsed();
+        let range_started = std::time::Instant::now();
         let range_guards = self.runtime.range_locks.write_keys(&keys);
+        let range_wait = range_started.elapsed();
         self.runtime.check_open(self.id(), self.opened_epoch)?;
-        self.inner.write_many_at(ops)?;
+        let inner_started = std::time::Instant::now();
+        let result = self.inner.write_many_at(ops);
+        let inner_elapsed = inner_started.elapsed();
         drop(range_guards);
-        Ok(())
+        let total_elapsed = total_started.elapsed();
+        if total_elapsed >= std::time::Duration::from_millis(5) {
+            tracing::warn!(
+                ld = %self.id(),
+                ops = ops.len(),
+                bytes = ops.iter().map(|(_, buf)| buf.len()).sum::<usize>(),
+                lifecycle_wait_us = lifecycle_wait.as_micros() as u64,
+                key_build_us = key_build.as_micros() as u64,
+                range_wait_us = range_wait.as_micros() as u64,
+                inner_us = inner_elapsed.as_micros() as u64,
+                total_us = total_elapsed.as_micros() as u64,
+                "slow runtime LD write_many"
+            );
+        }
+        result
     }
 
     fn flush(&self) -> ChunkletResult<()> {
