@@ -20,7 +20,9 @@
 //! 4 KiB fragment alignment).
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use io_uring::{opcode, types, IoUring};
 
@@ -28,9 +30,11 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::aligned::AlignedBuf;
 use crate::io::backend::{IoBackend, StripRead, StripWrite};
 use crate::io::sync_backend::SyncBackend;
+use crate::pd::PhysicalDisk;
 use crate::types::BLOCK_SIZE;
 
 const URING_DEPTH: u32 = 64;
+const MAX_COALESCED_WRITE_BYTES: usize = 256 * 1024;
 
 /// Per-thread ring state. A ring is created lazily on first submit and reused
 /// for the thread's lifetime. If creation hits file-descriptor exhaustion
@@ -130,15 +134,7 @@ impl IoBackend for UringBackend {
             RingAccess::Ready(ring) => {
                 let mut start = 0usize;
                 while start < ops.len() {
-                    let node = ops[start].pd.numa_node();
-                    let mut end = start + 1;
-                    while end < ops.len()
-                        && end - start < URING_DEPTH as usize
-                        && ops[end].pd.numa_node() == node
-                    {
-                        end += 1;
-                    }
-                    crate::numa::bind_current_to_node(node);
+                    let end = (start + URING_DEPTH as usize).min(ops.len());
                     submit_read_chunk(ring, &mut ops[start..end])?;
                     start = end;
                 }
@@ -164,18 +160,10 @@ impl IoBackend for UringBackend {
                 RingAccess::Ready(ring) => {
                     let mut start = 0usize;
                     while start < n {
-                        let node = ops[start].pd.numa_node();
-                        let mut end = start + 1;
-                        while end < n
-                            && end - start < URING_DEPTH as usize
-                            && ops[end].pd.numa_node() == node
-                        {
-                            end += 1;
-                        }
-                        crate::numa::bind_current_to_node(node);
+                        let end = (start + URING_DEPTH as usize).min(n);
                         // Per-op results for this chunk, offset back into the
                         // full-batch positions (chunk uses chunk-local indices).
-                        for (i, r) in submit_chunk_detailed(ring, &ops[start..end])
+                        for (i, r) in submit_coalesced_chunk_detailed(ring, &ops[start..end])
                             .into_iter()
                             .enumerate()
                         {
@@ -204,6 +192,213 @@ impl IoBackend for UringBackend {
             }
         }
     }
+
+    fn submit_flushes(&self, pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
+        if pds.is_empty() {
+            return Ok(());
+        }
+        let degraded = with_ring(|access| match access {
+            RingAccess::Degrade => Ok(true),
+            RingAccess::Ready(ring) => {
+                for chunk in pds.chunks(URING_DEPTH as usize) {
+                    submit_flush_chunk(ring, chunk)?;
+                }
+                Ok(false)
+            }
+        })?;
+        if degraded {
+            return SyncBackend.submit_flushes(pds);
+        }
+        Ok(())
+    }
+}
+
+/// Submit one cache-flush command per PD in a single ring batch. The writes
+/// guarded by this barrier have already completed before `LogicalDisk::flush`
+/// is called, so the fsync SQEs do not need link ordering against write SQEs.
+fn submit_flush_chunk(ring: &mut IoUring, pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
+    {
+        let mut sq = ring.submission();
+        for (idx, pd) in pds.iter().enumerate() {
+            let entry = opcode::Fsync::new(types::Fd(pd.raw_fd()))
+                .build()
+                .user_data(idx as u64);
+            // SAFETY: the fd remains owned by `pd`, and this function waits for
+            // every submitted SQE before returning.
+            unsafe {
+                sq.push(&entry).map_err(|error| {
+                    ChunkletError::Io(std::io::Error::other(format!(
+                        "io_uring flush sq push: {error}"
+                    )))
+                })?;
+            }
+        }
+    }
+
+    ring.submit_and_wait(pds.len()).map_err(|error| {
+        ChunkletError::Io(std::io::Error::other(format!(
+            "io_uring flush submit_and_wait: {error}"
+        )))
+    })?;
+
+    let mut completed = 0usize;
+    let mut first_err = None;
+    for cqe in ring.completion() {
+        completed += 1;
+        if cqe.result() < 0 && first_err.is_none() {
+            first_err = Some(ChunkletError::Io(std::io::Error::from_raw_os_error(
+                -cqe.result(),
+            )));
+        }
+    }
+    if completed != pds.len() {
+        return Err(ChunkletError::Io(std::io::Error::other(format!(
+            "io_uring expected {} flush cqes, got {completed}",
+            pds.len()
+        ))));
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// Collapse adjacent writes to one PD chunklet before submitting a depth-sized
+/// batch. Mirror page writes arrive interleaved by copy (A0, B0, A1, B1, ...),
+/// so issuing them verbatim turns a contiguous checkpoint into 4 KiB physical
+/// IO. The temporary buffers here are bounded by `URING_DEPTH` and preserve a
+/// result slot for every original op, including degraded-member failures.
+fn submit_coalesced_chunk_detailed(
+    ring: &mut IoUring,
+    ops: &[StripWrite<'_>],
+) -> Vec<ChunkletResult<()>> {
+    let groups = coalesced_write_groups(ops);
+    if groups.iter().all(|group| group.len() == 1) {
+        return submit_chunk_detailed(ring, ops);
+    }
+
+    struct PlannedWrite {
+        originals: Vec<usize>,
+        buffer: Option<AlignedBuf>,
+    }
+
+    let mut planned = Vec::with_capacity(groups.len());
+    for group in groups {
+        if group.len() == 1 {
+            planned.push(PlannedWrite {
+                originals: group,
+                buffer: None,
+            });
+            continue;
+        }
+        let total_bytes: usize = group.iter().map(|&idx| ops[idx].data.len()).sum();
+        let mut buffer = match AlignedBuf::new(total_bytes) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                let message = format!("io_uring coalesced write allocation: {error}");
+                return (0..ops.len())
+                    .map(|_| Err(ChunkletError::Io(std::io::Error::other(message.clone()))))
+                    .collect();
+            }
+        };
+        let mut cursor = 0;
+        for &idx in &group {
+            let data = ops[idx].data;
+            buffer.as_mut_slice()[cursor..cursor + data.len()].copy_from_slice(data);
+            cursor += data.len();
+        }
+        planned.push(PlannedWrite {
+            originals: group,
+            buffer: Some(buffer),
+        });
+    }
+
+    let submitted: Vec<StripWrite<'_>> = planned
+        .iter()
+        .map(|plan| {
+            let first = &ops[plan.originals[0]];
+            StripWrite {
+                pd: first.pd.clone(),
+                chunklet_index: first.chunklet_index,
+                in_chunklet_off: first.in_chunklet_off,
+                data: plan
+                    .buffer
+                    .as_ref()
+                    .map(AlignedBuf::as_slice)
+                    .unwrap_or(first.data),
+            }
+        })
+        .collect();
+    let submitted_results = submit_chunk_detailed(ring, &submitted);
+    let mut results: Vec<Option<ChunkletResult<()>>> = (0..ops.len()).map(|_| None).collect();
+    for (plan, result) in planned.iter().zip(submitted_results) {
+        if plan.originals.len() == 1 {
+            results[plan.originals[0]] = Some(result);
+            continue;
+        }
+        match result {
+            Ok(()) => {
+                for &idx in &plan.originals {
+                    results[idx] = Some(Ok(()));
+                }
+            }
+            Err(error) => {
+                let message = format!("coalesced member write failed: {error}");
+                for &idx in &plan.originals {
+                    results[idx] = Some(Err(ChunkletError::Io(std::io::Error::other(
+                        message.clone(),
+                    ))));
+                }
+            }
+        }
+    }
+    results
+        .into_iter()
+        .map(|result| result.expect("every coalesced source op has a result"))
+        .collect()
+}
+
+fn coalesced_write_groups(ops: &[StripWrite<'_>]) -> Vec<Vec<usize>> {
+    let mut by_location: BTreeMap<(crate::types::PdId, u32), Vec<usize>> = BTreeMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        by_location
+            .entry((op.pd.pd_id(), op.chunklet_index))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut groups = Vec::new();
+    for (_, original_indices) in by_location {
+        let mut indices = original_indices.clone();
+        indices.sort_unstable_by_key(|&idx| ops[idx].in_chunklet_off);
+
+        let overlaps = indices.windows(2).any(|pair| {
+            let first = &ops[pair[0]];
+            first.in_chunklet_off + first.data.len() as u64 > ops[pair[1]].in_chunklet_off
+        });
+        if overlaps {
+            groups.extend(original_indices.into_iter().map(|idx| vec![idx]));
+            continue;
+        }
+
+        let mut current: Vec<usize> = Vec::new();
+        let mut current_end = 0u64;
+        let mut current_bytes = 0usize;
+        for idx in indices {
+            let op = &ops[idx];
+            let adjacent = !current.is_empty() && op.in_chunklet_off == current_end;
+            if !current.is_empty()
+                && (!adjacent || current_bytes + op.data.len() > MAX_COALESCED_WRITE_BYTES)
+            {
+                groups.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current_end = op.in_chunklet_off + op.data.len() as u64;
+            current_bytes += op.data.len();
+            current.push(idx);
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+    }
+    groups
 }
 
 fn submit_read_chunk(ring: &mut IoUring, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
@@ -440,6 +635,49 @@ mod tests {
         }
         // A non-OS error (no errno) is not exhaustion.
         assert!(!is_resource_exhaustion(&std::io::Error::other("nope")));
+    }
+
+    #[test]
+    fn interleaved_adjacent_writes_are_grouped_per_physical_disk() {
+        let dir = TempDir::new().unwrap();
+        let raw =
+            crate::io::RawDevice::open_or_create(&dir.path().join("pd0"), 4 * 1024 * 1024 * 1024)
+                .unwrap();
+        let pd: Arc<PhysicalDisk> = PhysicalDisk::init(
+            raw,
+            PoolId::new_v4(),
+            PdId::new_v4(),
+            0,
+            1,
+            vec![],
+            0,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let page = [0x5a; 4096];
+        let writes = vec![
+            StripWrite {
+                pd: pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &page,
+            },
+            StripWrite {
+                pd: pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 8192,
+                data: &page,
+            },
+            StripWrite {
+                pd,
+                chunklet_index: 0,
+                in_chunklet_off: 4096,
+                data: &page,
+            },
+        ];
+
+        assert_eq!(coalesced_write_groups(&writes), vec![vec![0, 2, 1]]);
     }
 
     /// When the thread's ring is disabled (the EMFILE outcome), `submit_writes`

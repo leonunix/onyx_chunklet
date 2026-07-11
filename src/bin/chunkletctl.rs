@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use onyx_chunklet::io::RawDevice;
+use onyx_chunklet::io::{AlignedBuf, RawDevice};
 use onyx_chunklet::metrics::{PdOperationalState, PoolMetrics};
 use onyx_chunklet::ops::{
     self, AutoRecoverSnapshot, PoolSnapshot, RecoveryCycleOptions, RecoveryCycleSnapshot,
@@ -312,6 +312,20 @@ enum LdOp {
     List {
         #[arg(long, required = true, value_delimiter = ',')]
         pool: Vec<PathBuf>,
+    },
+    /// Destructively zero an aligned prefix of one LD. Intended for preparing
+    /// newly allocated LDs whose recycled chunklets still contain old bytes.
+    ZeroPrefix {
+        #[arg(long, required = true, value_delimiter = ',')]
+        pool: Vec<PathBuf>,
+        /// LD uuid.
+        ld_id: String,
+        /// Prefix length in bytes (must be a multiple of 4 KiB).
+        #[arg(long)]
+        bytes: u64,
+        /// Confirm the destructive write.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
     /// Drop an LD from the pool by uuid.
     Drop {
@@ -716,6 +730,45 @@ fn run_ld(cmd: LdCmd) -> ChunkletResult<()> {
             let raws = open_devices(&pool)?;
             let pool = Pool::open(raws)?;
             print_ld_table(&pool);
+            Ok(())
+        }
+        LdOp::ZeroPrefix {
+            pool,
+            ld_id,
+            bytes,
+            yes,
+        } => {
+            if !yes {
+                return Err(onyx_chunklet::ChunkletError::Config(
+                    "zero-prefix is destructive; pass --yes to confirm".into(),
+                ));
+            }
+            const ALIGN: u64 = 4096;
+            const CHUNK_BYTES: usize = 16 * 1024 * 1024;
+            if bytes == 0 || bytes % ALIGN != 0 {
+                return Err(onyx_chunklet::ChunkletError::Config(format!(
+                    "zero-prefix bytes must be a non-zero multiple of {ALIGN}, got {bytes}"
+                )));
+            }
+            let id = parse_ld_id(&ld_id)?;
+            let raws = open_devices(&pool)?;
+            let pool = Pool::open(raws)?;
+            let ld = pool.open_ld(id)?;
+            if bytes > ld.capacity_bytes() {
+                return Err(onyx_chunklet::ChunkletError::Config(format!(
+                    "zero-prefix length {bytes} exceeds LD capacity {}",
+                    ld.capacity_bytes()
+                )));
+            }
+            let zeroes = AlignedBuf::new(CHUNK_BYTES.min(bytes as usize))?;
+            let mut offset = 0u64;
+            while offset < bytes {
+                let len = (bytes - offset).min(zeroes.len() as u64) as usize;
+                ld.write_at(offset, &zeroes.as_slice()[..len])?;
+                offset += len as u64;
+            }
+            ld.flush()?;
+            println!("zeroed {} bytes at start of LD {}", bytes, id);
             Ok(())
         }
         LdOp::Drop { pool, ld_id } => {

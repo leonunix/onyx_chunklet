@@ -519,8 +519,9 @@ fn run_phase(
     let mut handles = Vec::new();
 
     for job in jobs {
-        let use_batch_writes =
-            job.workload == WorkloadKind::Write && !job.verify && job.batch_writes;
+        let use_batch_writes = matches!(job.workload, WorkloadKind::Write | WorkloadKind::Seqwrite)
+            && !job.verify
+            && job.batch_writes;
         let lanes = if (job.workload == WorkloadKind::Read && !job.verify) || use_batch_writes {
             job.workers
         } else {
@@ -533,7 +534,10 @@ fn run_phase(
             handles.push(std::thread::spawn(move || {
                 if job.workload == WorkloadKind::Read && !job.verify {
                     read_batch_worker_loop(job, lane, stop, counters)
-                } else if job.workload == WorkloadKind::Write && !job.verify && job.batch_writes {
+                } else if matches!(job.workload, WorkloadKind::Write | WorkloadKind::Seqwrite)
+                    && !job.verify
+                    && job.batch_writes
+                {
                     write_batch_worker_loop(job, lane, stop, counters)
                 } else {
                     worker_loop(job, lane, stop, counters)
@@ -640,7 +644,13 @@ fn write_batch_worker_loop(
         Err(e) => return worker_init_error(job, lane, counters, "aligned write buffers", e),
     };
     let mut offsets = vec![0u64; job.iodepth];
-    let mut seq = job.offset_bytes + ((lane as u64 * job.io_len as u64) % job.work_bytes);
+    // Give every batched lane a disjoint sequential region. Offsetting lanes by
+    // one IO makes adjacent iodepth-wide batches overlap almost completely,
+    // turning a sequential throughput test into a stripe-lock collision test.
+    let lane_region = (job.work_bytes / job.workers.max(1) as u64)
+        / job.io_len as u64
+        * job.io_len as u64;
+    let mut seq = job.offset_bytes + lane as u64 * lane_region;
     let mut stats = WorkerStats {
         job: job.name.clone(),
         ..Default::default()

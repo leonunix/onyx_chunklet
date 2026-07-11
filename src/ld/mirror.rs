@@ -49,6 +49,7 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 
 use crate::error::{ChunkletError, ChunkletResult};
+use crate::io::AlignedBuf;
 use crate::ld::degrade::{absorb_degraded, is_runtime_read_fault, SuspectMember};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{
@@ -60,6 +61,7 @@ use crate::pool::{new_rebuild_cell, PdHealth, RebuildCell};
 use crate::types::{LdId, PdId, RaidLevel, BLOCK_SIZE, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE};
 
 const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
+const MAX_LOGICAL_COALESCE_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct LdMirror {
     desc: LdDescriptor,
@@ -634,18 +636,71 @@ impl LogicalDisk for LdMirror {
         for (offset, buf) in ops {
             self.ensure_aligned(*offset, buf.len())?;
         }
-        // One StripWrite per (segment × live copy) across the whole batch, so
-        // a coalesced multi-strip flush span becomes ONE cross-PD submit
-        // instead of one submit per 4 KiB strip.
-        let (writes, stripe_keys, group_of, max_fail) = self.collect_strip_writes(ops)?;
-        // Two segments hitting the same physical strip must serialize — a
-        // single batched submit would race them. Disjoint ring spans (the
-        // flusher) never collide; this only trips on a misbehaving caller, so
-        // fall back to ordered per-op writes.
-        if has_duplicate_stripes(&stripe_keys) {
-            drop(writes);
+        // Mirror writes do not perform parity read-modify-write. Disjoint byte
+        // ranges within one large strip are therefore safe in the same batch
+        // and can be coalesced into one physical write. Only genuinely
+        // overlapping caller ranges need the ordered fallback.
+        if has_overlapping_ranges(ops) {
             return self.write_many_fallback(ops);
         }
+
+        struct LogicalWrite<'a> {
+            offset: u64,
+            borrowed: &'a [u8],
+            buffer: Option<AlignedBuf>,
+        }
+
+        let total_bytes: usize = ops.iter().map(|(_, data)| data.len()).sum();
+        let mut logical_writes = Vec::new();
+        if total_bytes <= MAX_LOGICAL_COALESCE_BYTES {
+            for group in adjacent_write_groups(ops) {
+                let first = group[0];
+                if group.len() == 1 {
+                    logical_writes.push(LogicalWrite {
+                        offset: ops[first].0,
+                        borrowed: ops[first].1,
+                        buffer: None,
+                    });
+                    continue;
+                }
+                let bytes: usize = group.iter().map(|&idx| ops[idx].1.len()).sum();
+                let mut buffer = AlignedBuf::new(bytes)?;
+                let mut cursor = 0;
+                for &idx in &group {
+                    let data = ops[idx].1;
+                    buffer.as_mut_slice()[cursor..cursor + data.len()].copy_from_slice(data);
+                    cursor += data.len();
+                }
+                logical_writes.push(LogicalWrite {
+                    offset: ops[first].0,
+                    borrowed: &[],
+                    buffer: Some(buffer),
+                });
+            }
+        }
+        let coalesced_ops: Vec<(u64, &[u8])> = logical_writes
+            .iter()
+            .map(|write| {
+                (
+                    write.offset,
+                    write
+                        .buffer
+                        .as_ref()
+                        .map(AlignedBuf::as_slice)
+                        .unwrap_or(write.borrowed),
+                )
+            })
+            .collect();
+        let effective_ops = if coalesced_ops.is_empty() {
+            ops
+        } else {
+            coalesced_ops.as_slice()
+        };
+
+        // One StripWrite per (segment × live copy) across the whole batch, so
+        // a coalesced multi-strip flush span becomes ONE cross-PD submit
+        // instead of one submit per 4 KiB page.
+        let (writes, stripe_keys, group_of, max_fail) = self.collect_strip_writes(effective_ops)?;
         let stripe_guards = self.stripe_locks.write_keys(&stripe_keys);
         let results = submit_strip_writes_detailed(&writes);
         let outcome = absorb_degraded(&writes, &results, &group_of, &max_fail);
@@ -674,11 +729,64 @@ impl LdMirror {
     }
 }
 
-/// True if any two segments in the batch target the same physical strip.
-/// `stripe_key` already folds (row, set, strip_in_chunklet) into a unique id,
-/// so this subsumes exact-offset duplicates AND partial multi-strip overlap.
-fn has_duplicate_stripes(keys: &[u64]) -> bool {
-    let mut sorted = keys.to_vec();
-    sorted.sort_unstable();
-    sorted.windows(2).any(|w| w[0] == w[1])
+fn has_overlapping_ranges(ops: &[(u64, &[u8])]) -> bool {
+    let mut ranges: Vec<(u64, u64)> = ops
+        .iter()
+        .map(|(offset, data)| (*offset, offset.saturating_add(data.len() as u64)))
+        .collect();
+    ranges.sort_unstable_by_key(|&(start, _)| start);
+    let mut furthest_end = 0;
+    for (idx, (start, end)) in ranges.into_iter().enumerate() {
+        if idx != 0 && start < furthest_end {
+            return true;
+        }
+        furthest_end = furthest_end.max(end);
+    }
+    false
+}
+
+fn adjacent_write_groups(ops: &[(u64, &[u8])]) -> Vec<Vec<usize>> {
+    let mut indices: Vec<usize> = (0..ops.len()).collect();
+    indices.sort_unstable_by_key(|&idx| ops[idx].0);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for idx in indices {
+        let adjacent = groups
+            .last()
+            .and_then(|group| group.last())
+            .is_some_and(|&last| ops[last].0 + ops[last].1.len() as u64 == ops[idx].0);
+        if adjacent {
+            groups.last_mut().expect("group exists").push(idx);
+        } else {
+            groups.push(vec![idx]);
+        }
+    }
+    groups
+}
+
+#[cfg(test)]
+mod write_many_overlap_tests {
+    use super::has_overlapping_ranges;
+
+    #[test]
+    fn adjacent_pages_inside_one_large_strip_do_not_overlap() {
+        let page = [0u8; 4096];
+        assert!(!has_overlapping_ranges(&[(0, &page), (4096, &page)]));
+    }
+
+    #[test]
+    fn duplicate_or_partial_ranges_still_require_ordered_fallback() {
+        let page = [0u8; 4096];
+        let two_pages = [0u8; 8192];
+        assert!(has_overlapping_ranges(&[(0, &page), (0, &page)]));
+        assert!(has_overlapping_ranges(&[(0, &two_pages), (4096, &page)]));
+    }
+
+    #[test]
+    fn adjacent_pages_form_one_logical_write_group() {
+        let page = [0u8; 4096];
+        assert_eq!(
+            super::adjacent_write_groups(&[(4096, &page), (0, &page)]),
+            vec![vec![1, 0]]
+        );
+    }
 }

@@ -37,7 +37,12 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::pd::PhysicalDisk;
 use crate::types::{LdId, BLOCK_SIZE};
 
-const STRIPE_LOCK_BUCKETS: usize = 1024;
+/// Hashed stripe locks shared by foreground IO, rebuild, and checkpoint page
+/// writes. A 4 MiB batch contains 1024 distinct 4 KiB stripes; with the old
+/// 1024-bucket table that batch locked every bucket and serialized all otherwise
+/// disjoint callers. 64K keeps collision probability low for bounded batches
+/// while adding only a few MiB across the live LD/runtime lock tables.
+const STRIPE_LOCK_BUCKETS: usize = 64 * 1024;
 
 // `StripWrite` and the cross-PD batched-write submission helper live in
 // `src/io/backend.rs` now (selectable between SyncBackend and
@@ -133,16 +138,17 @@ pub trait LogicalDisk: Send + Sync {
 /// non-redundant LD would already have errored on the write that preceded
 /// this flush. Shared by every `LogicalDisk::flush` implementation.
 pub(crate) fn flush_members(members: &[Option<Arc<PhysicalDisk>>]) -> ChunkletResult<()> {
-    let mut synced: Vec<crate::types::PdId> = Vec::new();
+    let mut seen: Vec<crate::types::PdId> = Vec::new();
+    let mut pds = Vec::new();
     for pd in members.iter().flatten() {
         let id = pd.pd_id();
-        if synced.contains(&id) {
+        if seen.contains(&id) {
             continue;
         }
-        pd.sync()?;
-        synced.push(id);
+        seen.push(id);
+        pds.push(pd.clone());
     }
-    Ok(())
+    crate::io::backend::submit_pd_flushes(&pds)
 }
 
 pub(crate) struct StripeLockTable {
@@ -276,4 +282,20 @@ pub(crate) fn resolve_members(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod stripe_lock_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn checkpoint_sized_key_window_does_not_saturate_lock_table() {
+        let occupied: HashSet<usize> = (0..1024).map(lock_bucket).collect();
+        assert_eq!(occupied.len(), 1024, "adjacent stripes should not alias");
+        assert!(
+            occupied.len() * 64 <= STRIPE_LOCK_BUCKETS,
+            "a 4 MiB key window must leave room for disjoint writers"
+        );
+    }
 }

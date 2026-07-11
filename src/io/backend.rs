@@ -83,8 +83,32 @@ pub trait IoBackend: Send + Sync {
         Ok(())
     }
 
+    /// Flush every distinct PD in `pds`, blocking until all completions have
+    /// been observed. Implementations may issue the device cache flushes in
+    /// parallel; the default preserves compatibility for test backends.
+    fn submit_flushes(&self, pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
+        let mut first_err = None;
+        for pd in pds {
+            if let Err(error) = pd.sync() {
+                if first_err.is_none() {
+                    first_err = Some(error);
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
     /// Human-readable backend label for logs / metrics.
     fn name(&self) -> &'static str;
+}
+
+/// LD-side entry point for a durability barrier across distinct PDs. Every PD
+/// in one LD belongs to the same pool and therefore shares one backend.
+pub(crate) fn submit_pd_flushes(pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
+    if pds.is_empty() {
+        return Ok(());
+    }
+    pds[0].backend().submit_flushes(pds)
 }
 
 /// Pool-wide backend selector. Stored on `PoolConfig` and resolved to a
@@ -109,51 +133,30 @@ impl Default for IoBackendKind {
 /// and shares one backend Arc) and forwards. Empty batches short-circuit
 /// without touching the backend. Takes `Vec` by value so call sites can
 /// move the assembled batch without an extra borrow dance.
-pub fn submit_strip_writes(mut ops: Vec<StripWrite<'_>>) -> ChunkletResult<()> {
+pub fn submit_strip_writes(ops: Vec<StripWrite<'_>>) -> ChunkletResult<()> {
     if ops.is_empty() {
         return Ok(());
     }
-    ops.sort_by_key(|op| op.pd.numa_node().unwrap_or(u16::MAX));
     let backend = ops[0].pd.backend();
     backend.submit_writes(&ops)
 }
 
 /// LD-side entry point for batched writes that returns a **per-op** result in
-/// the caller's INPUT order (unlike [`submit_strip_writes`], which collapses to
-/// the first error). Mirrors `submit_strip_writes`'s NUMA sort so the uring
-/// backend still batches contiguous same-node ops into one submit, but undoes
-/// that permutation before returning — the LD maps `results[i]` back to its
-/// `(segment, member)` by position, so the ordering is load-bearing.
+/// the caller's INPUT order. The LD maps `results[i]` back to its
+/// `(segment, member)` by position, so the ordering is load-bearing. One batch
+/// deliberately spans NUMA nodes: controllers on both PCIe roots should run in
+/// parallel rather than being separated by `submit_and_wait` barriers.
 ///
 /// Empty batches return `[]`. The returned Vec always has `ops.len()` entries.
-/// Borrows `ops` (it clones internally for the NUMA-sorted submission), so the
-/// caller keeps the ops to map results back to `(segment, member)` and to look
-/// up failed members for [`crate::ld::degrade::absorb_degraded`].
+/// Borrows `ops` so the caller can map results back to `(segment, member)` and
+/// look up failed members for [`crate::ld::degrade::absorb_degraded`].
 pub fn submit_strip_writes_detailed(ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
     let n = ops.len();
     if n == 0 {
         return Vec::new();
     }
-    // Sort an index permutation by NUMA node (leaving `ops` order as the
-    // authoritative caller order), submit in NUMA order, then scatter each
-    // result back to its original slot.
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&i| ops[i].pd.numa_node().unwrap_or(u16::MAX));
     let backend = ops[0].pd.backend();
-    let sorted: Vec<StripWrite<'_>> = order.iter().map(|&i| ops[i].clone()).collect();
-    let sorted_results = backend.submit_writes_detailed(&sorted);
-    debug_assert_eq!(
-        sorted_results.len(),
-        n,
-        "backend must return one result per op"
-    );
-    let mut out: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
-    for (pos, res) in sorted_results.into_iter().enumerate() {
-        out[order[pos]] = Some(res);
-    }
-    out.into_iter()
-        .map(|o| o.expect("every op position filled by scatter"))
-        .collect()
+    backend.submit_writes_detailed(ops)
 }
 
 /// LD-side entry point for batched reads. Picks the backend off the
@@ -162,7 +165,6 @@ pub fn submit_strip_reads(ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
     if ops.is_empty() {
         return Ok(());
     }
-    ops.sort_by_key(|op| op.pd.numa_node().unwrap_or(u16::MAX));
     let backend = ops[0].pd.backend();
     backend.submit_reads(ops)
 }

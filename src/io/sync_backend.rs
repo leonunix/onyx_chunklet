@@ -82,4 +82,37 @@ impl IoBackend for SyncBackend {
                 .collect()
         })
     }
+
+    fn submit_flushes(
+        &self,
+        pds: &[std::sync::Arc<crate::pd::PhysicalDisk>],
+    ) -> ChunkletResult<()> {
+        if pds.is_empty() {
+            return Ok(());
+        }
+        if pds.len() == 1 {
+            crate::numa::bind_current_to_node(pds[0].numa_node());
+            return pds[0].sync();
+        }
+        std::thread::scope(|scope| -> ChunkletResult<()> {
+            let handles: Vec<_> = pds
+                .iter()
+                .map(|pd| {
+                    scope.spawn(move || {
+                        crate::numa::bind_current_to_node(pd.numa_node());
+                        pd.sync()
+                    })
+                })
+                .collect();
+            let mut first_err = None;
+            for handle in handles {
+                match handle.join().expect("PD flush worker panicked") {
+                    Ok(()) => {}
+                    Err(error) if first_err.is_none() => first_err = Some(error),
+                    Err(_) => {}
+                }
+            }
+            first_err.map_or(Ok(()), Err)
+        })
+    }
 }
