@@ -2,10 +2,12 @@
 //! reconstruction (Anvin convention).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use onyx_chunklet::io::RawDevice;
+use onyx_chunklet::error::ChunkletResult;
+use onyx_chunklet::io::{IoBackend, RawDevice, StripRead, StripWrite};
 use onyx_chunklet::ld::raid6::LdRaid6;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE};
@@ -14,6 +16,38 @@ use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
 const PD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
+struct CountingReadBackend {
+    inner: Arc<dyn IoBackend>,
+    submits: AtomicUsize,
+    ops: AtomicUsize,
+}
+
+impl CountingReadBackend {
+    fn new(inner: Arc<dyn IoBackend>) -> Self {
+        Self {
+            inner,
+            submits: AtomicUsize::new(0),
+            ops: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl IoBackend for CountingReadBackend {
+    fn name(&self) -> &'static str {
+        "counting-read"
+    }
+
+    fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        self.submits.fetch_add(1, Ordering::Relaxed);
+        self.ops.fetch_add(ops.len(), Ordering::Relaxed);
+        self.inner.submit_reads(ops)
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        self.inner.submit_writes_detailed(ops)
+    }
+}
 
 fn make_pool(dir: &TempDir, n_pds: usize) -> (Arc<Pool>, Vec<PathBuf>) {
     let mut raws = Vec::new();
@@ -70,6 +104,107 @@ fn raid6_full_stripe_round_trip() {
     let mut readback = vec![0u8; payload.len()];
     ld.read_at(0, &mut readback).unwrap();
     assert_eq!(readback, payload);
+}
+
+#[test]
+fn raid6_read_many_batches_non_crossing_substrip_ranges() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let full_stripe = 3 * strip;
+    let payload: Vec<u8> = (0..full_stripe)
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+
+    let inner = pool.pd(pool.list_pds()[0].pd_id).unwrap().backend();
+    let counting = Arc::new(CountingReadBackend::new(inner));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(counting.clone());
+    }
+
+    let offsets = [
+        block as u64,
+        (strip + 2 * block) as u64,
+        (3 * strip - block) as u64,
+    ];
+    let mut bufs = [vec![0u8; block], vec![0u8; block], vec![0u8; block]];
+    let mut ops: Vec<(u64, &mut [u8])> = offsets
+        .iter()
+        .copied()
+        .zip(bufs.iter_mut().map(Vec::as_mut_slice))
+        .collect();
+    ld.read_many_at(&mut ops).unwrap();
+    drop(ops);
+
+    for (&offset, got) in offsets.iter().zip(&bufs) {
+        assert_eq!(got, &payload[offset as usize..offset as usize + block]);
+    }
+    assert_eq!(counting.submits.load(Ordering::Relaxed), 1);
+    assert_eq!(counting.ops.load(Ordering::Relaxed), offsets.len());
+}
+
+#[test]
+fn raid6_read_many_substrip_runtime_fault_reconstructs_range() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let payload: Vec<u8> = (0..3 * strip)
+        .map(|i| ((i * 17 + 11) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    pool.pd(desc.members[0].pd).unwrap().set_read_faulting(true);
+    let r6 = LdRaid6::open(desc, &pds_map(&pool)).unwrap();
+
+    let offsets = [2 * block as u64, (strip + 5 * block) as u64];
+    let mut bufs = [vec![0u8; block], vec![0u8; block]];
+    let mut ops: Vec<(u64, &mut [u8])> = offsets
+        .iter()
+        .copied()
+        .zip(bufs.iter_mut().map(Vec::as_mut_slice))
+        .collect();
+    r6.read_many_at(&mut ops).unwrap();
+    drop(ops);
+
+    for (&offset, got) in offsets.iter().zip(&bufs) {
+        assert_eq!(got, &payload[offset as usize..offset as usize + block]);
+    }
+}
+
+#[test]
+fn raid6_read_many_substrip_two_data_failures_reconstruct_via_pq() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let payload: Vec<u8> = (0..3 * strip)
+        .map(|i| ((i * 19 + 13) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let mut pds = pds_map(&pool);
+    pds.remove(&desc.members[0].pd);
+    pool.pd(desc.members[1].pd).unwrap().set_read_faulting(true);
+    let r6 = LdRaid6::open(desc, &pds).unwrap();
+
+    let offset = (strip + 7 * block) as u64;
+    let mut got = vec![0u8; block];
+    let mut ops = [(offset, got.as_mut_slice())];
+    r6.read_many_at(&mut ops).unwrap();
+    assert_eq!(got, payload[offset as usize..offset as usize + block]);
 }
 
 #[test]

@@ -247,7 +247,7 @@ impl LdRaid6 {
         }
     }
 
-    /// Reconstruct a full data strip whose member faulted at RUNTIME while the LD
+    /// Reconstruct a data range whose member faulted at RUNTIME while the LD
     /// still believes it healthy (dead-but-not-yet-isolated). Treats that
     /// position as failed IN ADDITION to any open-failed data positions (the
     /// "effective failed set"), and dispatches to the P/Q reconstruct that fits
@@ -256,12 +256,14 @@ impl LdRaid6 {
     /// would wrongly re-read the still-`is_some` faulting member, this builds the
     /// effective set explicitly. Errors (never returns wrong data) when the
     /// effective set exceeds budget or a survivor read also faults. `out.len()`
-    /// must equal `strip_bytes`.
-    fn reconstruct_full_data_strip(
+    /// may cover any block-aligned range contained within one strip; parity
+    /// reconstruction is byte-wise, so every survivor is read at the same
+    /// `in_chunklet_off` for exactly `out.len()` bytes.
+    fn reconstruct_data_range(
         &self,
         set_idx: usize,
         data_pos: usize,
-        strip_base: u64,
+        in_chunklet_off: u64,
         out: &mut [u8],
     ) -> ChunkletResult<()> {
         let mut ef = self.failed_data_positions(set_idx);
@@ -274,9 +276,9 @@ impl LdRaid6 {
         match ef.len() {
             1 => {
                 if p_ok {
-                    self.reconstruct_one_data(set_idx, data_pos, strip_base, out)
+                    self.reconstruct_one_data(set_idx, data_pos, in_chunklet_off, out)
                 } else if q_ok {
-                    self.reconstruct_one_data_via_q(set_idx, data_pos, strip_base, out)
+                    self.reconstruct_one_data_via_q(set_idx, data_pos, in_chunklet_off, out)
                 } else {
                     Err(ChunkletError::Invariant(format!(
                         "Raid6 set {}: 1 data + both parity unavailable — read reconstruct over budget",
@@ -286,7 +288,8 @@ impl LdRaid6 {
             }
             2 if p_ok && q_ok => {
                 let (x, y) = (ef[0], ef[1]);
-                let (dx, dy) = self.reconstruct_two_data(set_idx, x, y, strip_base, out.len())?;
+                let (dx, dy) =
+                    self.reconstruct_two_data(set_idx, x, y, in_chunklet_off, out.len())?;
                 out.copy_from_slice(if data_pos == x { &dx } else { &dy });
                 Ok(())
             }
@@ -298,9 +301,10 @@ impl LdRaid6 {
     }
 
     /// Fallback for the fast batched read (`read_many_at`) when a member faults:
-    /// re-read each full-strip op, reconstructing any that returns a runtime read
-    /// fault via [`Self::reconstruct_full_data_strip`]. Suspects reported on both
-    /// the Ok and Err paths so an over-budget read still drives isolation.
+    /// re-read each non-crossing strip range, reconstructing any that returns a
+    /// runtime read fault via [`Self::reconstruct_data_range`]. Suspects are
+    /// reported on both the Ok and Err paths so an over-budget read still drives
+    /// isolation.
     fn reconstruct_read_batch(
         &self,
         reads: &mut [StripRead<'_>],
@@ -313,12 +317,9 @@ impl LdRaid6 {
             match self.read_data_strip(set_idx, data_pos, r.in_chunklet_off, r.data) {
                 Ok(()) => {}
                 Err(e) if is_runtime_read_fault(&e) => {
-                    if let Err(e2) = self.reconstruct_full_data_strip(
-                        set_idx,
-                        data_pos,
-                        r.in_chunklet_off,
-                        r.data,
-                    ) {
+                    if let Err(e2) =
+                        self.reconstruct_data_range(set_idx, data_pos, r.in_chunklet_off, r.data)
+                    {
                         result = Err(e2);
                         break;
                     }
@@ -618,7 +619,7 @@ impl LogicalDisk for LdRaid6 {
                         let strip_len = self.strip_bytes as usize;
                         let strip_base = addr.in_chunklet_off - addr.in_strip_off;
                         let mut tmp = vec![0u8; strip_len];
-                        self.reconstruct_full_data_strip(
+                        self.reconstruct_data_range(
                             addr.set_idx,
                             addr.data_pos,
                             strip_base,
@@ -645,16 +646,21 @@ impl LogicalDisk for LdRaid6 {
         }
         let mut reads = Vec::with_capacity(ops.len());
         // Parallel to `reads`: (set_idx, data_pos) so reconstruct-on-EIO can
-        // rebuild a faulting full strip via the effective-failed-set dispatch.
+        // rebuild the same non-crossing range via the effective-failed-set
+        // dispatch.
         let mut ctxs: Vec<(usize, usize)> = Vec::new();
         for (offset, buf) in ops.iter_mut() {
-            if buf.len() != self.strip_bytes as usize {
-                self.read_at(*offset, buf)?;
+            if buf.is_empty() {
                 continue;
             }
             let addr = self.locate(*offset);
+            let strip_remaining = self.strip_bytes - addr.in_strip_off;
+            if buf.len() as u64 > strip_remaining {
+                self.read_at(*offset, buf)?;
+                continue;
+            }
             let failed = self.failed_data_positions(addr.set_idx);
-            if addr.in_strip_off != 0 || failed.contains(&addr.data_pos) {
+            if failed.contains(&addr.data_pos) {
                 self.read_at(*offset, buf)?;
                 continue;
             }
