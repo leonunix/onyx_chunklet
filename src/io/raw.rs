@@ -118,6 +118,11 @@ impl RawDevice {
         self.sync_required
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_sync_required_for_test(&mut self, required: bool) {
+        self.sync_required = required;
+    }
+
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> ChunkletResult<()> {
         if buf.is_empty() {
             return Ok(());

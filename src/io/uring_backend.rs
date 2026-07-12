@@ -194,23 +194,46 @@ impl IoBackend for UringBackend {
     }
 
     fn submit_flushes(&self, pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
-        if pds.is_empty() {
-            return Ok(());
-        }
-        let degraded = with_ring(|access| match access {
-            RingAccess::Degrade => Ok(true),
-            RingAccess::Ready(ring) => {
-                for chunk in pds.chunks(URING_DEPTH as usize) {
-                    submit_flush_chunk(ring, chunk)?;
+        submit_required_flushes(pds, |required| {
+            let degraded = with_ring(|access| match access {
+                RingAccess::Degrade => Ok(true),
+                RingAccess::Ready(ring) => {
+                    for chunk in required.chunks(URING_DEPTH as usize) {
+                        submit_flush_chunk(ring, chunk)?;
+                    }
+                    Ok(false)
                 }
-                Ok(false)
+            })?;
+            if degraded {
+                return SyncBackend.submit_flushes(required);
             }
-        })?;
-        if degraded {
-            return SyncBackend.submit_flushes(pds);
-        }
-        Ok(())
+            Ok(())
+        })
     }
+}
+
+/// Submit a barrier only for devices whose cache mode still requires one.
+/// Write-through O_DIRECT completion is already durable, matching
+/// `RawDevice::sync`; filtering here keeps the io_uring path from bypassing
+/// that durability decision.
+fn submit_required_flushes(
+    pds: &[Arc<PhysicalDisk>],
+    submit: impl FnOnce(&[Arc<PhysicalDisk>]) -> ChunkletResult<()>,
+) -> ChunkletResult<()> {
+    let mut required = Vec::new();
+    for pd in pds {
+        if pd.sync_required()
+            && required
+                .iter()
+                .all(|selected: &Arc<PhysicalDisk>| selected.pd_id() != pd.pd_id())
+        {
+            required.push(pd.clone());
+        }
+    }
+    if required.is_empty() {
+        return Ok(());
+    }
+    submit(&required)
 }
 
 /// Submit one cache-flush command per PD in a single ring batch. The writes
@@ -620,6 +643,69 @@ mod tests {
     use crate::types::{PdId, PoolId};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn test_pd(dir: &TempDir, name: &str, pd_seq: u32, sync_required: bool) -> Arc<PhysicalDisk> {
+        let mut raw =
+            crate::io::RawDevice::open_or_create(&dir.path().join(name), 4 * 1024 * 1024 * 1024)
+                .unwrap();
+        raw.set_sync_required_for_test(sync_required);
+        PhysicalDisk::init(
+            raw,
+            PoolId::new_v4(),
+            PdId::new_v4(),
+            pd_seq,
+            1,
+            vec![],
+            0,
+            vec![],
+            vec![],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn write_through_flushes_are_all_skipped() {
+        let dir = TempDir::new().unwrap();
+        let pds = vec![
+            test_pd(&dir, "pd0", 0, false),
+            test_pd(&dir, "pd1", 1, false),
+        ];
+        submit_required_flushes(&pds, |_| panic!("write-through PDs must not be submitted"))
+            .unwrap();
+    }
+
+    #[test]
+    fn mixed_flushes_submit_only_required_devices() {
+        let dir = TempDir::new().unwrap();
+        let skipped = test_pd(&dir, "pd0", 0, false);
+        let required_a = test_pd(&dir, "pd1", 1, true);
+        let required_b = test_pd(&dir, "pd2", 2, true);
+        let expected = vec![required_a.pd_id(), required_b.pd_id()];
+        let pds = vec![skipped, required_a.clone(), required_b, required_a];
+
+        submit_required_flushes(&pds, |submitted| {
+            assert_eq!(
+                submitted.iter().map(|pd| pd.pd_id()).collect::<Vec<_>>(),
+                expected
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn required_flush_error_is_propagated() {
+        let dir = TempDir::new().unwrap();
+        let pds = vec![test_pd(&dir, "pd0", 0, true)];
+        let error = submit_required_flushes(&pds, |_| {
+            Err(ChunkletError::Io(std::io::Error::from_raw_os_error(
+                libc::EIO,
+            )))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Input/output error"));
+    }
 
     #[test]
     fn resource_exhaustion_matches_fd_and_mem_errnos() {

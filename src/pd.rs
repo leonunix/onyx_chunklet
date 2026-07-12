@@ -239,6 +239,12 @@ impl PhysicalDisk {
         self.raw.as_raw_fd()
     }
 
+    /// Whether completed O_DIRECT writes still need an explicit device-cache
+    /// flush before they are durable.
+    pub(crate) fn sync_required(&self) -> bool {
+        self.raw.sync_required()
+    }
+
     pub fn pool_id(&self) -> PoolId {
         self.state.read().pool_id
     }
