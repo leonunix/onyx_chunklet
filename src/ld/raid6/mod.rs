@@ -404,12 +404,23 @@ impl LdRaid6 {
         if set_stripe_n >= sr.cursor.load(Ordering::Acquire) {
             return;
         }
-        for shadow in &sr.shadows {
-            let bytes = strip_for(shadow.pos_in_set);
-            if let Err(e) = shadow
-                .pd
-                .write_chunklet_user(shadow.chunklet_index, strip_base, &bytes)
-            {
+        let prepared: Vec<_> = sr
+            .shadows
+            .iter()
+            .map(|shadow| (shadow, strip_for(shadow.pos_in_set)))
+            .collect();
+        let writes: Vec<_> = prepared
+            .iter()
+            .map(|(shadow, bytes)| StripWrite {
+                pd: shadow.pd.clone(),
+                chunklet_index: shadow.chunklet_index,
+                in_chunklet_off: strip_base,
+                data: bytes,
+            })
+            .collect();
+        let results = submit_strip_writes_detailed(&writes);
+        for ((shadow, _), result) in prepared.iter().zip(results) {
+            if let Err(e) = result {
                 tracing::error!(
                     "online rebuild: shadow write-forward failed (set {} pos {} chunklet {}): {} — aborting rebuild",
                     set_idx,
@@ -418,7 +429,6 @@ impl LdRaid6 {
                     e
                 );
                 progress.aborted.store(true, Ordering::Relaxed);
-                return;
             }
         }
     }

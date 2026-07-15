@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::error::{ChunkletError, ChunkletResult};
+use crate::io::backend::{submit_strip_writes, StripWrite};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{resolve_members, LogicalDisk};
 use crate::pd::PhysicalDisk;
@@ -164,14 +165,22 @@ impl LogicalDisk for LdPlain {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
+        let mut writes = Vec::new();
         self.for_each_segment(offset, buf.len(), |member_idx, off_in_c, range| {
             debug_assert_eq!(self.desc.members[member_idx].role, LdRole::Data);
             let pd = self.members[member_idx]
                 .as_ref()
                 .ok_or_else(|| degraded_error(&self.desc.members[member_idx].pd))?;
             let chunklet_idx = self.desc.members[member_idx].chunklet_index;
-            pd.write_chunklet_user(chunklet_idx, off_in_c, &buf[range])
-        })
+            writes.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: chunklet_idx,
+                in_chunklet_off: off_in_c,
+                data: &buf[range],
+            });
+            Ok(())
+        })?;
+        submit_strip_writes(writes)
     }
 
     fn flush(&self) -> ChunkletResult<()> {

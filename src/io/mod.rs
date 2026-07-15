@@ -14,6 +14,7 @@
 pub mod aligned;
 pub mod backend;
 pub mod raw;
+pub mod scheduler;
 pub mod sync_backend;
 
 #[cfg(target_os = "linux")]
@@ -22,3 +23,7 @@ pub mod uring_backend;
 pub use aligned::{round_up, AlignedBuf};
 pub use backend::{make_backend, IoBackend, IoBackendKind, StripRead, StripWrite};
 pub use raw::RawDevice;
+pub use scheduler::{
+    current_io_class, with_io_class, IoClass, IoClassSnapshot, PdSchedulerSnapshot,
+    ScheduledBackend, SchedulerConfig, SchedulerSnapshot,
+};

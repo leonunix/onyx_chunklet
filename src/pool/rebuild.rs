@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use crate::chunklet::ChunkletHeader;
 use crate::error::{ChunkletError, ChunkletResult};
+use crate::io::backend::{submit_strip_writes, StripWrite};
+use crate::io::{with_io_class, IoClass};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::{LdMirror, LdRaid5, LdRaid6, ReconstructEngine};
 use crate::pd::PhysicalDisk;
@@ -348,11 +350,15 @@ impl Pool {
                     for shadow in &sr.shadows {
                         let midx = set_idx * n_per_set + shadow.pos_in_set;
                         engine.reconstruct_member_strip(midx, base_off, &mut buf[..range_len])?;
-                        if let Err(e) = shadow.pd.write_chunklet_user(
-                            shadow.chunklet_index,
-                            base_off,
-                            &buf[..range_len],
-                        ) {
+                        let write = StripWrite {
+                            pd: shadow.pd.clone(),
+                            chunklet_index: shadow.chunklet_index,
+                            in_chunklet_off: base_off,
+                            data: &buf[..range_len],
+                        };
+                        if let Err(e) =
+                            with_io_class(IoClass::Maintenance, || submit_strip_writes(vec![write]))
+                        {
                             tracing::error!(
                                 "online rebuild: shadow backfill write failed (set {} pos {}): {} — aborting",
                                 set_idx, shadow.pos_in_set, e

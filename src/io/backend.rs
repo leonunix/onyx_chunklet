@@ -22,7 +22,9 @@
 use std::sync::Arc;
 
 use crate::error::ChunkletResult;
+use crate::io::scheduler::{current_io_class, with_io_class, IoClass, SchedulerSnapshot};
 use crate::pd::PhysicalDisk;
+use crate::types::PdId;
 
 /// One PD-level write prepared by an LD. The lifetime ties `data` to
 /// whatever buffer the caller owns; backends are required to issue + wait
@@ -56,6 +58,17 @@ pub struct StripRead<'a> {
 /// Backends are stored as `Arc<dyn IoBackend>` on each `PhysicalDisk`;
 /// see `PhysicalDisk::backend`.
 pub trait IoBackend: Send + Sync {
+    /// Register a pool member for scheduler observability. Plain backends do
+    /// not retain per-PD state and therefore inherit this no-op.
+    fn register_pd(&self, pd_id: PdId) {
+        let _ = pd_id;
+    }
+
+    /// Scheduler metrics when this backend is an admission wrapper.
+    fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
+        None
+    }
+
     /// Issue every read in `ops`, blocking until all complete. Returns
     /// the first error seen.
     fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()>;
@@ -72,6 +85,16 @@ pub trait IoBackend: Send + Sync {
     /// short-circuit on `len <= 1` to avoid backend-specific ceremony.
     fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>>;
 
+    /// Class-aware detailed write entry point. Existing backends inherit the
+    /// historical implementation; scheduling wrappers override this method.
+    fn submit_writes_detailed_with_class(
+        &self,
+        class: IoClass,
+        ops: &[StripWrite<'_>],
+    ) -> Vec<ChunkletResult<()>> {
+        with_io_class(class, || self.submit_writes_detailed(ops))
+    }
+
     /// First-error convenience over [`Self::submit_writes_detailed`]: issue and
     /// wait on every op, then return the first `Err` (others dropped). Preserves
     /// the historical all-or-nothing contract for callers that do not perform
@@ -79,6 +102,19 @@ pub trait IoBackend: Send + Sync {
     fn submit_writes(&self, ops: &[StripWrite<'_>]) -> ChunkletResult<()> {
         for r in self.submit_writes_detailed(ops) {
             r?;
+        }
+        Ok(())
+    }
+
+    /// Class-aware first-error convenience over
+    /// [`Self::submit_writes_detailed_with_class`].
+    fn submit_writes_with_class(
+        &self,
+        class: IoClass,
+        ops: &[StripWrite<'_>],
+    ) -> ChunkletResult<()> {
+        for result in self.submit_writes_detailed_with_class(class, ops) {
+            result?;
         }
         Ok(())
     }
@@ -138,7 +174,7 @@ pub fn submit_strip_writes(ops: Vec<StripWrite<'_>>) -> ChunkletResult<()> {
         return Ok(());
     }
     let backend = ops[0].pd.backend();
-    backend.submit_writes(&ops)
+    backend.submit_writes_with_class(current_io_class(), &ops)
 }
 
 /// LD-side entry point for batched writes that returns a **per-op** result in
@@ -156,7 +192,7 @@ pub fn submit_strip_writes_detailed(ops: &[StripWrite<'_>]) -> Vec<ChunkletResul
         return Vec::new();
     }
     let backend = ops[0].pd.backend();
-    backend.submit_writes_detailed(ops)
+    backend.submit_writes_detailed_with_class(current_io_class(), ops)
 }
 
 /// LD-side entry point for batched reads. Picks the backend off the

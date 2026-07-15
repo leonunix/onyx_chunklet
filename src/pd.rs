@@ -207,6 +207,7 @@ impl PhysicalDisk {
     /// PD it owns right after open/init, so all PDs in a pool share one
     /// backend Arc.
     pub fn set_backend(&self, b: std::sync::Arc<dyn crate::io::IoBackend>) {
+        b.register_pd(self.pd_id());
         *self.backend.write() = b;
     }
 

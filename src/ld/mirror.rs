@@ -190,6 +190,8 @@ impl LdMirror {
             return;
         }
         let row_size = self.desc.row_size as usize;
+        let mut writes = Vec::new();
+        let mut contexts = Vec::new();
         for (offset, buf) in ops {
             let _ = self.for_each_segment(*offset, buf.len(), |row, set, off_in_c, range| {
                 let set_idx = row * row_size + set;
@@ -201,22 +203,30 @@ impl LdMirror {
                     let strip_n = off_in_c / self.strip_bytes;
                     if strip_n < sr.cursor.load(Ordering::Acquire) {
                         for shadow in &sr.shadows {
-                            if let Err(e) = shadow.pd.write_chunklet_user(
-                                shadow.chunklet_index,
-                                off_in_c,
-                                &buf[range.clone()],
-                            ) {
-                                tracing::error!(
-                                    "online rebuild (mirror): shadow write-forward failed (set {} pos {}): {} — aborting",
-                                    set_idx, shadow.pos_in_set, e
-                                );
-                                progress.aborted.store(true, Ordering::Relaxed);
-                            }
+                            writes.push(StripWrite {
+                                pd: shadow.pd.clone(),
+                                chunklet_index: shadow.chunklet_index,
+                                in_chunklet_off: off_in_c,
+                                data: &buf[range.clone()],
+                            });
+                            contexts.push((set_idx, shadow.pos_in_set));
                         }
                     }
                 }
                 Ok(())
             });
+        }
+        let results = submit_strip_writes_detailed(&writes);
+        for ((set_idx, pos_in_set), result) in contexts.into_iter().zip(results) {
+            if let Err(e) = result {
+                tracing::error!(
+                    "online rebuild (mirror): shadow write-forward failed (set {} pos {}): {} — aborting",
+                    set_idx,
+                    pos_in_set,
+                    e
+                );
+                progress.aborted.store(true, Ordering::Relaxed);
+            }
         }
     }
 

@@ -31,6 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::error::{ChunkletError, ChunkletResult};
+use crate::io::backend::{submit_strip_writes, StripWrite};
+use crate::io::{with_io_class, IoClass};
 use crate::ld::descriptor::LdList;
 use crate::ld::{LdMirror, LdRaid5, LdRaid6, ReconstructEngine};
 use crate::pd::PhysicalDisk;
@@ -400,11 +402,15 @@ impl Pool {
                     progress.aborted.store(true, Ordering::Relaxed);
                     break;
                 }
-                if let Err(e) = shadow.pd.write_chunklet_user(
-                    shadow.chunklet_index,
-                    base_off,
-                    &buf[..range_len],
-                ) {
+                let write = StripWrite {
+                    pd: shadow.pd.clone(),
+                    chunklet_index: shadow.chunklet_index,
+                    in_chunklet_off: base_off,
+                    data: &buf[..range_len],
+                };
+                if let Err(e) =
+                    with_io_class(IoClass::Maintenance, || submit_strip_writes(vec![write]))
+                {
                     tracing::error!(
                         "rebalance: shadow write failed (ld {} set {}): {} — aborting",
                         mv.ld_id,

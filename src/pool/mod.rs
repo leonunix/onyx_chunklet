@@ -734,6 +734,35 @@ impl Pool {
         }
     }
 
+    /// Install one pool-shared per-PD block scheduler around the selected IO
+    /// backend. Every live and subsequently admitted PD receives the same
+    /// backend `Arc`, so class reservations are enforced across all LD roles.
+    pub fn set_scheduled_io_backend(
+        &self,
+        kind: crate::io::IoBackendKind,
+        config: crate::io::SchedulerConfig,
+    ) -> ChunkletResult<()> {
+        let inner = crate::io::make_backend(kind);
+        let backend: Arc<dyn crate::io::IoBackend> =
+            Arc::new(crate::io::ScheduledBackend::new(inner, config)?);
+        let s = self.state.read();
+        for pd in s.pds.values() {
+            pd.set_backend(backend.clone());
+        }
+        Ok(())
+    }
+
+    /// Snapshot the pool-shared per-PD scheduler, if one is installed.
+    /// Clone the backend while holding the pool lock, then release it before
+    /// taking the scheduler mutex so status collection cannot invert locks.
+    pub fn io_scheduler_snapshot(&self) -> Option<crate::io::SchedulerSnapshot> {
+        let backend = {
+            let s = self.state.read();
+            s.pds.values().next().map(|pd| pd.backend())
+        }?;
+        backend.scheduler_snapshot()
+    }
+
     pub fn pd_count(&self) -> usize {
         self.state.read().pds.len()
     }
@@ -1107,6 +1136,42 @@ mod tests {
         for (i, info) in infos.iter().enumerate() {
             assert_eq!(info.pd_seq_in_pool, i as u32);
         }
+    }
+
+    #[test]
+    fn scheduled_backend_snapshot_is_per_pd_and_idle_until_io() {
+        let dir = TempDir::new().unwrap();
+        let pool = Pool::create(
+            vec![sparse(&dir, "pd0"), sparse(&dir, "pd1")],
+            PoolConfig::default(),
+        )
+        .unwrap();
+
+        assert!(pool.io_scheduler_snapshot().is_none());
+
+        let config = crate::io::SchedulerConfig::new(64)
+            .with_min_active_blocks(crate::io::IoClass::Foreground, 16)
+            .with_min_active_blocks(crate::io::IoClass::DrainData, 24)
+            .with_min_active_blocks(crate::io::IoClass::DrainMeta, 16)
+            .with_min_active_blocks(crate::io::IoClass::Maintenance, 8);
+        pool.set_scheduled_io_backend(crate::io::IoBackendKind::Sync, config)
+            .unwrap();
+
+        let snapshot = pool.io_scheduler_snapshot().unwrap();
+        assert_eq!(snapshot.pds.len(), 2);
+        for pd in snapshot.pds {
+            assert_eq!(pd.max_active_blocks, 64);
+            assert_eq!(pd.total_queued_blocks, 0);
+            assert_eq!(pd.total_active_blocks, 0);
+            assert_eq!(pd.classes.len(), crate::io::IoClass::ALL.len());
+            assert_eq!(pd.classes[0].configured_min_blocks, 16);
+            assert_eq!(pd.classes[1].configured_min_blocks, 24);
+            assert_eq!(pd.classes[2].configured_min_blocks, 16);
+            assert_eq!(pd.classes[3].configured_min_blocks, 8);
+        }
+
+        pool.set_io_backend(crate::io::IoBackendKind::Sync);
+        assert!(pool.io_scheduler_snapshot().is_none());
     }
 
     #[test]
