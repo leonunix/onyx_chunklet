@@ -123,27 +123,37 @@ impl ScheduledBackend {
         ops: &[StripWrite<'_>],
     ) -> Vec<ChunkletResult<()>> {
         let max_blocks = self.admission.config.max_active_blocks_per_pd;
-        let waves = match plan_ops(ops, self.admission.config.wave_cap(class), max_blocks) {
-            Ok(waves) => waves,
+        let mut lanes = match plan_ops(ops, self.admission.config.wave_cap(class), max_blocks) {
+            Ok(lanes) => lanes,
             Err(message) => return admission_errors(ops.len(), message),
         };
         let mut output: Vec<Option<ChunkletResult<()>>> =
             std::iter::repeat_with(|| None).take(ops.len()).collect();
-        for wave in waves {
-            let wave_ops: Vec<_> = wave
-                .indices
+
+        let initial_demands = lanes
+            .values()
+            .filter_map(|lane| lane.front().map(|wave| wave.demand.clone()))
+            .collect();
+        let mut pending = match self.admission.queue(class, initial_demands) {
+            Ok(pending) => pending,
+            Err(message) => return admission_errors(ops.len(), message),
+        };
+        while !pending.is_empty() {
+            let AdmittedSubset { pd_ids, permit } = pending.admit_ready();
+            let mut wave_indices = Vec::new();
+            for pd_id in &pd_ids {
+                let wave = lanes
+                    .get(pd_id)
+                    .and_then(|lane| lane.front())
+                    .expect("admitted PD lane disappeared");
+                debug_assert_eq!(wave.pd_id, *pd_id);
+                wave_indices.extend_from_slice(&wave.indices);
+            }
+            wave_indices.sort_unstable();
+            let wave_ops: Vec<_> = wave_indices
                 .iter()
                 .map(|&index| ops[index].clone())
                 .collect();
-            let permit = match self.admission.admit(class, wave.demands) {
-                Ok(permit) => permit,
-                Err(message) => {
-                    for index in wave.indices {
-                        output[index] = Some(Err(ChunkletError::Config(message.clone())));
-                    }
-                    continue;
-                }
-            };
             let completion = CreditCompletionObserver::new(&permit, &wave_ops);
             let service_started = Instant::now();
             let mut results = self
@@ -152,8 +162,8 @@ impl ScheduledBackend {
                 .into_iter();
             let fallback_service_ns = elapsed_ns(service_started);
             let service_ns_by_pd = completion.service_ns_by_pd();
-            let mut completions = Vec::with_capacity(wave.indices.len());
-            for (&index, op) in wave.indices.iter().zip(&wave_ops) {
+            let mut completions = Vec::with_capacity(wave_indices.len());
+            for (&index, op) in wave_indices.iter().zip(&wave_ops) {
                 let result = results.next().unwrap_or_else(|| {
                     Err(ChunkletError::Invariant(
                         "wrapped IO backend returned too few write results".into(),
@@ -184,6 +194,22 @@ impl ScheduledBackend {
                 );
             }
             drop(permit);
+
+            let mut next_demands = Vec::with_capacity(pd_ids.len());
+            for pd_id in pd_ids {
+                let lane = lanes.get_mut(&pd_id).expect("admitted PD lane disappeared");
+                let completed = lane.pop_front().expect("admitted PD wave disappeared");
+                debug_assert_eq!(completed.pd_id, pd_id);
+                if let Some(next) = lane.front() {
+                    next_demands.push(next.demand.clone());
+                }
+            }
+            if let Err(message) = pending.enqueue(next_demands) {
+                for result in output.iter_mut().filter(|result| result.is_none()) {
+                    *result = Some(Err(ChunkletError::Config(message.clone())));
+                }
+                break;
+            }
         }
         output
             .into_iter()

@@ -55,6 +55,37 @@ impl IoBackend for StreamingGateBackend {
 
 struct PartialCompletionPanicBackend;
 
+struct RecordingBackend {
+    calls: mpsc::Sender<Vec<PdId>>,
+}
+
+impl IoBackend for RecordingBackend {
+    fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        Ok(())
+    }
+
+    fn submit_writes_detailed(&self, _ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        panic!("non-observed path must not be used")
+    }
+
+    fn submit_writes_detailed_observed_with_class(
+        &self,
+        _class: IoClass,
+        ops: &[StripWrite<'_>],
+        observer: &dyn WriteCompletionObserver,
+    ) -> Vec<ChunkletResult<()>> {
+        self.calls
+            .send(ops.iter().map(|op| op.pd.pd_id()).collect())
+            .unwrap();
+        observer.writes_completed(&(0..ops.len()).collect::<Vec<_>>(), 1);
+        (0..ops.len()).map(|_| Ok(())).collect()
+    }
+
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+}
+
 impl IoBackend for PartialCompletionPanicBackend {
     fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
         Ok(())
@@ -181,15 +212,11 @@ fn accounts_ceil_blocks_and_aggregates_each_pd() {
     assert_eq!(blocks_for_len(4096).unwrap(), 1);
     assert_eq!(blocks_for_len(4097).unwrap(), 2);
 
-    let waves = plan_work(&[(first, 1), (second, 2), (first, 1), (first, 0)], 8, 8).unwrap();
-    let by_pd: BTreeMap<_, _> = waves[0]
-        .demands
-        .iter()
-        .into_iter()
-        .map(|demand| (demand.pd_id, demand.blocks))
-        .collect();
-    assert_eq!(by_pd[&first], 2);
-    assert_eq!(by_pd[&second], 2);
+    let lanes = plan_work(&[(first, 1), (second, 2), (first, 1), (first, 0)], 8, 8).unwrap();
+    assert_eq!(lanes[&first][0].indices, vec![0, 2, 3]);
+    assert_eq!(lanes[&first][0].demand.blocks, 2);
+    assert_eq!(lanes[&second][0].indices, vec![1]);
+    assert_eq!(lanes[&second][0].demand.blocks, 2);
 }
 
 #[test]
@@ -215,51 +242,60 @@ fn different_pds_have_independent_credits() {
 }
 
 #[test]
-fn multi_pd_batch_never_holds_partial_credit() {
+fn multi_pd_queue_admits_ready_pd_without_waiting_for_busy_pd() {
     let scheduler = controller(SchedulerConfig::new(4));
-    let first = PdId::new_v4();
-    let second = PdId::new_v4();
-    let first_busy = scheduler
-        .admit(IoClass::Foreground, vec![demand(first, 4)])
+    let busy_pd = PdId::new_v4();
+    let ready_pd = PdId::new_v4();
+    let busy = scheduler
+        .admit(IoClass::Foreground, vec![demand(busy_pd, 4)])
         .unwrap();
-    let (admitted_tx, admitted_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_ready_tx, release_ready_rx) = mpsc::channel();
+    let (busy_tx, busy_rx) = mpsc::channel();
     let waiter_scheduler = scheduler.clone();
     let waiter = thread::spawn(move || {
-        let permit = waiter_scheduler
-            .admit(
+        let mut pending = waiter_scheduler
+            .queue(
                 IoClass::Foreground,
-                vec![demand(first, 4), demand(second, 4)],
+                vec![demand(busy_pd, 4), demand(ready_pd, 4)],
             )
             .unwrap();
-        admitted_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
-        drop(permit);
+        let admitted = pending.admit_ready();
+        assert_eq!(admitted.pd_ids, vec![ready_pd]);
+        ready_tx.send(()).unwrap();
+        release_ready_rx.recv().unwrap();
+        drop(admitted.permit);
+
+        let admitted = pending.admit_ready();
+        assert_eq!(admitted.pd_ids, vec![busy_pd]);
+        busy_tx.send(()).unwrap();
+        drop(admitted.permit);
     });
     wait_until(|| {
         scheduler.snapshot().pds.into_iter().any(|pd| {
-            pd.pd_id == second
+            pd.pd_id == busy_pd
                 && pd
                     .classes
                     .into_iter()
                     .any(|class| class.class == IoClass::Foreground && class.queued_blocks == 4)
         })
     });
+    ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(
-        class_snapshot(&scheduler, second, IoClass::Foreground).active_blocks,
-        0
+        class_snapshot(&scheduler, ready_pd, IoClass::Foreground).active_blocks,
+        4
     );
 
-    drop(first_busy);
-    admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    release_tx.send(()).unwrap();
+    release_ready_tx.send(()).unwrap();
+    drop(busy);
+    busy_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     waiter.join().unwrap();
     assert_eq!(
-        class_snapshot(&scheduler, first, IoClass::Foreground).active_blocks,
+        class_snapshot(&scheduler, busy_pd, IoClass::Foreground).active_blocks,
         0
     );
     assert_eq!(
-        class_snapshot(&scheduler, second, IoClass::Foreground).active_blocks,
+        class_snapshot(&scheduler, ready_pd, IoClass::Foreground).active_blocks,
         0
     );
 }
@@ -527,30 +563,31 @@ fn error_and_unwind_drop_release_every_credit() {
 fn plans_bounded_waves_in_original_order_and_caps_oversized_op() {
     let first = PdId::new_v4();
     let second = PdId::new_v4();
-    let waves = plan_work(
+    let lanes = plan_work(
         &[(first, 3), (second, 2), (first, 3), (second, 1), (first, 9)],
         4,
         4,
     )
     .unwrap();
-    assert_eq!(waves.len(), 3);
-    assert_eq!(waves[0].indices, vec![0, 1]);
-    assert_eq!(waves[1].indices, vec![2, 3]);
-    assert_eq!(waves[2].indices, vec![4]);
-    for wave in &waves[..2] {
-        assert!(wave.demands.iter().all(|demand| demand.blocks <= 4));
-    }
-    assert_eq!(waves[2].demands[0].blocks, 4);
-    assert_eq!(waves[2].demands[0].requested_blocks, 9);
+    assert_eq!(lanes[&first].len(), 3);
+    assert_eq!(lanes[&first][0].indices, vec![0]);
+    assert_eq!(lanes[&first][1].indices, vec![2]);
+    assert_eq!(lanes[&first][2].indices, vec![4]);
+    assert_eq!(lanes[&first][2].demand.blocks, 4);
+    assert_eq!(lanes[&first][2].demand.requested_blocks, 9);
+    assert!(lanes[&first][2].demand.exclusive);
+    assert_eq!(lanes[&second].len(), 1);
+    assert_eq!(lanes[&second][0].indices, vec![1, 3]);
+    assert_eq!(lanes[&second][0].demand.blocks, 3);
 }
 
 #[test]
 fn idle_background_plan_uses_full_max_instead_of_min_sized_waves() {
     let pd_id = PdId::new_v4();
-    let waves = plan_work(&[(pd_id, 1), (pd_id, 1), (pd_id, 1), (pd_id, 3)], 8, 8).unwrap();
-    assert_eq!(waves.len(), 1);
-    assert_eq!(waves[0].indices, vec![0, 1, 2, 3]);
-    assert_eq!(waves[0].demands[0].blocks, 6);
+    let lanes = plan_work(&[(pd_id, 1), (pd_id, 1), (pd_id, 1), (pd_id, 3)], 8, 8).unwrap();
+    assert_eq!(lanes[&pd_id].len(), 1);
+    assert_eq!(lanes[&pd_id][0].indices, vec![0, 1, 2, 3]);
+    assert_eq!(lanes[&pd_id][0].demand.blocks, 6);
 }
 
 #[test]
@@ -639,6 +676,44 @@ fn flush_fence_waits_for_active_and_blocks_new_admissions() {
 }
 
 #[test]
+fn older_pending_write_precedes_later_flush_fence() {
+    let scheduler = controller(SchedulerConfig::new(1));
+    let pd_id = PdId::new_v4();
+    let active = scheduler
+        .admit(IoClass::Foreground, vec![demand(pd_id, 1)])
+        .unwrap();
+
+    let (write_tx, write_rx) = mpsc::channel();
+    let (write_release_tx, write_release_rx) = mpsc::channel();
+    let write_scheduler = scheduler.clone();
+    let writer = thread::spawn(move || {
+        let permit = write_scheduler
+            .admit(IoClass::DrainMeta, vec![demand(pd_id, 1)])
+            .unwrap();
+        write_tx.send(()).unwrap();
+        write_release_rx.recv().unwrap();
+        drop(permit);
+    });
+    wait_until(|| class_snapshot(&scheduler, pd_id, IoClass::DrainMeta).queued_blocks == 1);
+
+    let (flush_tx, flush_rx) = mpsc::channel();
+    let flush_scheduler = scheduler.clone();
+    let flush = thread::spawn(move || {
+        let _fence = flush_scheduler.fence(vec![pd_id]);
+        flush_tx.send(()).unwrap();
+    });
+    wait_until(|| scheduler.snapshot().pds[0].flush_waiters == 1);
+    drop(active);
+
+    write_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(flush_rx.try_recv().is_err());
+    write_release_tx.send(()).unwrap();
+    flush_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    writer.join().unwrap();
+    flush.join().unwrap();
+}
+
+#[test]
 fn registration_and_snapshot_include_idle_pd_limits_and_totals() {
     let scheduler =
         controller(SchedulerConfig::new(8).with_min_active_blocks(IoClass::DrainMeta, 2));
@@ -688,6 +763,153 @@ fn tls_class_restores_after_nested_scope_and_panic() {
     });
     assert!(unwind.is_err());
     assert_eq!(current_io_class(), IoClass::Foreground);
+}
+
+#[test]
+fn ready_pd_advances_each_lane_wave_while_another_pd_is_blocked() {
+    let (_dir, pds) = make_test_pds(2);
+    let blocked_pd = pds[0].clone();
+    let ready_pd = pds[1].clone();
+    let (calls_tx, calls_rx) = mpsc::channel();
+    let scheduled = Arc::new(
+        ScheduledBackend::new(
+            Arc::new(RecordingBackend { calls: calls_tx }),
+            SchedulerConfig::new(1),
+        )
+        .unwrap(),
+    );
+    let blocked = scheduled
+        .admission
+        .admit(IoClass::Foreground, vec![demand(blocked_pd.pd_id(), 1)])
+        .unwrap();
+
+    let submitter = scheduled.clone();
+    let blocked_submit_pd = blocked_pd.clone();
+    let ready_submit_pd = ready_pd.clone();
+    let submit = thread::spawn(move || {
+        let blocked_data = vec![1_u8; BLOCK_SIZE as usize];
+        let first_ready_data = vec![2_u8; BLOCK_SIZE as usize];
+        let second_ready_data = vec![3_u8; BLOCK_SIZE as usize];
+        let ops = [
+            StripWrite {
+                pd: blocked_submit_pd,
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &blocked_data,
+            },
+            StripWrite {
+                pd: ready_submit_pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &first_ready_data,
+            },
+            StripWrite {
+                pd: ready_submit_pd,
+                chunklet_index: 0,
+                in_chunklet_off: BLOCK_SIZE,
+                data: &second_ready_data,
+            },
+        ];
+        submitter.submit_writes_detailed_with_class(IoClass::DrainData, &ops)
+    });
+
+    assert_eq!(
+        calls_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        vec![ready_pd.pd_id()]
+    );
+    assert_eq!(
+        calls_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        vec![ready_pd.pd_id()]
+    );
+    assert!(calls_rx.try_recv().is_err());
+
+    drop(blocked);
+    assert_eq!(
+        calls_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        vec![blocked_pd.pd_id()]
+    );
+    assert!(submit
+        .join()
+        .unwrap()
+        .into_iter()
+        .all(|result| result.is_ok()));
+    assert!(scheduled
+        .snapshot()
+        .pds
+        .iter()
+        .all(|pd| { pd.total_active_blocks == 0 && pd.total_queued_blocks == 0 }));
+}
+
+#[test]
+fn panic_cancels_not_yet_admitted_pd_lane() {
+    let (_dir, pds) = make_test_pds(2);
+    let ready_pd = pds[0].clone();
+    let blocked_pd = pds[1].clone();
+    let scheduled = ScheduledBackend::new(
+        Arc::new(PartialCompletionPanicBackend),
+        SchedulerConfig::new(1),
+    )
+    .unwrap();
+    let blocked = scheduled
+        .admission
+        .admit(IoClass::Foreground, vec![demand(blocked_pd.pd_id(), 1)])
+        .unwrap();
+    let ready_data = vec![1_u8; BLOCK_SIZE as usize];
+    let blocked_data = vec![2_u8; BLOCK_SIZE as usize];
+    let ops = [
+        StripWrite {
+            pd: ready_pd,
+            chunklet_index: 0,
+            in_chunklet_off: 0,
+            data: &ready_data,
+        },
+        StripWrite {
+            pd: blocked_pd,
+            chunklet_index: 0,
+            in_chunklet_off: 0,
+            data: &blocked_data,
+        },
+    ];
+
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        scheduled.submit_writes_detailed_with_class(IoClass::DrainMeta, &ops)
+    }));
+    assert!(unwind.is_err());
+    let snapshot = scheduled.snapshot();
+    assert!(snapshot.pds.iter().all(|pd| {
+        let drain_meta = pd
+            .classes
+            .iter()
+            .find(|class| class.class == IoClass::DrainMeta)
+            .unwrap();
+        drain_meta.active_blocks == 0 && drain_meta.queued_blocks == 0
+    }));
+    assert_eq!(
+        snapshot
+            .pds
+            .iter()
+            .flat_map(|pd| &pd.classes)
+            .filter(|class| class.class == IoClass::DrainMeta)
+            .map(|class| class.wait_events)
+            .sum::<u64>(),
+        1
+    );
+    assert!(
+        snapshot
+            .pds
+            .iter()
+            .flat_map(|pd| &pd.classes)
+            .filter(|class| class.class == IoClass::DrainMeta)
+            .map(|class| class.wait_ns)
+            .sum::<u64>()
+            > 0
+    );
+    drop(blocked);
+    assert!(scheduled
+        .snapshot()
+        .pds
+        .iter()
+        .all(|pd| pd.total_active_blocks == 0 && pd.total_queued_blocks == 0));
 }
 
 #[test]
