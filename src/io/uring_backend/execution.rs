@@ -1,11 +1,11 @@
 //! Persistent scoped execution for PD-homogeneous io_uring write groups.
 //!
 //! Rayon owns fixed foreground and background worker sets. A submit borrows
-//! caller buffers only for the duration of `ThreadPool::scope`, while each
+//! caller buffers only for the duration of `ThreadPool::in_place_scope`, while each
 //! persistent worker reuses the `IoUring` stored in its thread-local state.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -92,9 +92,235 @@ impl ExecutionStats {
     }
 }
 
+#[derive(Default)]
+struct PdLaneState {
+    cap: usize,
+    active: usize,
+    waiters: VecDeque<u64>,
+}
+
+#[derive(Default)]
+struct LaneState {
+    pds: BTreeMap<PdId, PdLaneState>,
+    total_active: usize,
+    next_ticket: u64,
+}
+
+/// Admission in front of one shared Rayon pool. Foreground owns one instance;
+/// all background classes share another, so neither side consumes the other's
+/// worker lanes.
+struct PdLaneAdmission {
+    workers: usize,
+    state: ParkingMutex<LaneState>,
+    changed: Condvar,
+}
+
+impl PdLaneAdmission {
+    fn new(workers: usize) -> Self {
+        Self {
+            workers,
+            state: ParkingMutex::new(LaneState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn register_pd(&self, pd_id: PdId) {
+        let mut state = self.state.lock();
+        if state.pds.contains_key(&pd_id) {
+            return;
+        }
+        state.pds.insert(pd_id, PdLaneState::default());
+        self.rebalance(&mut state);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn enqueue_groups(self: &Arc<Self>, groups: &mut [PdGroup]) {
+        let mut state = self.state.lock();
+        let mut registered = false;
+        for group in groups.iter() {
+            if let std::collections::btree_map::Entry::Vacant(entry) = state.pds.entry(group.pd_id)
+            {
+                entry.insert(PdLaneState::default());
+                registered = true;
+            }
+        }
+        if registered {
+            self.rebalance(&mut state);
+        }
+
+        for group in groups {
+            debug_assert!(group.waiter.is_none());
+            let ticket = state.next_ticket;
+            state.next_ticket = state.next_ticket.wrapping_add(1);
+            state
+                .pds
+                .get_mut(&group.pd_id)
+                .expect("queued execution PD was not registered")
+                .waiters
+                .push_back(ticket);
+            group.waiter = Some(PdLaneWaiter {
+                admission: self.clone(),
+                pd_id: group.pd_id,
+                ticket,
+                queued: true,
+            });
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn acquire_any(self: &Arc<Self>, pending: &mut [PdGroup]) -> (usize, PdLanePermit) {
+        assert!(
+            self.workers > 0,
+            "cannot acquire a zero-worker execution lane"
+        );
+        assert!(
+            !pending.is_empty(),
+            "cannot acquire from an empty PD group set"
+        );
+
+        let mut state = self.state.lock();
+        loop {
+            if state.total_active < self.workers {
+                if let Some((pending_index, pd_id)) =
+                    pending.iter().enumerate().find_map(|(index, group)| {
+                        let lane = state
+                            .pds
+                            .get(&group.pd_id)
+                            .expect("pending execution PD was not registered");
+                        let ticket = group
+                            .waiter
+                            .as_ref()
+                            .expect("pending execution group has no lane ticket")
+                            .ticket;
+                        (lane.active < lane.cap && lane.waiters.front() == Some(&ticket))
+                            .then_some((index, group.pd_id))
+                    })
+                {
+                    let lane = state
+                        .pds
+                        .get_mut(&pd_id)
+                        .expect("selected execution PD was not registered");
+                    lane.waiters.pop_front();
+                    lane.active += 1;
+                    state.total_active += 1;
+                    let mut waiter = pending[pending_index]
+                        .waiter
+                        .take()
+                        .expect("selected execution group has no lane ticket");
+                    waiter.queued = false;
+                    return (
+                        pending_index,
+                        PdLanePermit {
+                            admission: self.clone(),
+                            pd_id,
+                        },
+                    );
+                }
+            }
+            self.changed.wait(&mut state);
+        }
+    }
+
+    fn cancel_waiter(&self, pd_id: PdId, ticket: u64) {
+        let mut state = self.state.lock();
+        let lane = state
+            .pds
+            .get_mut(&pd_id)
+            .expect("queued execution PD was unregistered");
+        if let Some(index) = lane.waiters.iter().position(|&queued| queued == ticket) {
+            lane.waiters.remove(index);
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn rebalance(&self, state: &mut LaneState) {
+        let pd_count = state.pds.len();
+        if pd_count == 0 {
+            return;
+        }
+
+        if self.workers >= pd_count {
+            let base = self.workers / pd_count;
+            let remainder = self.workers % pd_count;
+            for (index, lane) in state.pds.values_mut().enumerate() {
+                lane.cap = base + usize::from(index < remainder);
+            }
+        } else {
+            // No static reservation can cover every PD when workers < PDs.
+            // A one-lane cap keeps every PD runnable; total_active still caps
+            // actual concurrency at the worker count.
+            for lane in state.pds.values_mut() {
+                lane.cap = usize::from(self.workers > 0);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Vec<(PdId, usize, usize)> {
+        self.state
+            .lock()
+            .pds
+            .iter()
+            .map(|(&pd_id, lane)| (pd_id, lane.cap, lane.active))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self, pd_id: PdId) -> usize {
+        self.state
+            .lock()
+            .pds
+            .get(&pd_id)
+            .map_or(0, |lane| lane.waiters.len())
+    }
+}
+
+struct PdLanePermit {
+    admission: Arc<PdLaneAdmission>,
+    pd_id: PdId,
+}
+
+struct PdLaneWaiter {
+    admission: Arc<PdLaneAdmission>,
+    pd_id: PdId,
+    ticket: u64,
+    queued: bool,
+}
+
+impl Drop for PdLaneWaiter {
+    fn drop(&mut self) {
+        if self.queued {
+            self.admission.cancel_waiter(self.pd_id, self.ticket);
+        }
+    }
+}
+
+impl Drop for PdLanePermit {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock();
+        debug_assert!(state.total_active > 0);
+        {
+            let lane = state
+                .pds
+                .get_mut(&self.pd_id)
+                .expect("active execution PD was unregistered");
+            debug_assert!(lane.active > 0);
+            lane.active -= 1;
+        }
+        state.total_active -= 1;
+        drop(state);
+        self.admission.changed.notify_all();
+    }
+}
+
 pub(super) struct ScopedWritePools {
     foreground: Option<ThreadPool>,
     background: Option<ThreadPool>,
+    foreground_lanes: Arc<PdLaneAdmission>,
+    background_lanes: Arc<PdLaneAdmission>,
     foreground_workers: usize,
     background_workers: usize,
     foreground_cpus: Vec<usize>,
@@ -116,9 +342,15 @@ pub(crate) struct ExecutionPoolBackend {
 
 impl ExecutionPoolBackend {
     pub(crate) fn new(inner: Arc<dyn IoBackend>, config: UringPoolConfig) -> std::io::Result<Self> {
+        let write_pools = ScopedWritePools::with_config(config)?;
+        if let Some(snapshot) = inner.scheduler_snapshot() {
+            for pd in snapshot.pds {
+                write_pools.register_pd(pd.pd_id);
+            }
+        }
         Ok(Self {
             inner,
-            write_pools: ScopedWritePools::with_config(config)?,
+            write_pools,
             fence: ExecutionFence::new(),
         })
     }
@@ -127,6 +359,7 @@ impl ExecutionPoolBackend {
 impl IoBackend for ExecutionPoolBackend {
     fn register_pd(&self, pd_id: PdId) {
         self.inner.register_pd(pd_id);
+        self.write_pools.register_pd(pd_id);
     }
 
     fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
@@ -262,12 +495,19 @@ impl ScopedWritePools {
         Ok(Self {
             foreground: build_pool("ckuring-fg", config.foreground_workers, &foreground_cpus)?,
             background: build_pool("ckuring-bg", config.background_workers, &background_cpus)?,
+            foreground_lanes: Arc::new(PdLaneAdmission::new(config.foreground_workers)),
+            background_lanes: Arc::new(PdLaneAdmission::new(config.background_workers)),
             foreground_workers: config.foreground_workers,
             background_workers: config.background_workers,
             foreground_cpus,
             background_cpus,
             stats: ExecutionStats::new(),
         })
+    }
+
+    fn register_pd(&self, pd_id: PdId) {
+        self.foreground_lanes.register_pd(pd_id);
+        self.background_lanes.register_pd(pd_id);
     }
 
     pub(super) fn submit<'a, F>(
@@ -303,22 +543,31 @@ impl ScopedWritePools {
             return Vec::new();
         }
 
-        let groups = group_indices_by_pd(ops);
+        let mut groups = group_indices_by_pd(ops);
+        let lanes = self.lanes(class);
+        lanes.enqueue_groups(&mut groups);
         self.stats
             .class(class)
             .record_batch(groups.len(), ops.len());
         let (sender, receiver) = unbounded::<(Vec<usize>, Vec<ChunkletResult<()>>)>();
         let observer_panic = ParkingMutex::new(None::<Box<dyn Any + Send>>);
-        let scope_queued_at = Instant::now();
+        let batch_queued_at = submit_started;
 
-        pool.scope(|scope| {
-            for indices in groups {
+        assert!(
+            pool.current_thread_index().is_none(),
+            "persistent write execution pool cannot re-enter itself"
+        );
+        pool.in_place_scope(|scope| {
+            while !groups.is_empty() {
+                let (pending_index, permit) = lanes.acquire_any(&mut groups);
+                let PdGroup { indices, .. } = groups.remove(pending_index);
                 let sender = sender.clone();
                 let stats = self.stats.class(class);
-                let queued_at = scope_queued_at;
+                let queued_at = batch_queued_at;
                 let submit_group = &submit_group;
                 let observer_panic = &observer_panic;
                 scope.spawn(move |_| {
+                    let _permit = permit;
                     let queue_wait_ns = elapsed_ns(queued_at);
                     let group_ops: Vec<_> =
                         indices.iter().map(|&index| ops[index].clone()).collect();
@@ -373,22 +622,31 @@ impl ScopedWritePools {
             return Vec::new();
         }
 
-        let groups = group_indices_by_pd(ops);
+        let mut groups = group_indices_by_pd(ops);
+        let lanes = self.lanes(class);
+        lanes.enqueue_groups(&mut groups);
         self.stats
             .class(class)
             .record_batch(groups.len(), ops.len());
         let (sender, receiver) = unbounded::<(Vec<usize>, Vec<ChunkletResult<()>>)>();
         let observer_panic = ParkingMutex::new(None::<Box<dyn Any + Send>>);
-        let scope_queued_at = Instant::now();
+        let batch_queued_at = submit_started;
 
-        pool.scope(|scope| {
-            for indices in groups {
+        assert!(
+            pool.current_thread_index().is_none(),
+            "persistent write execution pool cannot re-enter itself"
+        );
+        pool.in_place_scope(|scope| {
+            while !groups.is_empty() {
+                let (pending_index, permit) = lanes.acquire_any(&mut groups);
+                let PdGroup { indices, .. } = groups.remove(pending_index);
                 let sender = sender.clone();
                 let stats = self.stats.class(class);
-                let queued_at = scope_queued_at;
+                let queued_at = batch_queued_at;
                 let submit_group = &submit_group;
                 let observer_panic = &observer_panic;
                 scope.spawn(move |_| {
+                    let _permit = permit;
                     let queue_wait_ns = elapsed_ns(queued_at);
                     let group_ops: Vec<_> =
                         indices.iter().map(|&index| ops[index].clone()).collect();
@@ -459,6 +717,15 @@ impl ScopedWritePools {
             IoClass::Foreground => self.foreground.as_ref(),
             IoClass::DrainData | IoClass::DrainMeta | IoClass::Maintenance => {
                 self.background.as_ref()
+            }
+        }
+    }
+
+    fn lanes(&self, class: IoClass) -> &Arc<PdLaneAdmission> {
+        match class {
+            IoClass::Foreground => &self.foreground_lanes,
+            IoClass::DrainData | IoClass::DrainMeta | IoClass::Maintenance => {
+                &self.background_lanes
             }
         }
     }
@@ -555,7 +822,13 @@ fn build_pool(
         .map_err(|error| std::io::Error::other(format!("build {name} pool: {error}")))
 }
 
-fn group_indices_by_pd(ops: &[StripWrite<'_>]) -> Vec<Vec<usize>> {
+struct PdGroup {
+    pd_id: PdId,
+    indices: Vec<usize>,
+    waiter: Option<PdLaneWaiter>,
+}
+
+fn group_indices_by_pd(ops: &[StripWrite<'_>]) -> Vec<PdGroup> {
     let mut groups = BTreeMap::new();
     for (index, op) in ops.iter().enumerate() {
         groups
@@ -563,7 +836,14 @@ fn group_indices_by_pd(ops: &[StripWrite<'_>]) -> Vec<Vec<usize>> {
             .or_insert_with(Vec::new)
             .push(index);
     }
-    groups.into_values().collect()
+    groups
+        .into_iter()
+        .map(|(pd_id, indices)| PdGroup {
+            pd_id,
+            indices,
+            waiter: None,
+        })
+        .collect()
 }
 
 fn normalize_result_count(results: &mut Vec<ChunkletResult<()>>, expected: usize) {
@@ -620,6 +900,7 @@ mod tests {
     use parking_lot::{Condvar, Mutex};
     use tempfile::TempDir;
 
+    use crate::io::sync_backend::SyncBackend;
     use crate::io::{RawDevice, ScheduledBackend, SchedulerConfig};
     use crate::pd::PhysicalDisk;
     use crate::types::{PdId, PoolId};
@@ -639,6 +920,65 @@ mod tests {
     struct OrderedGate {
         state: Mutex<OrderedGateState>,
         changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct LaneOrderState {
+        started: Vec<usize>,
+        released_through: usize,
+    }
+
+    struct LaneOrderGate {
+        state: Mutex<LaneOrderState>,
+        changed: Condvar,
+    }
+
+    impl LaneOrderGate {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(LaneOrderState::default()),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn run_slow(&self, marker: usize) {
+            let mut state = self.state.lock();
+            state.started.push(marker);
+            self.changed.notify_all();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.released_through < marker {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    panic!("timed out waiting to release slow lane task {marker}");
+                };
+                if self.changed.wait_for(&mut state, remaining).timed_out()
+                    && state.released_through < marker
+                {
+                    panic!("timed out waiting to release slow lane task {marker}");
+                }
+            }
+        }
+
+        fn wait_for_started(&self, count: usize) -> Vec<usize> {
+            let mut state = self.state.lock();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.started.len() < count {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    panic!("timed out waiting for {count} slow lane tasks");
+                };
+                if self.changed.wait_for(&mut state, remaining).timed_out()
+                    && state.started.len() < count
+                {
+                    panic!("timed out waiting for {count} slow lane tasks");
+                }
+            }
+            state.started.clone()
+        }
+
+        fn release(&self, marker: usize) {
+            let mut state = self.state.lock();
+            state.released_through = state.released_through.max(marker);
+            self.changed.notify_all();
+        }
     }
 
     impl OrderedGate {
@@ -866,6 +1206,256 @@ mod tests {
                 data: &pages[3],
             },
         ]
+    }
+
+    fn lane_group(pd_id: PdId) -> PdGroup {
+        PdGroup {
+            pd_id,
+            indices: vec![0],
+            waiter: None,
+        }
+    }
+
+    fn spawn_slow_lane_submit(
+        pools: Arc<ScopedWritePools>,
+        pd: Arc<PhysicalDisk>,
+        gate: Arc<LaneOrderGate>,
+        marker: usize,
+    ) -> thread::JoinHandle<Vec<ChunkletResult<()>>> {
+        thread::spawn(move || {
+            let page = [marker as u8; 4096];
+            pools.submit(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: (marker as u64) * 4096,
+                    data: &page,
+                }],
+                move |group| {
+                    gate.run_slow(marker);
+                    group.iter().map(|_| Ok(())).collect()
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn registered_scheduler_pds_seed_and_rebalance_execution_lane_caps() {
+        let first = PdId::new_v4();
+        let second = PdId::new_v4();
+        let third = PdId::new_v4();
+        let scheduled = Arc::new(
+            ScheduledBackend::new(Arc::new(SyncBackend), SchedulerConfig::new(1)).unwrap(),
+        );
+        scheduled.register_pd(first);
+        scheduled.register_pd(second);
+
+        let execution = ExecutionPoolBackend::new(scheduled, UringPoolConfig::new(5, 3)).unwrap();
+        let mut foreground_caps: Vec<_> = execution
+            .write_pools
+            .foreground_lanes
+            .snapshot()
+            .into_iter()
+            .map(|(_, cap, _)| cap)
+            .collect();
+        foreground_caps.sort_unstable();
+        assert_eq!(foreground_caps, vec![2, 3]);
+        assert_eq!(foreground_caps.iter().sum::<usize>(), 5);
+
+        execution.register_pd(third);
+        let foreground = execution.write_pools.foreground_lanes.snapshot();
+        let background = execution.write_pools.background_lanes.snapshot();
+        assert_eq!(foreground.len(), 3);
+        assert_eq!(foreground.iter().map(|(_, cap, _)| cap).sum::<usize>(), 5);
+        assert_eq!(background.len(), 3);
+        assert_eq!(background.iter().map(|(_, cap, _)| cap).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn fewer_workers_than_pds_keep_every_lane_runnable_under_global_cap() {
+        let lanes = Arc::new(PdLaneAdmission::new(2));
+        let mut pending = vec![
+            lane_group(PdId::new_v4()),
+            lane_group(PdId::new_v4()),
+            lane_group(PdId::new_v4()),
+        ];
+        lanes.enqueue_groups(&mut pending);
+        assert!(lanes.snapshot().iter().all(|(_, cap, _)| *cap == 1));
+
+        let (first_index, first) = lanes.acquire_any(&mut pending);
+        pending.remove(first_index);
+        let (second_index, second) = lanes.acquire_any(&mut pending);
+        pending.remove(second_index);
+        assert_eq!(
+            lanes
+                .snapshot()
+                .iter()
+                .map(|(_, _, active)| active)
+                .sum::<usize>(),
+            2
+        );
+
+        drop(first);
+        let (third_index, third) = lanes.acquire_any(&mut pending);
+        pending.remove(third_index);
+        drop(second);
+        drop(third);
+        assert!(lanes.snapshot().iter().all(|(_, _, active)| *active == 0));
+    }
+
+    #[test]
+    fn foreground_and_background_lanes_are_independent_and_background_is_shared() {
+        let pools = ScopedWritePools::with_config(UringPoolConfig::new(1, 1)).unwrap();
+        let pd_id = PdId::new_v4();
+        pools.register_pd(pd_id);
+        assert!(!Arc::ptr_eq(
+            pools.lanes(IoClass::Foreground),
+            pools.lanes(IoClass::DrainData)
+        ));
+        assert!(Arc::ptr_eq(
+            pools.lanes(IoClass::DrainData),
+            pools.lanes(IoClass::DrainMeta)
+        ));
+        assert!(Arc::ptr_eq(
+            pools.lanes(IoClass::DrainMeta),
+            pools.lanes(IoClass::Maintenance)
+        ));
+
+        let mut foreground = vec![lane_group(pd_id)];
+        let mut background = vec![lane_group(pd_id)];
+        pools.foreground_lanes.enqueue_groups(&mut foreground);
+        pools.background_lanes.enqueue_groups(&mut background);
+        let (foreground_index, foreground_permit) =
+            pools.foreground_lanes.acquire_any(&mut foreground);
+        foreground.remove(foreground_index);
+        let (background_index, background_permit) =
+            pools.background_lanes.acquire_any(&mut background);
+        background.remove(background_index);
+        assert_eq!(pools.foreground_lanes.snapshot()[0].2, 1);
+        assert_eq!(pools.background_lanes.snapshot()[0].2, 1);
+        drop(foreground_permit);
+        drop(background_permit);
+    }
+
+    #[test]
+    fn panicking_lane_task_releases_permit_and_wakes_fifo_waiter() {
+        let lanes = Arc::new(PdLaneAdmission::new(1));
+        let pd_id = PdId::new_v4();
+        let mut first_group = vec![lane_group(pd_id)];
+        lanes.enqueue_groups(&mut first_group);
+        let (first_index, first_permit) = lanes.acquire_any(&mut first_group);
+        first_group.remove(first_index);
+
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter_lanes = lanes.clone();
+        let waiter = thread::spawn(move || {
+            let mut pending = vec![lane_group(pd_id)];
+            waiter_lanes.enqueue_groups(&mut pending);
+            queued_tx.send(()).unwrap();
+            let (index, permit) = waiter_lanes.acquire_any(&mut pending);
+            pending.remove(index);
+            acquired_tx.send(()).unwrap();
+            drop(permit);
+        });
+        queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_until(|| lanes.waiter_count(pd_id) == 1);
+
+        let unwind = catch_unwind(AssertUnwindSafe(move || {
+            let _permit = first_permit;
+            panic!("simulated execution task panic");
+        }));
+        assert!(unwind.is_err());
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("panic did not release and notify the next PD waiter");
+        waiter.join().unwrap();
+        assert_eq!(lanes.snapshot()[0].2, 0);
+    }
+
+    #[test]
+    fn same_pd_waiters_do_not_occupy_fast_pd_worker_and_admit_fifo() {
+        let dir = TempDir::new().unwrap();
+        let pool_id = PoolId::new_v4();
+        let slow_pd = test_pd(&dir, "slow-lane", 0, pool_id);
+        let fast_pd = test_pd(&dir, "fast-lane", 1, pool_id);
+        let pools = Arc::new(ScopedWritePools::with_config(UringPoolConfig::new(2, 0)).unwrap());
+        pools.register_pd(slow_pd.pd_id());
+        pools.register_pd(fast_pd.pd_id());
+        let gate = Arc::new(LaneOrderGate::new());
+
+        let first = spawn_slow_lane_submit(pools.clone(), slow_pd.clone(), gate.clone(), 1);
+        assert_eq!(gate.wait_for_started(1), vec![1]);
+        let second = spawn_slow_lane_submit(pools.clone(), slow_pd.clone(), gate.clone(), 2);
+        wait_until(|| pools.foreground_lanes.waiter_count(slow_pd.pd_id()) == 1);
+        let third = spawn_slow_lane_submit(pools.clone(), slow_pd.clone(), gate.clone(), 3);
+        wait_until(|| pools.foreground_lanes.waiter_count(slow_pd.pd_id()) == 2);
+        thread::sleep(Duration::from_millis(20));
+
+        let (fast_started_tx, fast_started_rx) = mpsc::channel();
+        let fast_pools = pools.clone();
+        let fast = thread::spawn(move || {
+            let page = [0xf1; 4096];
+            fast_pools.submit(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd: fast_pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: 0,
+                    data: &page,
+                }],
+                move |group| {
+                    fast_started_tx.send(()).unwrap();
+                    group.iter().map(|_| Ok(())).collect()
+                },
+            )
+        });
+        fast_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("same-PD waiters consumed the fast PD's worker lane");
+        assert!(fast.join().unwrap().iter().all(Result::is_ok));
+        assert_eq!(gate.wait_for_started(1), vec![1]);
+
+        gate.release(1);
+        assert_eq!(gate.wait_for_started(2), vec![1, 2]);
+        gate.release(2);
+        assert_eq!(gate.wait_for_started(3), vec![1, 2, 3]);
+        gate.release(3);
+        assert!(first.join().unwrap().iter().all(Result::is_ok));
+        assert!(second.join().unwrap().iter().all(Result::is_ok));
+        assert!(third.join().unwrap().iter().all(Result::is_ok));
+        assert!(pools.snapshot().classes[0].queue_wait_max_ns >= 10_000_000);
+    }
+
+    #[test]
+    fn execution_pool_reentry_panics_without_leaking_lane_waiter() {
+        let dir = TempDir::new().unwrap();
+        let pool_id = PoolId::new_v4();
+        let pd = test_pd(&dir, "reentry", 0, pool_id);
+        let pd_id = pd.pd_id();
+        let pools = ScopedWritePools::with_config(UringPoolConfig::new(1, 0)).unwrap();
+        pools.register_pd(pd_id);
+        let page = [0xc1; 4096];
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            pools.foreground.as_ref().unwrap().install(|| {
+                pools.submit(
+                    IoClass::Foreground,
+                    &[StripWrite {
+                        pd,
+                        chunklet_index: 0,
+                        in_chunklet_off: 0,
+                        data: &page,
+                    }],
+                    |group| group.iter().map(|_| Ok(())).collect(),
+                )
+            })
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(pools.foreground_lanes.waiter_count(pd_id), 0);
+        assert_eq!(pools.foreground_lanes.snapshot()[0].2, 0);
     }
 
     #[test]
