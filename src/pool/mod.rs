@@ -769,8 +769,10 @@ impl Pool {
         scheduler: crate::io::SchedulerConfig,
         uring: crate::io::UringPoolConfig,
     ) -> ChunkletResult<()> {
-        let inner = crate::io::make_backend_with_uring_pool_config(kind, uring);
-        self.install_scheduled_io_backend(inner, scheduler)
+        let backend =
+            crate::io::make_scheduled_backend_with_uring_pool_config(kind, scheduler, uring)?;
+        self.install_io_backend(backend);
+        Ok(())
     }
 
     fn install_scheduled_io_backend(
@@ -1214,6 +1216,40 @@ mod tests {
 
         pool.set_io_backend(crate::io::IoBackendKind::Sync);
         assert!(pool.io_scheduler_snapshot().is_none());
+    }
+
+    #[test]
+    fn scheduled_uring_workers_wrap_admission_and_zero_workers_stay_inline() {
+        let dir = TempDir::new().unwrap();
+        let pool = Pool::create(
+            vec![sparse(&dir, "pd0"), sparse(&dir, "pd1")],
+            PoolConfig::default(),
+        )
+        .unwrap();
+        let scheduler = crate::io::SchedulerConfig::new(64);
+
+        pool.set_scheduled_io_backend_with_uring_pool_config(
+            crate::io::IoBackendKind::Uring,
+            scheduler.clone(),
+            crate::io::UringPoolConfig::new(0, 0),
+        )
+        .unwrap();
+        let inline = pool.pd(pool.list_pds()[0].pd_id).unwrap().backend();
+        assert_eq!(inline.name(), "scheduled");
+
+        pool.set_scheduled_io_backend_with_uring_pool_config(
+            crate::io::IoBackendKind::Uring,
+            scheduler,
+            crate::io::UringPoolConfig::new(1, 1),
+        )
+        .unwrap();
+        let outer = pool.pd(pool.list_pds()[0].pd_id).unwrap().backend();
+        assert_eq!(outer.name(), "execution-pool");
+        assert_eq!(pool.io_scheduler_snapshot().unwrap().pds.len(), 2);
+        let execution = pool.io_execution_snapshot().unwrap();
+        assert!(execution.enabled);
+        assert_eq!(execution.foreground_workers, 1);
+        assert_eq!(execution.background_workers, 1);
     }
 
     #[test]

@@ -8,18 +8,21 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::unbounded;
-use parking_lot::Mutex as ParkingMutex;
+use parking_lot::{Condvar, Mutex as ParkingMutex};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::backend::{
-    IoExecutionClassSnapshot, IoExecutionSnapshot, StripWrite, UringPoolConfig,
-    WriteCompletionObserver,
+    IoBackend, IoExecutionClassSnapshot, IoExecutionSnapshot, StripRead, StripWrite,
+    UringPoolConfig, WriteCompletionObserver,
 };
-use crate::io::scheduler::{with_io_class, IoClass};
+use crate::io::scheduler::{current_io_class, with_io_class, IoClass, SchedulerSnapshot};
+use crate::pd::PhysicalDisk;
+use crate::types::PdId;
 
 struct ClassStats {
     batches: AtomicU64,
@@ -97,6 +100,159 @@ pub(super) struct ScopedWritePools {
     foreground_cpus: Vec<usize>,
     background_cpus: Vec<usize>,
     stats: ExecutionStats,
+}
+
+/// Persistent PD-homogeneous execution outside admission control.
+///
+/// Keeping this wrapper outside `ScheduledBackend` is load-bearing: worker
+/// queue residence is execution backlog, not device-active work. A worker
+/// acquires scheduler credit only after it dequeues one PD group, so a blocked
+/// member cannot hold credit for, or prevent dispatch to, an unrelated PD.
+pub(crate) struct ExecutionPoolBackend {
+    inner: Arc<dyn IoBackend>,
+    write_pools: ScopedWritePools,
+    fence: ExecutionFence,
+}
+
+impl ExecutionPoolBackend {
+    pub(crate) fn new(inner: Arc<dyn IoBackend>, config: UringPoolConfig) -> std::io::Result<Self> {
+        Ok(Self {
+            inner,
+            write_pools: ScopedWritePools::with_config(config)?,
+            fence: ExecutionFence::new(),
+        })
+    }
+}
+
+impl IoBackend for ExecutionPoolBackend {
+    fn register_pd(&self, pd_id: PdId) {
+        self.inner.register_pd(pd_id);
+    }
+
+    fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
+        self.inner.scheduler_snapshot()
+    }
+
+    fn execution_snapshot(&self) -> Option<IoExecutionSnapshot> {
+        Some(self.write_pools.snapshot())
+    }
+
+    fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        self.inner.submit_reads(ops)
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        self.submit_writes_detailed_with_class(current_io_class(), ops)
+    }
+
+    fn submit_writes_detailed_with_class(
+        &self,
+        class: IoClass,
+        ops: &[StripWrite<'_>],
+    ) -> Vec<ChunkletResult<()>> {
+        let _write = (!ops.is_empty()).then(|| self.fence.enter_write());
+        self.write_pools.submit(class, ops, |group| {
+            self.inner.submit_writes_detailed_with_class(class, group)
+        })
+    }
+
+    fn submit_writes_detailed_observed_with_class(
+        &self,
+        class: IoClass,
+        ops: &[StripWrite<'_>],
+        observer: &dyn WriteCompletionObserver,
+    ) -> Vec<ChunkletResult<()>> {
+        let _write = (!ops.is_empty()).then(|| self.fence.enter_write());
+        self.write_pools.submit_observed(
+            class,
+            ops,
+            observer,
+            |group, group_observer, _service_started| {
+                self.inner
+                    .submit_writes_detailed_observed_with_class(class, group, group_observer)
+            },
+        )
+    }
+
+    fn submit_flushes(&self, pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
+        if pds.iter().all(|pd| !pd.sync_required()) {
+            return self.inner.submit_flushes(pds);
+        }
+        let _flush = self.fence.enter_flush();
+        self.inner.submit_flushes(pds)
+    }
+
+    fn name(&self) -> &'static str {
+        "execution-pool"
+    }
+}
+
+#[derive(Default)]
+struct ExecutionFenceState {
+    active_writes: u64,
+    flush_waiters: u64,
+    flushing: bool,
+}
+
+struct ExecutionFence {
+    state: ParkingMutex<ExecutionFenceState>,
+    changed: Condvar,
+}
+
+impl ExecutionFence {
+    fn new() -> Self {
+        Self {
+            state: ParkingMutex::new(ExecutionFenceState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn enter_write(&self) -> ExecutionWriteGuard<'_> {
+        let mut state = self.state.lock();
+        while state.flushing || state.flush_waiters > 0 {
+            self.changed.wait(&mut state);
+        }
+        state.active_writes = state.active_writes.saturating_add(1);
+        ExecutionWriteGuard { fence: self }
+    }
+
+    fn enter_flush(&self) -> ExecutionFlushGuard<'_> {
+        let mut state = self.state.lock();
+        state.flush_waiters = state.flush_waiters.saturating_add(1);
+        while state.flushing || state.active_writes > 0 {
+            self.changed.wait(&mut state);
+        }
+        state.flush_waiters -= 1;
+        state.flushing = true;
+        ExecutionFlushGuard { fence: self }
+    }
+}
+
+struct ExecutionWriteGuard<'a> {
+    fence: &'a ExecutionFence,
+}
+
+impl Drop for ExecutionWriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.fence.state.lock();
+        state.active_writes -= 1;
+        if state.active_writes == 0 {
+            self.fence.changed.notify_all();
+        }
+    }
+}
+
+struct ExecutionFlushGuard<'a> {
+    fence: &'a ExecutionFence,
+}
+
+impl Drop for ExecutionFlushGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.fence.state.lock();
+        debug_assert!(state.flushing);
+        state.flushing = false;
+        self.fence.changed.notify_all();
+    }
 }
 
 impl ScopedWritePools {
@@ -456,13 +612,15 @@ mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::thread;
     use std::time::Duration;
 
     use parking_lot::{Condvar, Mutex};
     use tempfile::TempDir;
 
-    use crate::io::RawDevice;
+    use crate::io::{RawDevice, ScheduledBackend, SchedulerConfig};
     use crate::pd::PhysicalDisk;
     use crate::types::{PdId, PoolId};
 
@@ -537,6 +695,58 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct FirstSlowGateBackend {
+        slow_pd: PdId,
+        slow_calls: AtomicUsize,
+        read_calls: AtomicUsize,
+        first_slow_started: mpsc::Sender<()>,
+        release_first_slow: Mutex<mpsc::Receiver<()>>,
+        fast_submitted: mpsc::Sender<()>,
+        flush_submitted: Option<mpsc::Sender<()>>,
+    }
+
+    impl IoBackend for FirstSlowGateBackend {
+        fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn submit_writes_detailed(&self, _ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+            panic!("scheduled test backend must use the observed path")
+        }
+
+        fn submit_writes_detailed_observed_with_class(
+            &self,
+            _class: IoClass,
+            ops: &[StripWrite<'_>],
+            observer: &dyn WriteCompletionObserver,
+        ) -> Vec<ChunkletResult<()>> {
+            assert!(!ops.is_empty());
+            let pd_id = ops[0].pd.pd_id();
+            assert!(ops.iter().all(|op| op.pd.pd_id() == pd_id));
+            if pd_id == self.slow_pd && self.slow_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_slow_started.send(()).unwrap();
+                self.release_first_slow.lock().recv().unwrap();
+            } else if pd_id != self.slow_pd {
+                self.fast_submitted.send(()).unwrap();
+            }
+            let indices: Vec<_> = (0..ops.len()).collect();
+            observer.writes_completed(&indices, 1);
+            ops.iter().map(|_| Ok(())).collect()
+        }
+
+        fn submit_flushes(&self, _pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
+            if let Some(submitted) = &self.flush_submitted {
+                submitted.send(()).unwrap();
+            }
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "first-slow-gate"
+        }
+    }
+
     impl WriteCompletionObserver for PanicObserver {
         fn writes_completed(&self, _op_indices: &[usize], _service_ns: u64) {
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -579,9 +789,16 @@ mod tests {
         }
     }
 
-    fn test_pd(dir: &TempDir, name: &str, pd_seq: u32, pool_id: PoolId) -> Arc<PhysicalDisk> {
-        let raw =
+    fn test_pd_with_sync(
+        dir: &TempDir,
+        name: &str,
+        pd_seq: u32,
+        pool_id: PoolId,
+        sync_required: bool,
+    ) -> Arc<PhysicalDisk> {
+        let mut raw =
             RawDevice::open_or_create(&dir.path().join(name), 4 * 1024 * 1024 * 1024).unwrap();
+        raw.set_sync_required_for_test(sync_required);
         PhysicalDisk::init(
             raw,
             pool_id,
@@ -594,6 +811,28 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    fn test_pd(dir: &TempDir, name: &str, pd_seq: u32, pool_id: PoolId) -> Arc<PhysicalDisk> {
+        test_pd_with_sync(dir, name, pd_seq, pool_id, true)
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "timed out waiting for state");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn pd_totals(backend: &ScheduledBackend, pd_id: PdId) -> (u64, u64) {
+        backend
+            .snapshot()
+            .pds
+            .into_iter()
+            .find(|pd| pd.pd_id == pd_id)
+            .map(|pd| (pd.total_queued_blocks, pd.total_active_blocks))
+            .unwrap_or((0, 0))
     }
 
     fn four_interleaved_ops<'a>(
@@ -741,6 +980,328 @@ mod tests {
         completed.sort_unstable();
         assert_eq!(completed, vec![0, 1, 2, 3]);
         assert!(calls.iter().all(|call| call.1 > 0));
+    }
+
+    #[test]
+    fn blocked_pd_child_does_not_hold_back_fast_pd_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let pool_id = PoolId::new_v4();
+        let slow_pd = test_pd(&dir, "slow", 0, pool_id);
+        let fast_pd = test_pd(&dir, "fast", 1, pool_id);
+        let (slow_started_tx, slow_started_rx) = mpsc::channel();
+        let (release_slow_tx, release_slow_rx) = mpsc::channel();
+        let (fast_submitted_tx, fast_submitted_rx) = mpsc::channel();
+        let device = Arc::new(FirstSlowGateBackend {
+            slow_pd: slow_pd.pd_id(),
+            slow_calls: AtomicUsize::new(0),
+            read_calls: AtomicUsize::new(0),
+            first_slow_started: slow_started_tx,
+            release_first_slow: Mutex::new(release_slow_rx),
+            fast_submitted: fast_submitted_tx,
+            flush_submitted: None,
+        });
+        let scheduled = Arc::new(ScheduledBackend::new(device, SchedulerConfig::new(1)).unwrap());
+        scheduled.register_pd(slow_pd.pd_id());
+        scheduled.register_pd(fast_pd.pd_id());
+        let execution = Arc::new(
+            ExecutionPoolBackend::new(scheduled.clone(), UringPoolConfig::new(2, 0)).unwrap(),
+        );
+
+        let holder_backend = scheduled.clone();
+        let holder_pd = slow_pd.clone();
+        let holder = thread::spawn(move || {
+            let page = [0x31; 4096];
+            holder_backend.submit_writes_detailed_with_class(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd: holder_pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: 0,
+                    data: &page,
+                }],
+            )
+        });
+        slow_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let child_backend = execution.clone();
+        let child_slow_pd = slow_pd.clone();
+        let child_fast_pd = fast_pd.clone();
+        let children = thread::spawn(move || {
+            let slow_page = [0x41; 4096];
+            let fast_page = [0x51; 4096];
+            child_backend.submit_writes_detailed_with_class(
+                IoClass::Foreground,
+                &[
+                    StripWrite {
+                        pd: child_slow_pd,
+                        chunklet_index: 0,
+                        in_chunklet_off: 4096,
+                        data: &slow_page,
+                    },
+                    StripWrite {
+                        pd: child_fast_pd,
+                        chunklet_index: 0,
+                        in_chunklet_off: 4096,
+                        data: &fast_page,
+                    },
+                ],
+            )
+        });
+
+        wait_until(|| pd_totals(&scheduled, slow_pd.pd_id()) == (1, 1));
+        fast_submitted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fast PD child was coupled to blocked slow-PD admission");
+        assert_eq!(pd_totals(&scheduled, fast_pd.pd_id()), (0, 0));
+
+        release_slow_tx.send(()).unwrap();
+        assert!(holder.join().unwrap().iter().all(Result::is_ok));
+        assert!(children.join().unwrap().iter().all(Result::is_ok));
+        assert_eq!(pd_totals(&scheduled, slow_pd.pd_id()), (0, 0));
+        let execution_snapshot = execution.execution_snapshot().unwrap();
+        assert_eq!(execution_snapshot.classes[0].groups, 2);
+    }
+
+    #[test]
+    fn worker_queue_wait_is_not_counted_as_scheduler_active() {
+        let dir = TempDir::new().unwrap();
+        let pool_id = PoolId::new_v4();
+        let slow_pd = test_pd(&dir, "slow", 0, pool_id);
+        let fast_pd = test_pd(&dir, "fast", 1, pool_id);
+        let (slow_started_tx, slow_started_rx) = mpsc::channel();
+        let (release_slow_tx, release_slow_rx) = mpsc::channel();
+        let (fast_submitted_tx, fast_submitted_rx) = mpsc::channel();
+        let device = Arc::new(FirstSlowGateBackend {
+            slow_pd: slow_pd.pd_id(),
+            slow_calls: AtomicUsize::new(0),
+            read_calls: AtomicUsize::new(0),
+            first_slow_started: slow_started_tx,
+            release_first_slow: Mutex::new(release_slow_rx),
+            fast_submitted: fast_submitted_tx,
+            flush_submitted: None,
+        });
+        let scheduled = Arc::new(ScheduledBackend::new(device, SchedulerConfig::new(1)).unwrap());
+        scheduled.register_pd(slow_pd.pd_id());
+        scheduled.register_pd(fast_pd.pd_id());
+        let execution = Arc::new(
+            ExecutionPoolBackend::new(scheduled.clone(), UringPoolConfig::new(1, 0)).unwrap(),
+        );
+
+        let slow_backend = execution.clone();
+        let submitted_slow_pd = slow_pd.clone();
+        let slow = thread::spawn(move || {
+            let page = [0x61; 4096];
+            slow_backend.submit_writes_detailed_with_class(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd: submitted_slow_pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: 0,
+                    data: &page,
+                }],
+            )
+        });
+        slow_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let fast_backend = execution.clone();
+        let submitted_fast_pd = fast_pd.clone();
+        let fast = thread::spawn(move || {
+            let page = [0x71; 4096];
+            fast_backend.submit_writes_detailed_with_class(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd: submitted_fast_pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: 0,
+                    data: &page,
+                }],
+            )
+        });
+        wait_until(|| execution.execution_snapshot().unwrap().classes[0].batches == 2);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(pd_totals(&scheduled, slow_pd.pd_id()), (0, 1));
+        assert_eq!(pd_totals(&scheduled, fast_pd.pd_id()), (0, 0));
+        assert!(fast_submitted_rx.try_recv().is_err());
+
+        release_slow_tx.send(()).unwrap();
+        fast_submitted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(slow.join().unwrap().iter().all(Result::is_ok));
+        assert!(fast.join().unwrap().iter().all(Result::is_ok));
+        let foreground = &execution.execution_snapshot().unwrap().classes[0];
+        assert!(foreground.queue_wait_max_ns >= 10_000_000);
+        assert_eq!(pd_totals(&scheduled, fast_pd.pd_id()), (0, 0));
+    }
+
+    #[test]
+    fn flush_waits_for_outer_queue_and_reads_delegate() {
+        let dir = TempDir::new().unwrap();
+        let pool_id = PoolId::new_v4();
+        let slow_pd = test_pd(&dir, "slow", 0, pool_id);
+        let fast_pd = test_pd(&dir, "fast", 1, pool_id);
+        let (slow_started_tx, slow_started_rx) = mpsc::channel();
+        let (release_slow_tx, release_slow_rx) = mpsc::channel();
+        let (fast_submitted_tx, fast_submitted_rx) = mpsc::channel();
+        let (flush_submitted_tx, flush_submitted_rx) = mpsc::channel();
+        let device = Arc::new(FirstSlowGateBackend {
+            slow_pd: slow_pd.pd_id(),
+            slow_calls: AtomicUsize::new(0),
+            read_calls: AtomicUsize::new(0),
+            first_slow_started: slow_started_tx,
+            release_first_slow: Mutex::new(release_slow_rx),
+            fast_submitted: fast_submitted_tx,
+            flush_submitted: Some(flush_submitted_tx),
+        });
+        let scheduled =
+            Arc::new(ScheduledBackend::new(device.clone(), SchedulerConfig::new(1)).unwrap());
+        scheduled.register_pd(slow_pd.pd_id());
+        scheduled.register_pd(fast_pd.pd_id());
+        let execution =
+            Arc::new(ExecutionPoolBackend::new(scheduled, UringPoolConfig::new(1, 0)).unwrap());
+
+        let mut read_page = [0_u8; 4096];
+        execution
+            .submit_reads(&mut [StripRead {
+                pd: fast_pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &mut read_page,
+            }])
+            .unwrap();
+        assert_eq!(device.read_calls.load(Ordering::SeqCst), 1);
+
+        let slow_backend = execution.clone();
+        let submitted_slow_pd = slow_pd.clone();
+        let slow = thread::spawn(move || {
+            let page = [0x81; 4096];
+            slow_backend.submit_writes_detailed_with_class(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd: submitted_slow_pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: 0,
+                    data: &page,
+                }],
+            )
+        });
+        slow_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let fast_backend = execution.clone();
+        let submitted_fast_pd = fast_pd.clone();
+        let fast = thread::spawn(move || {
+            let page = [0x91; 4096];
+            fast_backend.submit_writes_detailed_with_class(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd: submitted_fast_pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: 0,
+                    data: &page,
+                }],
+            )
+        });
+        wait_until(|| execution.execution_snapshot().unwrap().classes[0].batches == 2);
+
+        let flush_backend = execution.clone();
+        let flush_pds = vec![slow_pd, fast_pd];
+        let flush = thread::spawn(move || flush_backend.submit_flushes(&flush_pds));
+        assert!(flush_submitted_rx
+            .recv_timeout(Duration::from_millis(20))
+            .is_err());
+
+        release_slow_tx.send(()).unwrap();
+        fast_submitted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        flush_submitted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("flush passed queued execution work");
+        assert!(slow.join().unwrap().iter().all(Result::is_ok));
+        assert!(fast.join().unwrap().iter().all(Result::is_ok));
+        flush.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn write_through_flush_does_not_wait_for_outer_queue() {
+        let dir = TempDir::new().unwrap();
+        let pool_id = PoolId::new_v4();
+        let slow_pd = test_pd_with_sync(&dir, "slow", 0, pool_id, false);
+        let fast_pd = test_pd_with_sync(&dir, "fast", 1, pool_id, false);
+        let (slow_started_tx, slow_started_rx) = mpsc::channel();
+        let (release_slow_tx, release_slow_rx) = mpsc::channel();
+        let (fast_submitted_tx, fast_submitted_rx) = mpsc::channel();
+        let (flush_submitted_tx, flush_submitted_rx) = mpsc::channel();
+        let device = Arc::new(FirstSlowGateBackend {
+            slow_pd: slow_pd.pd_id(),
+            slow_calls: AtomicUsize::new(0),
+            read_calls: AtomicUsize::new(0),
+            first_slow_started: slow_started_tx,
+            release_first_slow: Mutex::new(release_slow_rx),
+            fast_submitted: fast_submitted_tx,
+            flush_submitted: Some(flush_submitted_tx),
+        });
+        let scheduled = Arc::new(ScheduledBackend::new(device, SchedulerConfig::new(1)).unwrap());
+        scheduled.register_pd(slow_pd.pd_id());
+        scheduled.register_pd(fast_pd.pd_id());
+        let execution =
+            Arc::new(ExecutionPoolBackend::new(scheduled, UringPoolConfig::new(1, 0)).unwrap());
+
+        let slow_backend = execution.clone();
+        let submitted_slow_pd = slow_pd.clone();
+        let slow = thread::spawn(move || {
+            let page = [0xa1; 4096];
+            slow_backend.submit_writes_detailed_with_class(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd: submitted_slow_pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: 0,
+                    data: &page,
+                }],
+            )
+        });
+        slow_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let fast_backend = execution.clone();
+        let submitted_fast_pd = fast_pd.clone();
+        let fast = thread::spawn(move || {
+            let page = [0xb1; 4096];
+            fast_backend.submit_writes_detailed_with_class(
+                IoClass::Foreground,
+                &[StripWrite {
+                    pd: submitted_fast_pd,
+                    chunklet_index: 0,
+                    in_chunklet_off: 0,
+                    data: &page,
+                }],
+            )
+        });
+        wait_until(|| execution.execution_snapshot().unwrap().classes[0].batches == 2);
+
+        let flush_backend = execution.clone();
+        let flush_pds = vec![slow_pd, fast_pd];
+        let flush = thread::spawn(move || flush_backend.submit_flushes(&flush_pds));
+        flush_submitted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("write-through no-op flush waited behind the execution queue");
+        flush.join().unwrap().unwrap();
+        assert!(fast_submitted_rx.try_recv().is_err());
+
+        release_slow_tx.send(()).unwrap();
+        fast_submitted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(slow.join().unwrap().iter().all(Result::is_ok));
+        assert!(fast.join().unwrap().iter().all(Result::is_ok));
     }
 
     #[test]

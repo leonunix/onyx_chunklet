@@ -22,7 +22,9 @@
 use std::sync::Arc;
 
 use crate::error::ChunkletResult;
-use crate::io::scheduler::{current_io_class, with_io_class, IoClass, SchedulerSnapshot};
+use crate::io::scheduler::{
+    current_io_class, with_io_class, IoClass, ScheduledBackend, SchedulerConfig, SchedulerSnapshot,
+};
 use crate::pd::PhysicalDisk;
 use crate::types::PdId;
 
@@ -336,5 +338,54 @@ pub fn make_backend_with_uring_pool_config(
             let _ = config;
             Arc::new(crate::io::sync_backend::SyncBackend)
         }
+    }
+}
+
+/// Compose per-PD admission with optional persistent execution workers.
+///
+/// The wrapper order is deliberately `execution -> scheduler -> device`.
+/// Each execution worker dequeues one PD-homogeneous group before asking the
+/// scheduler for credit, so worker queue wait is not counted as active device
+/// work and a blocked PD does not create an all-or-none multi-PD admission.
+pub fn make_scheduled_backend_with_uring_pool_config(
+    kind: IoBackendKind,
+    scheduler: SchedulerConfig,
+    uring: UringPoolConfig,
+) -> ChunkletResult<Arc<dyn IoBackend>> {
+    let workers_enabled = uring.foreground_workers > 0 || uring.background_workers > 0;
+    let mut inline_config = uring.clone();
+    inline_config.foreground_workers = 0;
+    inline_config.background_workers = 0;
+    let inner: Arc<dyn IoBackend> = if kind == IoBackendKind::Uring && workers_enabled {
+        #[cfg(target_os = "linux")]
+        {
+            Arc::new(crate::io::uring_backend::UringBackend::new_pooled_with_config(inline_config)?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = inline_config;
+            return Err(crate::error::ChunkletError::Unsupported(
+                "persistent io_uring workers require Linux".into(),
+            ));
+        }
+    } else {
+        make_backend_with_uring_pool_config(kind, inline_config)
+    };
+    let scheduled: Arc<dyn IoBackend> = Arc::new(ScheduledBackend::new(inner, scheduler)?);
+
+    if kind != IoBackendKind::Uring || !workers_enabled {
+        return Ok(scheduled);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let backend = crate::io::uring_backend::ExecutionPoolBackend::new(scheduled, uring)?;
+        return Ok(Arc::new(backend));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = uring;
+        Ok(scheduled)
     }
 }

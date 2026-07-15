@@ -22,9 +22,10 @@ pub mod uring_backend;
 
 pub use aligned::{round_up, AlignedBuf};
 pub use backend::{
-    make_backend, make_backend_with_uring_pool_config, make_backend_with_uring_workers, IoBackend,
-    IoBackendKind, IoExecutionClassSnapshot, IoExecutionSnapshot, StripRead, StripWrite,
-    UringPoolConfig, WriteCompletionObserver,
+    make_backend, make_backend_with_uring_pool_config, make_backend_with_uring_workers,
+    make_scheduled_backend_with_uring_pool_config, IoBackend, IoBackendKind,
+    IoExecutionClassSnapshot, IoExecutionSnapshot, StripRead, StripWrite, UringPoolConfig,
+    WriteCompletionObserver,
 };
 pub use raw::RawDevice;
 pub use scheduler::{

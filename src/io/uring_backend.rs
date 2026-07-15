@@ -44,6 +44,7 @@ mod batch;
 mod execution;
 
 use batch::{push_batch, wait_and_drain, wait_and_drain_observed, ValidatedCompletion};
+pub(crate) use execution::ExecutionPoolBackend;
 use execution::ScopedWritePools;
 
 /// Holds the first observer panic while terminal IO recovery continues. The
