@@ -59,6 +59,11 @@ struct RecordingBackend {
     calls: mpsc::Sender<Vec<PdId>>,
 }
 
+#[derive(Default)]
+struct MarkerResultBackend {
+    calls: Mutex<Vec<Vec<u8>>>,
+}
+
 impl IoBackend for RecordingBackend {
     fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
         Ok(())
@@ -83,6 +88,44 @@ impl IoBackend for RecordingBackend {
 
     fn name(&self) -> &'static str {
         "recording"
+    }
+}
+
+impl IoBackend for MarkerResultBackend {
+    fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        Ok(())
+    }
+
+    fn submit_writes_detailed(&self, _ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        panic!("non-observed path must not be used")
+    }
+
+    fn submit_writes_detailed_observed_with_class(
+        &self,
+        _class: IoClass,
+        ops: &[StripWrite<'_>],
+        observer: &dyn WriteCompletionObserver,
+    ) -> Vec<ChunkletResult<()>> {
+        let markers: Vec<_> = ops
+            .iter()
+            .map(|op| op.data.first().copied().unwrap_or_default())
+            .collect();
+        self.calls.lock().push(markers.clone());
+        observer.writes_completed(&(0..ops.len()).collect::<Vec<_>>(), 1);
+        markers
+            .into_iter()
+            .map(|marker| {
+                if marker % 2 == 0 {
+                    Ok(())
+                } else {
+                    Err(ChunkletError::Invariant(format!("marker-{marker}")))
+                }
+            })
+            .collect()
+    }
+
+    fn name(&self) -> &'static str {
+        "marker-result"
     }
 }
 
@@ -714,6 +757,69 @@ fn older_pending_write_precedes_later_flush_fence() {
 }
 
 #[test]
+fn multi_pd_flush_waits_for_ready_and_blocked_older_writes() {
+    let scheduler = controller(SchedulerConfig::new(1));
+    let ready_pd = PdId::new_v4();
+    let blocked_pd = PdId::new_v4();
+    let blocked = scheduler
+        .admit(IoClass::Foreground, vec![demand(blocked_pd, 1)])
+        .unwrap();
+    let mut pending = scheduler
+        .queue(
+            IoClass::DrainData,
+            vec![demand(ready_pd, 1), demand(blocked_pd, 1)],
+        )
+        .unwrap();
+    let ready = pending.admit_ready();
+    assert_eq!(ready.pd_ids, vec![ready_pd]);
+
+    let (fenced_tx, fenced_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let flush_scheduler = scheduler.clone();
+    let flush = thread::spawn(move || {
+        let fence = flush_scheduler.fence(vec![ready_pd, blocked_pd]);
+        fenced_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(fence);
+    });
+    wait_until(|| {
+        let snapshot = scheduler.snapshot();
+        [ready_pd, blocked_pd].iter().all(|pd_id| {
+            snapshot
+                .pds
+                .iter()
+                .find(|pd| pd.pd_id == *pd_id)
+                .is_some_and(|pd| pd.flush_waiters == 1)
+        })
+    });
+
+    drop(ready.permit);
+    assert!(fenced_rx.try_recv().is_err());
+    drop(blocked);
+    let blocked_ready = pending.admit_ready();
+    assert_eq!(blocked_ready.pd_ids, vec![blocked_pd]);
+    assert!(fenced_rx.try_recv().is_err());
+
+    drop(blocked_ready.permit);
+    fenced_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let fenced = scheduler.snapshot();
+    assert!([ready_pd, blocked_pd].iter().all(|pd_id| {
+        fenced
+            .pds
+            .iter()
+            .find(|pd| pd.pd_id == *pd_id)
+            .is_some_and(|pd| pd.flush_fenced)
+    }));
+    release_tx.send(()).unwrap();
+    flush.join().unwrap();
+    assert!(scheduler
+        .snapshot()
+        .pds
+        .iter()
+        .all(|pd| !pd.flush_fenced && pd.total_active_blocks == 0));
+}
+
+#[test]
 fn registration_and_snapshot_include_idle_pd_limits_and_totals() {
     let scheduler =
         controller(SchedulerConfig::new(8).with_min_active_blocks(IoClass::DrainMeta, 2));
@@ -838,6 +944,207 @@ fn ready_pd_advances_each_lane_wave_while_another_pd_is_blocked() {
         .pds
         .iter()
         .all(|pd| { pd.total_active_blocks == 0 && pd.total_queued_blocks == 0 }));
+}
+
+#[test]
+fn multi_pd_multiwave_errors_attempt_every_wave_and_preserve_result_order() {
+    let (_dir, pds) = make_test_pds(2);
+    let first_pd = pds[0].clone();
+    let second_pd = pds[1].clone();
+    let inner = Arc::new(MarkerResultBackend::default());
+    let scheduled = ScheduledBackend::new(inner.clone(), SchedulerConfig::new(1)).unwrap();
+    let data: Vec<_> = (1_u8..=6)
+        .map(|marker| vec![marker; BLOCK_SIZE as usize])
+        .collect();
+    let ops = [
+        StripWrite {
+            pd: first_pd.clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 0,
+            data: &data[0],
+        },
+        StripWrite {
+            pd: second_pd.clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 0,
+            data: &data[1],
+        },
+        StripWrite {
+            pd: first_pd.clone(),
+            chunklet_index: 0,
+            in_chunklet_off: BLOCK_SIZE,
+            data: &data[2],
+        },
+        StripWrite {
+            pd: second_pd.clone(),
+            chunklet_index: 0,
+            in_chunklet_off: BLOCK_SIZE,
+            data: &data[3],
+        },
+        StripWrite {
+            pd: first_pd.clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 2 * BLOCK_SIZE,
+            data: &data[4],
+        },
+        StripWrite {
+            pd: second_pd.clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 2 * BLOCK_SIZE,
+            data: &data[5],
+        },
+    ];
+
+    let results = scheduled.submit_writes_detailed_with_class(IoClass::DrainData, &ops);
+    assert_eq!(
+        inner.calls.lock().as_slice(),
+        &[vec![1, 2], vec![3, 4], vec![5, 6]]
+    );
+    for (result, marker) in results.iter().zip(1_u8..=6) {
+        if marker % 2 == 0 {
+            assert!(result.is_ok(), "marker {marker} should succeed");
+        } else {
+            match result {
+                Err(ChunkletError::Invariant(message)) => {
+                    assert_eq!(message, &format!("marker-{marker}"));
+                }
+                other => panic!("marker {marker} returned {other:?}"),
+            }
+        }
+    }
+    let snapshot = scheduled.snapshot();
+    let first = snapshot
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == first_pd.pd_id())
+        .unwrap();
+    let second = snapshot
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == second_pd.pd_id())
+        .unwrap();
+    let first_class = first
+        .classes
+        .iter()
+        .find(|class| class.class == IoClass::DrainData)
+        .unwrap();
+    let second_class = second
+        .classes
+        .iter()
+        .find(|class| class.class == IoClass::DrainData)
+        .unwrap();
+    assert_eq!(first_class.error_blocks, 3);
+    assert_eq!(first_class.completed_blocks, 0);
+    assert_eq!(second_class.completed_blocks, 3);
+    assert_eq!(second_class.error_blocks, 0);
+    assert!(snapshot
+        .pds
+        .iter()
+        .all(|pd| pd.total_active_blocks == 0 && pd.total_queued_blocks == 0));
+}
+
+#[test]
+fn oversized_exclusive_lane_does_not_block_ready_pd_and_metrics_keep_actual_work() {
+    let (_dir, pds) = make_test_pds(2);
+    let oversized_pd = pds[0].clone();
+    let ready_pd = pds[1].clone();
+    let (calls_tx, calls_rx) = mpsc::channel();
+    let scheduled = Arc::new(
+        ScheduledBackend::new(
+            Arc::new(RecordingBackend { calls: calls_tx }),
+            SchedulerConfig::new(2),
+        )
+        .unwrap(),
+    );
+    let blocked = scheduled
+        .admission
+        .admit(IoClass::Foreground, vec![demand(oversized_pd.pd_id(), 1)])
+        .unwrap();
+
+    let submitter = scheduled.clone();
+    let submit_oversized_pd = oversized_pd.clone();
+    let submit_ready_pd = ready_pd.clone();
+    let submit = thread::spawn(move || {
+        let oversized_data = vec![1_u8; (3 * BLOCK_SIZE) as usize];
+        let ready_data = vec![2_u8; BLOCK_SIZE as usize];
+        let ops = [
+            StripWrite {
+                pd: submit_oversized_pd,
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &oversized_data,
+            },
+            StripWrite {
+                pd: submit_ready_pd,
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &ready_data,
+            },
+        ];
+        submitter.submit_writes_detailed_with_class(IoClass::DrainData, &ops)
+    });
+
+    assert_eq!(
+        calls_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        vec![ready_pd.pd_id()]
+    );
+    wait_until(|| {
+        class_snapshot(&scheduled.admission, ready_pd.pd_id(), IoClass::DrainData).completed_blocks
+            == 1
+    });
+    let waiting = scheduled.snapshot();
+    let oversized_waiting = waiting
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == oversized_pd.pd_id())
+        .unwrap()
+        .classes
+        .iter()
+        .find(|class| class.class == IoClass::DrainData)
+        .unwrap();
+    let ready_done = waiting
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == ready_pd.pd_id())
+        .unwrap()
+        .classes
+        .iter()
+        .find(|class| class.class == IoClass::DrainData)
+        .unwrap();
+    assert_eq!(oversized_waiting.queued_blocks, 2);
+    assert_eq!(oversized_waiting.admitted_blocks, 0);
+    assert_eq!(ready_done.active_blocks_max, 1);
+    assert_eq!(ready_done.admitted_blocks, 1);
+    assert_eq!(ready_done.completed_blocks, 1);
+
+    drop(blocked);
+    assert_eq!(
+        calls_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        vec![oversized_pd.pd_id()]
+    );
+    assert!(submit
+        .join()
+        .unwrap()
+        .into_iter()
+        .all(|result| result.is_ok()));
+    let completed = scheduled.snapshot();
+    let oversized_done = completed
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == oversized_pd.pd_id())
+        .unwrap()
+        .classes
+        .iter()
+        .find(|class| class.class == IoClass::DrainData)
+        .unwrap();
+    assert_eq!(oversized_done.active_blocks_max, 2);
+    assert_eq!(oversized_done.admitted_blocks, 3);
+    assert_eq!(oversized_done.completed_blocks, 3);
+    assert_eq!(oversized_done.reclaimed_blocks, 2);
+    assert!(completed
+        .pds
+        .iter()
+        .all(|pd| pd.total_active_blocks == 0 && pd.total_queued_blocks == 0));
 }
 
 #[test]
