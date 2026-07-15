@@ -728,6 +728,21 @@ impl Pool {
     /// pool the default Sync way, then upgrade to Uring before doing IO).
     pub fn set_io_backend(&self, kind: crate::io::IoBackendKind) {
         let backend = crate::io::make_backend(kind);
+        self.install_io_backend(backend);
+    }
+
+    /// Swap every PD to a backend built with an explicit persistent io_uring
+    /// execution-pool layout. Non-uring backends ignore the uring-only config.
+    pub fn set_io_backend_with_uring_pool_config(
+        &self,
+        kind: crate::io::IoBackendKind,
+        uring: crate::io::UringPoolConfig,
+    ) {
+        let backend = crate::io::make_backend_with_uring_pool_config(kind, uring);
+        self.install_io_backend(backend);
+    }
+
+    fn install_io_backend(&self, backend: Arc<dyn crate::io::IoBackend>) {
         let s = self.state.read();
         for pd in s.pds.values() {
             pd.set_backend(backend.clone());
@@ -743,12 +758,29 @@ impl Pool {
         config: crate::io::SchedulerConfig,
     ) -> ChunkletResult<()> {
         let inner = crate::io::make_backend(kind);
+        self.install_scheduled_io_backend(inner, config)
+    }
+
+    /// Install per-PD admission around a backend with an explicit persistent
+    /// io_uring execution-pool layout.
+    pub fn set_scheduled_io_backend_with_uring_pool_config(
+        &self,
+        kind: crate::io::IoBackendKind,
+        scheduler: crate::io::SchedulerConfig,
+        uring: crate::io::UringPoolConfig,
+    ) -> ChunkletResult<()> {
+        let inner = crate::io::make_backend_with_uring_pool_config(kind, uring);
+        self.install_scheduled_io_backend(inner, scheduler)
+    }
+
+    fn install_scheduled_io_backend(
+        &self,
+        inner: Arc<dyn crate::io::IoBackend>,
+        config: crate::io::SchedulerConfig,
+    ) -> ChunkletResult<()> {
         let backend: Arc<dyn crate::io::IoBackend> =
             Arc::new(crate::io::ScheduledBackend::new(inner, config)?);
-        let s = self.state.read();
-        for pd in s.pds.values() {
-            pd.set_backend(backend.clone());
-        }
+        self.install_io_backend(backend);
         Ok(())
     }
 
@@ -761,6 +793,16 @@ impl Pool {
             s.pds.values().next().map(|pd| pd.backend())
         }?;
         backend.scheduler_snapshot()
+    }
+
+    /// Snapshot the persistent write-execution pools, whether installed
+    /// directly or wrapped by per-PD admission.
+    pub fn io_execution_snapshot(&self) -> Option<crate::io::IoExecutionSnapshot> {
+        let backend = {
+            let s = self.state.read();
+            s.pds.values().next().map(|pd| pd.backend())
+        }?;
+        backend.execution_snapshot()
     }
 
     pub fn pd_count(&self) -> usize {

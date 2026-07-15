@@ -159,10 +159,18 @@ impl RawDevice {
         if !self.sync_required {
             return Ok(());
         }
-        self.file.sync_all().map_err(|e| ChunkletError::Device {
-            path: self.path.clone(),
-            reason: format!("sync_all: {}", e),
-        })
+        loop {
+            match self.file.sync_all() {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(ChunkletError::Device {
+                        path: self.path.clone(),
+                        reason: format!("sync_all: {error}"),
+                    });
+                }
+            }
+        }
     }
 
     fn detect_sync_required(file: &File, path: &Path) -> bool {

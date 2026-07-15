@@ -26,6 +26,55 @@ use crate::io::scheduler::{current_io_class, with_io_class, IoClass, SchedulerSn
 use crate::pd::PhysicalDisk;
 use crate::types::PdId;
 
+/// Persistent write-execution metrics for one scheduling class. Queue wait is
+/// measured from scoped task creation until a worker starts the PD group;
+/// execute time covers the group's backend submit through all completions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoExecutionClassSnapshot {
+    pub class: IoClass,
+    pub batches: u64,
+    pub groups: u64,
+    pub ops: u64,
+    pub queue_wait_ns: u64,
+    pub queue_wait_max_ns: u64,
+    pub execute_ns: u64,
+    pub execute_max_ns: u64,
+}
+
+/// Immutable state for an optional persistent write-execution pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoExecutionSnapshot {
+    pub enabled: bool,
+    pub foreground_workers: usize,
+    pub background_workers: usize,
+    pub foreground_cpus: Vec<usize>,
+    pub background_cpus: Vec<usize>,
+    pub cpu_sets_disjoint: bool,
+    pub classes: Vec<IoExecutionClassSnapshot>,
+}
+
+/// Optional persistent io_uring execution-pool layout. Empty CPU vectors let
+/// workers inherit the creating thread's affinity; non-empty vectors bind each
+/// pool's workers when they start.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UringPoolConfig {
+    pub foreground_workers: usize,
+    pub background_workers: usize,
+    pub foreground_cpus: Vec<usize>,
+    pub background_cpus: Vec<usize>,
+}
+
+impl UringPoolConfig {
+    pub fn new(foreground_workers: usize, background_workers: usize) -> Self {
+        Self {
+            foreground_workers,
+            background_workers,
+            foreground_cpus: Vec::new(),
+            background_cpus: Vec::new(),
+        }
+    }
+}
+
 /// One PD-level write prepared by an LD. The lifetime ties `data` to
 /// whatever buffer the caller owns; backends are required to issue + wait
 /// for the IO before returning, so the borrow only needs to outlive a
@@ -51,6 +100,17 @@ pub struct StripRead<'a> {
     pub data: &'a mut [u8],
 }
 
+/// Completion sink for synchronous batched writes. Implementations may call
+/// this concurrently and in any order, but exactly once per completed input
+/// index. `service_ns` is elapsed time from the start of backend execution to
+/// this completion. An execution pool must exclude its worker-queue residence
+/// and report that separately, so scheduler service time remains comparable to
+/// the caller-thread path. Implementations must stop calling this before the
+/// submit method returns.
+pub trait WriteCompletionObserver: Send + Sync {
+    fn writes_completed(&self, op_indices: &[usize], service_ns: u64);
+}
+
 /// Cross-PD batched IO backend. Backends MUST block until every write in
 /// `ops` is durable on its respective PD (or short-circuit on the first
 /// error and report it).
@@ -66,6 +126,11 @@ pub trait IoBackend: Send + Sync {
 
     /// Scheduler metrics when this backend is an admission wrapper.
     fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
+        None
+    }
+
+    /// Persistent write-execution metrics when this backend owns worker pools.
+    fn execution_snapshot(&self) -> Option<IoExecutionSnapshot> {
         None
     }
 
@@ -93,6 +158,28 @@ pub trait IoBackend: Send + Sync {
         ops: &[StripWrite<'_>],
     ) -> Vec<ChunkletResult<()>> {
         with_io_class(class, || self.submit_writes_detailed(ops))
+    }
+
+    /// Optional streaming-completion entry point. The default keeps every
+    /// existing backend compatible by notifying after its synchronous submit
+    /// returns. CQE-aware backends can override this and notify earlier while
+    /// retaining the ordered return-vector contract.
+    fn submit_writes_detailed_observed_with_class(
+        &self,
+        class: IoClass,
+        ops: &[StripWrite<'_>],
+        observer: &dyn WriteCompletionObserver,
+    ) -> Vec<ChunkletResult<()>> {
+        let service_started = std::time::Instant::now();
+        let results = self.submit_writes_detailed_with_class(class, ops);
+        if !ops.is_empty() {
+            let completed: Vec<_> = (0..ops.len()).collect();
+            observer.writes_completed(
+                &completed,
+                service_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+        }
+        results
     }
 
     /// First-error convenience over [`Self::submit_writes_detailed`]: issue and
@@ -209,17 +296,45 @@ pub fn submit_strip_reads(ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
 /// `Uring` request silently downgrades to `Sync` because `io_uring` only
 /// links on Linux targets.
 pub fn make_backend(kind: IoBackendKind) -> Arc<dyn IoBackend> {
+    make_backend_with_uring_workers(kind, 0, 0)
+}
+
+/// Build a backend with optional persistent io_uring execution pools. Zero
+/// workers preserve the historical caller-thread/TLS-ring behavior. On
+/// non-Linux targets, or when io_uring/pool initialization fails, this retains
+/// the existing graceful fallback to `SyncBackend`.
+pub fn make_backend_with_uring_workers(
+    kind: IoBackendKind,
+    foreground_workers: usize,
+    background_workers: usize,
+) -> Arc<dyn IoBackend> {
+    make_backend_with_uring_pool_config(
+        kind,
+        UringPoolConfig::new(foreground_workers, background_workers),
+    )
+}
+
+/// Build a backend with explicit persistent worker counts and CPU affinity.
+pub fn make_backend_with_uring_pool_config(
+    kind: IoBackendKind,
+    config: UringPoolConfig,
+) -> Arc<dyn IoBackend> {
     match kind {
         IoBackendKind::Sync => Arc::new(crate::io::sync_backend::SyncBackend),
         #[cfg(target_os = "linux")]
-        IoBackendKind::Uring => match crate::io::uring_backend::UringBackend::new() {
-            Ok(b) => Arc::new(b),
-            Err(e) => {
-                tracing::warn!("io_uring init failed ({}); falling back to SyncBackend", e);
-                Arc::new(crate::io::sync_backend::SyncBackend)
+        IoBackendKind::Uring => {
+            match crate::io::uring_backend::UringBackend::new_pooled_with_config(config) {
+                Ok(b) => Arc::new(b),
+                Err(e) => {
+                    tracing::warn!("io_uring init failed ({}); falling back to SyncBackend", e);
+                    Arc::new(crate::io::sync_backend::SyncBackend)
+                }
             }
-        },
+        }
         #[cfg(not(target_os = "linux"))]
-        IoBackendKind::Uring => Arc::new(crate::io::sync_backend::SyncBackend),
+        IoBackendKind::Uring => {
+            let _ = config;
+            Arc::new(crate::io::sync_backend::SyncBackend)
+        }
     }
 }

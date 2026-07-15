@@ -81,12 +81,23 @@ pub fn bind_current_to_node(node: Option<u16>) {
     if cpus.is_empty() {
         return;
     }
-    match set_current_cpus(&cpus) {
+    match bind_current_to_cpus(&cpus) {
         Ok(()) => LAST_BOUND_NODE.with(|last| last.set(Some(node))),
         Err(err) => {
             tracing::warn!(node, error = %err, "failed to bind chunklet IO worker to NUMA node");
         }
     }
+}
+
+/// Bind the calling thread to an exact CPU set. An empty set deliberately
+/// preserves the inherited affinity mask.
+pub fn bind_current_to_cpus(cpus: &[usize]) -> std::io::Result<()> {
+    if cpus.is_empty() {
+        return Ok(());
+    }
+    set_current_cpus(cpus)?;
+    LAST_BOUND_NODE.with(|last| last.set(None));
+    Ok(())
 }
 
 static NODES: OnceLock<Vec<NumaNode>> = OnceLock::new();

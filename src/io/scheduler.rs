@@ -16,6 +16,8 @@ use crate::io::backend::{IoBackend, StripRead, StripWrite};
 use crate::pd::PhysicalDisk;
 use crate::types::{PdId, BLOCK_SIZE};
 
+mod completion;
+
 /// Scheduling class carried from the logical caller to physical-disk writes.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -303,7 +305,7 @@ impl AdmissionController {
         if demands.is_empty() {
             return Ok(AdmissionPermit {
                 controller: self.clone(),
-                allocations: Vec::new(),
+                allocations: Mutex::new(Vec::new()),
             });
         }
 
@@ -359,7 +361,7 @@ impl AdmissionController {
                 self.changed.notify_all();
                 return Ok(AdmissionPermit {
                     controller: self.clone(),
-                    allocations,
+                    allocations: Mutex::new(allocations),
                 });
             }
 
@@ -744,13 +746,7 @@ impl AdmissionController {
 
 struct AdmissionPermit {
     controller: Arc<AdmissionController>,
-    allocations: Vec<Allocation>,
-}
-
-impl Drop for AdmissionPermit {
-    fn drop(&mut self) {
-        self.controller.release(&self.allocations);
-    }
+    allocations: Mutex<Vec<Allocation>>,
 }
 
 struct FlushPermit {
@@ -802,74 +798,20 @@ impl ScheduledBackend {
     pub fn inner_name(&self) -> &'static str {
         self.inner.name()
     }
-
-    fn submit_scheduled(&self, class: IoClass, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
-        let max_blocks = self.admission.config.max_active_blocks_per_pd;
-        let waves = match plan_ops(ops, self.admission.config.wave_cap(class), max_blocks) {
-            Ok(waves) => waves,
-            Err(message) => return admission_errors(ops.len(), message),
-        };
-        let mut output: Vec<Option<ChunkletResult<()>>> =
-            std::iter::repeat_with(|| None).take(ops.len()).collect();
-        for wave in waves {
-            let wave_ops: Vec<_> = wave
-                .indices
-                .iter()
-                .map(|&index| ops[index].clone())
-                .collect();
-            let permit = match self.admission.admit(class, wave.demands) {
-                Ok(permit) => permit,
-                Err(message) => {
-                    for index in wave.indices {
-                        output[index] = Some(Err(ChunkletError::Config(message.clone())));
-                    }
-                    continue;
-                }
-            };
-            let service_started = Instant::now();
-            let mut results = self
-                .inner
-                .submit_writes_detailed_with_class(class, &wave_ops)
-                .into_iter();
-            let service_ns = elapsed_ns(service_started);
-            let mut completions = Vec::with_capacity(wave.indices.len());
-            for (&index, op) in wave.indices.iter().zip(&wave_ops) {
-                let result = results.next().unwrap_or_else(|| {
-                    Err(ChunkletError::Invariant(
-                        "wrapped IO backend returned too few write results".into(),
-                    ))
-                });
-                completions.push((
-                    op.pd.pd_id(),
-                    blocks_for_len(op.data.len()).expect("planned write length became invalid"),
-                    result.is_err(),
-                ));
-                output[index] = Some(result);
-            }
-            self.admission
-                .record_completion(class, &completions, service_ns);
-            drop(permit);
-        }
-        output
-            .into_iter()
-            .map(|result| {
-                result.unwrap_or_else(|| {
-                    Err(ChunkletError::Invariant(
-                        "scheduler omitted a write result".into(),
-                    ))
-                })
-            })
-            .collect()
-    }
 }
 
 impl IoBackend for ScheduledBackend {
     fn register_pd(&self, pd_id: PdId) {
         self.admission.register_pd(pd_id);
+        self.inner.register_pd(pd_id);
     }
 
     fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
         Some(self.snapshot())
+    }
+
+    fn execution_snapshot(&self) -> Option<crate::io::IoExecutionSnapshot> {
+        self.inner.execution_snapshot()
     }
 
     fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {

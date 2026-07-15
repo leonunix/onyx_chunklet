@@ -5,12 +5,105 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::io::{IoBackendKind, RawDevice};
+use crate::io::{IoBackendKind, RawDevice, WriteCompletionObserver};
 use crate::{Pool, PoolConfig};
 
 struct CountingBackend {
     calls: AtomicUsize,
     max_ops: AtomicUsize,
+}
+
+struct StreamingGateBackend {
+    first_pd_done: mpsc::Sender<()>,
+    release_second_pd: Mutex<mpsc::Receiver<()>>,
+    followup_done: mpsc::Sender<()>,
+}
+
+impl IoBackend for StreamingGateBackend {
+    fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        Ok(())
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        (0..ops.len()).map(|_| Ok(())).collect()
+    }
+
+    fn submit_writes_detailed_observed_with_class(
+        &self,
+        _class: IoClass,
+        ops: &[StripWrite<'_>],
+        observer: &dyn WriteCompletionObserver,
+    ) -> Vec<ChunkletResult<()>> {
+        if ops.len() == 2 {
+            observer.writes_completed(&[0], 10);
+            self.first_pd_done.send(()).unwrap();
+            self.release_second_pd.lock().recv().unwrap();
+            observer.writes_completed(&[1], 80);
+            vec![Err(ChunkletError::Invariant("first result".into())), Ok(())]
+        } else {
+            assert_eq!(ops.len(), 1);
+            observer.writes_completed(&[0], 5);
+            self.followup_done.send(()).unwrap();
+            vec![Ok(())]
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "streaming-gate"
+    }
+}
+
+struct PartialCompletionPanicBackend;
+
+impl IoBackend for PartialCompletionPanicBackend {
+    fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        Ok(())
+    }
+
+    fn submit_writes_detailed(&self, _ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        panic!("non-observed path must not be used")
+    }
+
+    fn submit_writes_detailed_observed_with_class(
+        &self,
+        _class: IoClass,
+        _ops: &[StripWrite<'_>],
+        observer: &dyn WriteCompletionObserver,
+    ) -> Vec<ChunkletResult<()>> {
+        observer.writes_completed(&[0], 10);
+        panic!("simulated streaming backend panic")
+    }
+
+    fn name(&self) -> &'static str {
+        "partial-completion-panic"
+    }
+}
+
+fn make_test_pds(count: usize) -> (tempfile::TempDir, Vec<Arc<PhysicalDisk>>) {
+    let dir = tempfile::tempdir().unwrap();
+    let devices: Vec<_> = (0..count)
+        .map(|index| {
+            RawDevice::open_or_create(
+                &dir.path().join(format!("pd-{index}")),
+                4 * 1024 * 1024 * 1024,
+            )
+            .unwrap()
+        })
+        .collect();
+    let pool = Pool::create(
+        devices,
+        PoolConfig {
+            spare_pct: 0,
+            io_backend: IoBackendKind::Sync,
+        },
+    )
+    .unwrap();
+    let pds = pool
+        .list_pds()
+        .into_iter()
+        .map(|info| pool.pd(info.pd_id).unwrap())
+        .collect();
+    (dir, pds)
 }
 
 impl CountingBackend {
@@ -595,4 +688,152 @@ fn tls_class_restores_after_nested_scope_and_panic() {
     });
     assert!(unwind.is_err());
     assert_eq!(current_io_class(), IoClass::Foreground);
+}
+
+#[test]
+fn streaming_completion_reclaims_fast_pd_before_slow_pd_returns() {
+    let (_dir, pds) = make_test_pds(2);
+    let fast_pd = pds[0].clone();
+    let slow_pd = pds[1].clone();
+    let (first_pd_done_tx, first_pd_done_rx) = mpsc::channel();
+    let (release_second_pd_tx, release_second_pd_rx) = mpsc::channel();
+    let (followup_done_tx, followup_done_rx) = mpsc::channel();
+    let inner = Arc::new(StreamingGateBackend {
+        first_pd_done: first_pd_done_tx,
+        release_second_pd: Mutex::new(release_second_pd_rx),
+        followup_done: followup_done_tx,
+    });
+    let scheduled = Arc::new(ScheduledBackend::new(inner, SchedulerConfig::new(1)).unwrap());
+
+    let first_scheduled = scheduled.clone();
+    let first_fast_pd = fast_pd.clone();
+    let first = thread::spawn(move || {
+        let fast_data = vec![1_u8; BLOCK_SIZE as usize];
+        let slow_data = vec![2_u8; BLOCK_SIZE as usize];
+        let ops = [
+            StripWrite {
+                pd: first_fast_pd,
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &fast_data,
+            },
+            StripWrite {
+                pd: slow_pd,
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &slow_data,
+            },
+        ];
+        first_scheduled.submit_writes_detailed_with_class(IoClass::DrainData, &ops)
+    });
+    first_pd_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+
+    let followup_scheduled = scheduled.clone();
+    let followup = thread::spawn(move || {
+        let data = vec![3_u8; BLOCK_SIZE as usize];
+        let ops = [StripWrite {
+            pd: fast_pd,
+            chunklet_index: 0,
+            in_chunklet_off: BLOCK_SIZE,
+            data: &data,
+        }];
+        followup_scheduled.submit_writes_detailed_with_class(IoClass::Foreground, &ops)
+    });
+    followup_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fast-PD credit stayed coupled to the slow PD");
+
+    let active = scheduled.snapshot();
+    let fast = active
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == pds[0].pd_id())
+        .unwrap();
+    let slow = active
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == pds[1].pd_id())
+        .unwrap();
+    assert_eq!(fast.total_active_blocks, 0);
+    assert_eq!(slow.total_active_blocks, 1);
+
+    release_second_pd_tx.send(()).unwrap();
+    let first_results = first.join().unwrap();
+    let followup_results = followup.join().unwrap();
+    assert!(first_results[0].is_err());
+    assert!(first_results[1].is_ok());
+    assert!(followup_results[0].is_ok());
+    assert!(scheduled
+        .snapshot()
+        .pds
+        .iter()
+        .all(|pd| pd.total_active_blocks == 0));
+    let completed = scheduled.snapshot();
+    let fast_service = completed
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == pds[0].pd_id())
+        .unwrap()
+        .classes
+        .iter()
+        .find(|class| class.class == IoClass::DrainData)
+        .unwrap()
+        .service_ns;
+    let slow_service = completed
+        .pds
+        .iter()
+        .find(|pd| pd.pd_id == pds[1].pd_id())
+        .unwrap()
+        .classes
+        .iter()
+        .find(|class| class.class == IoClass::DrainData)
+        .unwrap()
+        .service_ns;
+    assert_eq!(fast_service, 10);
+    assert_eq!(slow_service, 80);
+}
+
+#[test]
+fn streaming_completion_panic_reclaims_unreported_pd_credit() {
+    let (_dir, pds) = make_test_pds(2);
+    let scheduled = ScheduledBackend::new(
+        Arc::new(PartialCompletionPanicBackend),
+        SchedulerConfig::new(1),
+    )
+    .unwrap();
+    let first_data = vec![1_u8; BLOCK_SIZE as usize];
+    let second_data = vec![2_u8; BLOCK_SIZE as usize];
+    let ops = [
+        StripWrite {
+            pd: pds[0].clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 0,
+            data: &first_data,
+        },
+        StripWrite {
+            pd: pds[1].clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 0,
+            data: &second_data,
+        },
+    ];
+
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        scheduled.submit_writes_detailed_with_class(IoClass::DrainMeta, &ops)
+    }));
+    assert!(unwind.is_err());
+    let snapshot = scheduled.snapshot();
+    assert!(snapshot.pds.iter().all(|pd| pd.total_active_blocks == 0));
+    assert_eq!(
+        snapshot
+            .pds
+            .iter()
+            .flat_map(|pd| &pd.classes)
+            .filter(|class| class.class == IoClass::DrainMeta)
+            .map(|class| class.reclaimed_blocks)
+            .sum::<u64>(),
+        2
+    );
 }

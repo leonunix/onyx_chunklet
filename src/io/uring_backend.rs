@@ -1,10 +1,9 @@
 //! `UringBackend` — `io_uring` batched writes (Linux only).
 //!
-//! One thread-local `IoUring` instance per worker thread. `submit_writes`
-//! bounces every `StripWrite` into an `AlignedBuf` (so the data buffer
-//! satisfies O_DIRECT alignment when the underlying fd was opened with
-//! it), pushes one `IORING_OP_WRITE` SQE per op, calls `submit_and_wait`
-//! once, and drains CQEs to surface per-op errors.
+//! One thread-local `IoUring` instance per execution thread. The default
+//! constructor preserves caller-thread execution. The pooled constructor owns
+//! independent persistent foreground/background Rayon pools, groups a batch by
+//! physical disk, and reuses each worker's TLS ring across submits.
 //!
 //! Two big wins versus `SyncBackend` for a K-strip fan-out:
 //! - K thread spawns → 0 (everything runs on the calling thread, kernel
@@ -19,22 +18,68 @@
 //! satisfied (typically true under O_DIRECT-capable allocators with
 //! 4 KiB fragment alignment).
 
+use std::any::Any;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring};
 
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::aligned::AlignedBuf;
-use crate::io::backend::{IoBackend, StripRead, StripWrite};
-use crate::io::sync_backend::SyncBackend;
+use crate::io::backend::{
+    IoBackend, IoExecutionSnapshot, StripRead, StripWrite, UringPoolConfig, WriteCompletionObserver,
+};
+use crate::io::scheduler::{current_io_class, IoClass};
 use crate::pd::PhysicalDisk;
 use crate::types::BLOCK_SIZE;
 
 const URING_DEPTH: u32 = 64;
 const MAX_COALESCED_WRITE_BYTES: usize = 256 * 1024;
+
+mod batch;
+mod execution;
+
+use batch::{push_batch, wait_and_drain, wait_and_drain_observed, ValidatedCompletion};
+use execution::ScopedWritePools;
+
+/// Holds the first observer panic while terminal IO recovery continues. The
+/// callback is disabled after its first panic and resumed only once every
+/// already-submitted IO and required exact-IO retry has finished.
+struct CompletionCallback<'a, F> {
+    callback: &'a mut F,
+    panic: Option<Box<dyn Any + Send>>,
+}
+
+impl<'a, F> CompletionCallback<'a, F>
+where
+    F: FnMut(&[ValidatedCompletion]),
+{
+    fn new(callback: &'a mut F) -> Self {
+        Self {
+            callback,
+            panic: None,
+        }
+    }
+
+    fn notify(&mut self, completions: &[ValidatedCompletion]) {
+        if completions.is_empty() || self.panic.is_some() {
+            return;
+        }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| (self.callback)(completions))) {
+            self.panic = Some(payload);
+        }
+    }
+
+    fn resume_if_panicked(self) {
+        if let Some(payload) = self.panic {
+            resume_unwind(payload);
+        }
+    }
+}
 
 /// Per-thread ring state. A ring is created lazily on first submit and reused
 /// for the thread's lifetime. If creation hits file-descriptor exhaustion
@@ -65,15 +110,126 @@ fn is_resource_exhaustion(e: &std::io::Error) -> bool {
     )
 }
 
-pub struct UringBackend;
+pub struct UringBackend {
+    write_pools: ScopedWritePools,
+}
 
 impl UringBackend {
     /// Probe-initialize an `IoUring` instance to verify the kernel
     /// supports it. Returns `Err` on kernels without `io_uring` (pre-5.1)
     /// or with it disabled by sysctl.
     pub fn new() -> std::io::Result<Self> {
+        Self::new_pooled(0, 0)
+    }
+
+    /// Build with optional persistent write pools. Zero workers keep the
+    /// corresponding class on the historical caller-thread path.
+    pub fn new_pooled(
+        foreground_workers: usize,
+        background_workers: usize,
+    ) -> std::io::Result<Self> {
+        Self::new_pooled_with_config(UringPoolConfig::new(foreground_workers, background_workers))
+    }
+
+    /// Build persistent write pools with explicit worker CPU sets.
+    pub fn new_pooled_with_config(config: UringPoolConfig) -> std::io::Result<Self> {
         let _probe = IoUring::new(URING_DEPTH)?;
-        Ok(UringBackend)
+        Ok(Self {
+            write_pools: ScopedWritePools::with_config(config)?,
+        })
+    }
+
+    fn submit_writes_detailed_inline(ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        if ops.is_empty() {
+            return Vec::new();
+        }
+        let n = ops.len();
+        let mut results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
+        let outcome = with_ring(|access| -> ChunkletResult<bool> {
+            match access {
+                RingAccess::Degrade => Ok(true),
+                RingAccess::Ready(ring) => {
+                    let mut start = 0usize;
+                    while start < n {
+                        let end = (start + URING_DEPTH as usize).min(n);
+                        for (i, result) in submit_coalesced_chunk_detailed(ring, &ops[start..end])
+                            .into_iter()
+                            .enumerate()
+                        {
+                            results[start + i] = Some(result);
+                        }
+                        start = end;
+                    }
+                    Ok(false)
+                }
+            }
+        });
+        match outcome {
+            Ok(true) => submit_writes_serial(ops),
+            Ok(false) => results
+                .into_iter()
+                .map(|result| result.expect("every op filled by a chunk"))
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                (0..n)
+                    .map(|_| Err(ChunkletError::Io(std::io::Error::other(message.clone()))))
+                    .collect()
+            }
+        }
+    }
+
+    fn submit_writes_detailed_inline_observed(
+        ops: &[StripWrite<'_>],
+        observer: &dyn WriteCompletionObserver,
+        service_started: Instant,
+    ) -> Vec<ChunkletResult<()>> {
+        if ops.is_empty() {
+            return Vec::new();
+        }
+        let n = ops.len();
+        let mut results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
+        let outcome = with_ring(|access| -> ChunkletResult<bool> {
+            match access {
+                RingAccess::Degrade => Ok(true),
+                RingAccess::Ready(ring) => {
+                    let mut start = 0usize;
+                    while start < n {
+                        let end = (start + URING_DEPTH as usize).min(n);
+                        let chunk_results = submit_coalesced_chunk_detailed_observed(
+                            ring,
+                            &ops[start..end],
+                            start,
+                            observer,
+                            service_started,
+                        );
+                        for (index, result) in chunk_results.into_iter().enumerate() {
+                            results[start + index] = Some(result);
+                        }
+                        start = end;
+                    }
+                    Ok(false)
+                }
+            }
+        });
+        match outcome {
+            Ok(true) => {
+                let results = submit_writes_serial(ops);
+                notify_all_completed(observer, n, service_started);
+                results
+            }
+            Ok(false) => results
+                .into_iter()
+                .map(|result| result.expect("every op filled by a chunk"))
+                .collect(),
+            Err(error) => {
+                notify_all_completed(observer, n, service_started);
+                let message = error.to_string();
+                (0..n)
+                    .map(|_| Err(ChunkletError::Io(std::io::Error::other(message.clone()))))
+                    .collect()
+            }
+        }
     }
 }
 
@@ -142,55 +298,44 @@ impl IoBackend for UringBackend {
             }
         })?;
         if degraded {
-            // fd exhaustion → run this batch through the syscall fan-out.
-            return SyncBackend.submit_reads(ops);
+            return submit_reads_serial(ops);
         }
         Ok(())
     }
 
     fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
-        if ops.is_empty() {
-            return Vec::new();
+        self.write_pools
+            .submit(current_io_class(), ops, Self::submit_writes_detailed_inline)
+    }
+
+    fn submit_writes_detailed_with_class(
+        &self,
+        class: IoClass,
+        ops: &[StripWrite<'_>],
+    ) -> Vec<ChunkletResult<()>> {
+        self.write_pools
+            .submit(class, ops, Self::submit_writes_detailed_inline)
+    }
+
+    fn submit_writes_detailed_observed_with_class(
+        &self,
+        class: IoClass,
+        ops: &[StripWrite<'_>],
+        observer: &dyn WriteCompletionObserver,
+    ) -> Vec<ChunkletResult<()>> {
+        if self.write_pools.has_pool(class) {
+            return self.write_pools.submit_observed(
+                class,
+                ops,
+                observer,
+                Self::submit_writes_detailed_inline_observed,
+            );
         }
-        let n = ops.len();
-        let mut results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
-        let outcome = with_ring(|access| -> ChunkletResult<bool> {
-            match access {
-                RingAccess::Degrade => Ok(true),
-                RingAccess::Ready(ring) => {
-                    let mut start = 0usize;
-                    while start < n {
-                        let end = (start + URING_DEPTH as usize).min(n);
-                        // Per-op results for this chunk, offset back into the
-                        // full-batch positions (chunk uses chunk-local indices).
-                        for (i, r) in submit_coalesced_chunk_detailed(ring, &ops[start..end])
-                            .into_iter()
-                            .enumerate()
-                        {
-                            results[start + i] = Some(r);
-                        }
-                        start = end;
-                    }
-                    Ok(false)
-                }
-            }
-        });
-        match outcome {
-            // fd/memory exhaustion → run this batch through the syscall fan-out.
-            Ok(true) => SyncBackend.submit_writes_detailed(ops),
-            Ok(false) => results
-                .into_iter()
-                .map(|o| o.expect("every op filled by a chunk"))
-                .collect(),
-            // Genuine (non-exhaustion) ring-init error: cannot attribute to a
-            // single op, so mark the whole batch failed and let the LD surface it.
-            Err(e) => {
-                let msg = e.to_string();
-                (0..n)
-                    .map(|_| Err(ChunkletError::Io(std::io::Error::other(msg.clone()))))
-                    .collect()
-            }
-        }
+        Self::submit_writes_detailed_inline_observed(ops, observer, Instant::now())
+    }
+
+    fn execution_snapshot(&self) -> Option<IoExecutionSnapshot> {
+        Some(self.write_pools.snapshot())
     }
 
     fn submit_flushes(&self, pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
@@ -205,7 +350,7 @@ impl IoBackend for UringBackend {
                 }
             })?;
             if degraded {
-                return SyncBackend.submit_flushes(required);
+                return submit_flushes_serial(required);
             }
             Ok(())
         })
@@ -240,45 +385,29 @@ fn submit_required_flushes(
 /// guarded by this barrier have already completed before `LogicalDisk::flush`
 /// is called, so the fsync SQEs do not need link ordering against write SQEs.
 fn submit_flush_chunk(ring: &mut IoUring, pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
-    {
-        let mut sq = ring.submission();
-        for (idx, pd) in pds.iter().enumerate() {
-            let entry = opcode::Fsync::new(types::Fd(pd.raw_fd()))
+    let entries: Vec<squeue::Entry> = pds
+        .iter()
+        .enumerate()
+        .map(|(index, pd)| {
+            opcode::Fsync::new(types::Fd(pd.raw_fd()))
                 .build()
-                .user_data(idx as u64);
-            // SAFETY: the fd remains owned by `pd`, and this function waits for
-            // every submitted SQE before returning.
-            unsafe {
-                sq.push(&entry).map_err(|error| {
-                    ChunkletError::Io(std::io::Error::other(format!(
-                        "io_uring flush sq push: {error}"
-                    )))
-                })?;
-            }
-        }
+                .user_data(index as u64)
+        })
+        .collect();
+    push_batch(ring, &entries, "io_uring flush")?;
+    let completions = wait_and_drain(ring, pds.len(), "io_uring flush");
+    if let Some(error) = completions.protocol_error {
+        return Err(ChunkletError::Io(std::io::Error::other(format!(
+            "io_uring flush completion protocol: {error}"
+        ))));
     }
-
-    ring.submit_and_wait(pds.len()).map_err(|error| {
-        ChunkletError::Io(std::io::Error::other(format!(
-            "io_uring flush submit_and_wait: {error}"
-        )))
-    })?;
-
-    let mut completed = 0usize;
     let mut first_err = None;
-    for cqe in ring.completion() {
-        completed += 1;
-        if cqe.result() < 0 && first_err.is_none() {
+    for result in completions.results.into_iter().flatten() {
+        if result < 0 && first_err.is_none() {
             first_err = Some(ChunkletError::Io(std::io::Error::from_raw_os_error(
-                -cqe.result(),
+                -result,
             )));
         }
-    }
-    if completed != pds.len() {
-        return Err(ChunkletError::Io(std::io::Error::other(format!(
-            "io_uring expected {} flush cqes, got {completed}",
-            pds.len()
-        ))));
     }
     first_err.map_or(Ok(()), Err)
 }
@@ -292,9 +421,39 @@ fn submit_coalesced_chunk_detailed(
     ring: &mut IoUring,
     ops: &[StripWrite<'_>],
 ) -> Vec<ChunkletResult<()>> {
+    submit_coalesced_chunk_detailed_with_callback(ring, ops, |_| {})
+}
+
+fn submit_coalesced_chunk_detailed_observed(
+    ring: &mut IoUring,
+    ops: &[StripWrite<'_>],
+    global_offset: usize,
+    observer: &dyn WriteCompletionObserver,
+    service_started: Instant,
+) -> Vec<ChunkletResult<()>> {
+    submit_coalesced_chunk_detailed_with_callback(ring, ops, |local_indices| {
+        let global_indices: Vec<_> = local_indices
+            .iter()
+            .map(|index| global_offset.saturating_add(*index))
+            .collect();
+        observer.writes_completed(&global_indices, elapsed_ns(service_started));
+    })
+}
+
+fn submit_coalesced_chunk_detailed_with_callback(
+    ring: &mut IoUring,
+    ops: &[StripWrite<'_>],
+    mut on_completed: impl FnMut(&[usize]),
+) -> Vec<ChunkletResult<()>> {
     let groups = coalesced_write_groups(ops);
     if groups.iter().all(|group| group.len() == 1) {
-        return submit_chunk_detailed(ring, ops);
+        return submit_chunk_detailed_with_callback(ring, ops, |completions| {
+            let indices: Vec<_> = completions
+                .iter()
+                .map(|completion| completion.index)
+                .collect();
+            on_completed(&indices);
+        });
     }
 
     struct PlannedWrite {
@@ -303,10 +462,10 @@ fn submit_coalesced_chunk_detailed(
     }
 
     let mut planned = Vec::with_capacity(groups.len());
-    for group in groups {
+    for group in &groups {
         if group.len() == 1 {
             planned.push(PlannedWrite {
-                originals: group,
+                originals: group.clone(),
                 buffer: None,
             });
             continue;
@@ -316,19 +475,21 @@ fn submit_coalesced_chunk_detailed(
             Ok(buffer) => buffer,
             Err(error) => {
                 let message = format!("io_uring coalesced write allocation: {error}");
+                let indices: Vec<_> = (0..ops.len()).collect();
+                on_completed(&indices);
                 return (0..ops.len())
                     .map(|_| Err(ChunkletError::Io(std::io::Error::other(message.clone()))))
                     .collect();
             }
         };
         let mut cursor = 0;
-        for &idx in &group {
+        for &idx in group {
             let data = ops[idx].data;
             buffer.as_mut_slice()[cursor..cursor + data.len()].copy_from_slice(data);
             cursor += data.len();
         }
         planned.push(PlannedWrite {
-            originals: group,
+            originals: group.clone(),
             buffer: Some(buffer),
         });
     }
@@ -349,7 +510,10 @@ fn submit_coalesced_chunk_detailed(
             }
         })
         .collect();
-    let submitted_results = submit_chunk_detailed(ring, &submitted);
+    let submitted_results = submit_chunk_detailed_with_callback(ring, &submitted, |completions| {
+        let indices = map_physical_completions(&groups, completions, 0);
+        on_completed(&indices);
+    });
     let mut results: Vec<Option<ChunkletResult<()>>> = (0..ops.len()).map(|_| None).collect();
     for (plan, result) in planned.iter().zip(submitted_results) {
         if plan.originals.len() == 1 {
@@ -375,6 +539,19 @@ fn submit_coalesced_chunk_detailed(
     results
         .into_iter()
         .map(|result| result.expect("every coalesced source op has a result"))
+        .collect()
+}
+
+fn map_physical_completions(
+    groups: &[Vec<usize>],
+    completions: &[ValidatedCompletion],
+    global_offset: usize,
+) -> Vec<usize> {
+    completions
+        .iter()
+        .filter_map(|completion| groups.get(completion.index))
+        .flat_map(|originals| originals.iter().copied())
+        .map(|index| global_offset.saturating_add(index))
         .collect()
 }
 
@@ -450,86 +627,103 @@ fn submit_read_chunk(ring: &mut IoUring, ops: &mut [StripRead<'_>]) -> ChunkletR
         }
     }
 
-    {
-        let mut sq = ring.submission();
-        for i in 0..ops.len() {
+    let entries: Vec<squeue::Entry> = (0..ops.len())
+        .map(|i| {
             let (fd, abs) = targets[i];
             let (ptr, len) = ptrs[i];
-            let entry = opcode::Read::new(types::Fd(fd), ptr, len)
+            opcode::Read::new(types::Fd(fd), ptr, len)
                 .offset(abs)
                 .build()
-                .user_data(i as u64);
-            // SAFETY: direct buffers and bounce buffers outlive this function;
-            // `submit_and_wait` waits for every submitted SQE.
-            unsafe {
-                sq.push(&entry).map_err(|e| {
-                    ChunkletError::Io(std::io::Error::other(format!(
-                        "io_uring read sq push: {}",
-                        e
-                    )))
-                })?;
-            }
-        }
-    }
-
-    ring.submit_and_wait(ops.len()).map_err(|e| {
+                .user_data(i as u64)
+        })
+        .collect();
+    push_batch(ring, &entries, "io_uring read")?;
+    let completions = wait_and_drain(ring, ops.len(), "io_uring read");
+    let mut first_err = completions.protocol_error.map(|error| {
         ChunkletError::Io(std::io::Error::other(format!(
-            "io_uring read submit_and_wait: {}",
-            e
+            "io_uring read completion protocol: {error}"
         )))
-    })?;
-
-    let mut first_err: Option<ChunkletError> = None;
-    let mut completed = 0;
-    for cqe in ring.completion() {
-        completed += 1;
-        let idx = cqe.user_data() as usize;
-        let res = cqe.result();
+    });
+    let mut successful = vec![false; ops.len()];
+    let mut short_indices = Vec::new();
+    for (index, result) in completions.results.iter().enumerate() {
+        let Some(res) = *result else {
+            continue;
+        };
         if res < 0 {
             let errno = -res;
             if first_err.is_none() {
                 first_err = Some(ChunkletError::Io(std::io::Error::from_raw_os_error(errno)));
             }
-        } else if (res as u32) < ptrs[idx].1 {
-            if first_err.is_none() {
-                first_err = Some(ChunkletError::Io(std::io::Error::other(format!(
-                    "io_uring short read op_idx={}: {} of {}",
-                    idx, res, ptrs[idx].1
-                ))));
-            }
+        } else if res as u32 == ptrs[index].1 {
+            successful[index] = true;
+        } else if is_positive_short(res, ptrs[index].1) {
+            short_indices.push(index);
+        } else if first_err.is_none() {
+            let reason = if res == 0 { "zero-length" } else { "oversized" };
+            first_err = Some(ChunkletError::Io(std::io::Error::other(format!(
+                "io_uring {reason} read completion op_idx={index}: {res} for {} bytes",
+                ptrs[index].1
+            ))));
         }
     }
-    if completed < ops.len() {
-        return Err(ChunkletError::Io(std::io::Error::other(format!(
-            "io_uring expected {} read cqes, got {}",
-            ops.len(),
-            completed
-        ))));
-    }
-    if let Some(err) = first_err {
-        return Err(err);
+
+    let recovered = attempt_all_indices(
+        &short_indices,
+        |index| {
+            let op = &mut ops[index];
+            let pd = op.pd.clone();
+            match bounces[index].as_mut() {
+                Some(buffer) => pd.read_chunklet_user_unbound(
+                    op.chunklet_index,
+                    op.in_chunklet_off,
+                    buffer.as_mut_slice(),
+                ),
+                None => {
+                    pd.read_chunklet_user_unbound(op.chunklet_index, op.in_chunklet_off, op.data)
+                }
+            }
+        },
+        |_, _| {},
+    );
+    for (index, result) in recovered {
+        match result {
+            Ok(()) => successful[index] = true,
+            Err(error) if first_err.is_none() => {
+                first_err = Some(ChunkletError::Io(std::io::Error::other(format!(
+                    "io_uring short read exact retry op_idx={index} failed: {error}"
+                ))));
+            }
+            Err(_) => {}
+        }
     }
 
-    for (op, bounce) in ops.iter_mut().zip(bounces.iter()) {
+    for (index, (op, bounce)) in ops.iter_mut().zip(bounces.iter()).enumerate() {
+        if !successful[index] {
+            continue;
+        }
         if let Some(buf) = bounce {
             op.data.copy_from_slice(&buf.as_slice()[..op.data.len()]);
         }
     }
-    Ok(())
+    if let Some(err) = first_err {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 /// Submit one NUMA-homogeneous chunk and return a per-op result in the chunk's
-/// input order (`results[i]` ↔ `ops[i]`). A batch-level setup failure (offset
-/// geometry, bounce alloc, SQE push, submit_and_wait) cannot be attributed to a
-/// single op, so it marks every op in the chunk failed; otherwise each op's CQE
-/// determines its own result. Surviving ops are durable when this returns.
-fn submit_chunk_detailed(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+/// input order (`results[i]` ↔ `ops[i]`). A pre-publication setup failure
+/// (offset geometry, bounce allocation, atomic SQ push) marks the chunk failed.
+/// After publication, the safety helper drains every CQE before this can return;
+/// each CQE then determines its own result.
+fn submit_chunk_detailed_with_callback(
+    ring: &mut IoUring,
+    ops: &[StripWrite<'_>],
+    mut on_completed: impl FnMut(&[ValidatedCompletion]),
+) -> Vec<ChunkletResult<()>> {
     let n = ops.len();
-    let chunk_all_err = |msg: String| -> Vec<ChunkletResult<()>> {
-        (0..n)
-            .map(|_| Err(ChunkletError::Io(std::io::Error::other(msg.clone()))))
-            .collect()
-    };
 
     // Resolve absolute offsets + fds while we still hold &op.
     let mut targets: Vec<(i32, u64)> = Vec::with_capacity(n);
@@ -540,7 +734,13 @@ fn submit_chunk_detailed(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> Vec<Chun
             op.data.len() as u64,
         ) {
             Ok(abs) => targets.push((op.pd.raw_fd(), abs)),
-            Err(e) => return chunk_all_err(format!("io_uring chunk offset setup: {}", e)),
+            Err(e) => {
+                return failed_chunk_results(
+                    n,
+                    format!("io_uring chunk offset setup: {}", e),
+                    &mut on_completed,
+                )
+            }
         }
     }
 
@@ -559,67 +759,242 @@ fn submit_chunk_detailed(ring: &mut IoUring, ops: &[StripWrite<'_>]) -> Vec<Chun
                     ptrs.push((buf.as_slice().as_ptr(), len as u32));
                     bounces.push(buf);
                 }
-                Err(e) => return chunk_all_err(format!("io_uring chunk bounce alloc: {}", e)),
-            }
-        }
-    }
-
-    {
-        let mut sq = ring.submission();
-        for (i, _op) in ops.iter().enumerate() {
-            let (fd, abs) = targets[i];
-            let (ptr, len) = ptrs[i];
-            let entry = opcode::Write::new(types::Fd(fd), ptr, len)
-                .offset(abs)
-                .build()
-                .user_data(i as u64);
-            // SAFETY: bounce buffers in `bounces` outlive this function;
-            // `submit_and_wait` blocks until the kernel has consumed
-            // every SQE this loop pushed.
-            unsafe {
-                if let Err(e) = sq.push(&entry) {
-                    return chunk_all_err(format!("io_uring sq push: {}", e));
+                Err(e) => {
+                    return failed_chunk_results(
+                        n,
+                        format!("io_uring chunk bounce alloc: {}", e),
+                        &mut on_completed,
+                    )
                 }
             }
         }
     }
 
-    if let Err(e) = ring.submit_and_wait(n) {
-        return chunk_all_err(format!("io_uring submit_and_wait: {}", e));
+    let entries: Vec<squeue::Entry> = ops
+        .iter()
+        .enumerate()
+        .map(|(i, _op)| {
+            let (fd, abs) = targets[i];
+            let (ptr, len) = ptrs[i];
+            opcode::Write::new(types::Fd(fd), ptr, len)
+                .offset(abs)
+                .build()
+                .user_data(i as u64)
+        })
+        .collect();
+    if let Err(error) = push_batch(ring, &entries, "io_uring write") {
+        return failed_chunk_results(n, error.to_string(), &mut on_completed);
+    }
+    let mut callback = CompletionCallback::new(&mut on_completed);
+    let mut short_indices = Vec::new();
+    let completions = wait_and_drain_observed(ring, n, "io_uring write", |arrivals| {
+        let terminal = partition_write_completions(arrivals, &ptrs, &mut short_indices);
+        callback.notify(&terminal);
+    });
+
+    let mut retry_results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
+    let recovered = attempt_all_indices(
+        &short_indices,
+        |index| {
+            let op = &ops[index];
+            op.pd
+                .write_chunklet_user_unbound(op.chunklet_index, op.in_chunklet_off, op.data)
+        },
+        |index, result| {
+            let completion = ValidatedCompletion {
+                index,
+                result: if result.is_ok() {
+                    ptrs[index].1 as i32
+                } else {
+                    -libc::EIO
+                },
+            };
+            callback.notify(std::slice::from_ref(&completion));
+        },
+    );
+    for (index, result) in recovered {
+        retry_results[index] = Some(result.map_err(|error| {
+            ChunkletError::Io(std::io::Error::other(format!(
+                "io_uring short write exact retry op_idx={index} failed: {error}"
+            )))
+        }));
     }
 
-    let mut results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
-    let mut completed = 0;
-    for cqe in ring.completion() {
-        completed += 1;
-        let idx = cqe.user_data() as usize;
-        let res = cqe.result();
-        let r = if res < 0 {
-            Err(ChunkletError::Io(std::io::Error::from_raw_os_error(-res)))
-        } else if (res as u32) < ptrs[idx].1 {
-            Err(ChunkletError::Io(std::io::Error::other(format!(
-                "io_uring short write op_idx={}: {} of {}",
-                idx, res, ptrs[idx].1
-            ))))
-        } else {
-            Ok(())
-        };
-        results[idx] = Some(r);
-    }
-    drop(bounces);
-    // Any op without a CQE (should not happen after submit_and_wait(n)) is
-    // reported as that op's own error, not a batch failure.
-    results
-        .into_iter()
-        .map(|o| {
-            o.unwrap_or_else(|| {
-                Err(ChunkletError::Io(std::io::Error::other(format!(
-                    "io_uring missing cqe (completed {} of {})",
-                    completed, n
-                ))))
+    if let Some(error) = completions.protocol_error {
+        let missing: Vec<_> = completions
+            .results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, result)| {
+                result.is_none().then_some(ValidatedCompletion {
+                    index,
+                    result: -libc::EPROTO,
+                })
             })
+            .collect();
+        callback.notify(&missing);
+        callback.resume_if_panicked();
+        return write_error_results(n, format!("io_uring write completion protocol: {error}"));
+    }
+
+    let results = completions
+        .results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let res = result.expect("validated completion batch has every write result");
+            if let Some(retry_result) = retry_results[index].take() {
+                retry_result
+            } else if res < 0 {
+                Err(ChunkletError::Io(std::io::Error::from_raw_os_error(-res)))
+            } else if res as u32 == ptrs[index].1 {
+                Ok(())
+            } else if res == 0 {
+                Err(ChunkletError::Io(std::io::Error::other(format!(
+                    "io_uring zero-length write completion op_idx={index} for {} bytes",
+                    ptrs[index].1
+                ))))
+            } else {
+                Err(ChunkletError::Io(std::io::Error::other(format!(
+                    "io_uring oversized write completion op_idx={index}: {res} for {} bytes",
+                    ptrs[index].1
+                ))))
+            }
+        })
+        .collect();
+    callback.resume_if_panicked();
+    results
+}
+
+fn is_positive_short(result: i32, expected: u32) -> bool {
+    result > 0 && (result as u32) < expected
+}
+
+fn partition_write_completions(
+    arrivals: &[ValidatedCompletion],
+    ptrs: &[(*const u8, u32)],
+    short_indices: &mut Vec<usize>,
+) -> Vec<ValidatedCompletion> {
+    let mut terminal = Vec::with_capacity(arrivals.len());
+    for &completion in arrivals {
+        if is_positive_short(completion.result, ptrs[completion.index].1) {
+            short_indices.push(completion.index);
+        } else {
+            terminal.push(completion);
+        }
+    }
+    terminal
+}
+
+/// Run every exact-IO recovery even if an earlier one fails. `after` runs only
+/// after its corresponding operation has reached a terminal result, allowing
+/// write observers to delay credit release until recovery really completed.
+fn attempt_all_indices(
+    indices: &[usize],
+    mut operation: impl FnMut(usize) -> ChunkletResult<()>,
+    mut after: impl FnMut(usize, &ChunkletResult<()>),
+) -> Vec<(usize, ChunkletResult<()>)> {
+    indices
+        .iter()
+        .map(|&index| {
+            let result = operation(index);
+            after(index, &result);
+            (index, result)
         })
         .collect()
+}
+
+fn failed_chunk_results(
+    count: usize,
+    message: String,
+    on_completed: &mut impl FnMut(&[ValidatedCompletion]),
+) -> Vec<ChunkletResult<()>> {
+    let completed: Vec<_> = (0..count)
+        .map(|index| ValidatedCompletion {
+            index,
+            result: -libc::EIO,
+        })
+        .collect();
+    if !completed.is_empty() {
+        on_completed(&completed);
+    }
+    write_error_results(count, message)
+}
+
+fn write_error_results(count: usize, message: String) -> Vec<ChunkletResult<()>> {
+    (0..count)
+        .map(|_| Err(ChunkletError::Io(std::io::Error::other(message.clone()))))
+        .collect()
+}
+
+fn submit_reads_serial(ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+    submit_reads_serial_with(ops, |op| {
+        op.pd
+            .read_chunklet_user_unbound(op.chunklet_index, op.in_chunklet_off, op.data)
+    })
+}
+
+fn submit_reads_serial_with(
+    ops: &mut [StripRead<'_>],
+    mut read: impl FnMut(&mut StripRead<'_>) -> ChunkletResult<()>,
+) -> ChunkletResult<()> {
+    let mut first_error = None;
+    for op in ops {
+        if let Err(error) = read(op) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn submit_writes_serial(ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+    ops.iter()
+        .map(|op| {
+            op.pd
+                .write_chunklet_user_unbound(op.chunklet_index, op.in_chunklet_off, op.data)
+        })
+        .collect()
+}
+
+fn submit_flushes_serial(pds: &[Arc<PhysicalDisk>]) -> ChunkletResult<()> {
+    submit_flushes_serial_with(pds, |pd| pd.sync())
+}
+
+fn submit_flushes_serial_with(
+    pds: &[Arc<PhysicalDisk>],
+    mut sync: impl FnMut(&Arc<PhysicalDisk>) -> ChunkletResult<()>,
+) -> ChunkletResult<()> {
+    let mut seen = BTreeSet::new();
+    let mut first_error = None;
+    for pd in pds {
+        if !seen.insert(pd.pd_id()) {
+            continue;
+        }
+        if let Err(error) = sync(pd) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn notify_all_completed(
+    observer: &dyn WriteCompletionObserver,
+    count: usize,
+    service_started: Instant,
+) {
+    if count == 0 {
+        return;
+    }
+    let indices: Vec<_> = (0..count).collect();
+    observer.writes_completed(&indices, elapsed_ns(service_started));
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
 fn is_direct_aligned(offset: u64, len: usize, ptr: usize) -> bool {
@@ -641,8 +1016,23 @@ mod tests {
     use super::*;
     use crate::pd::PhysicalDisk;
     use crate::types::{PdId, PoolId};
+    use parking_lot::Mutex;
+    use std::cell::{Cell, RefCell};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        completions: Mutex<Vec<(Vec<usize>, u64)>>,
+    }
+
+    impl WriteCompletionObserver for RecordingObserver {
+        fn writes_completed(&self, op_indices: &[usize], service_ns: u64) {
+            self.completions
+                .lock()
+                .push((op_indices.to_vec(), service_ns));
+        }
+    }
 
     fn test_pd(dir: &TempDir, name: &str, pd_seq: u32, sync_required: bool) -> Arc<PhysicalDisk> {
         let mut raw =
@@ -766,11 +1156,257 @@ mod tests {
         assert_eq!(coalesced_write_groups(&writes), vec![vec![0, 2, 1]]);
     }
 
-    /// When the thread's ring is disabled (the EMFILE outcome), `submit_writes`
-    /// / `submit_reads` must transparently fall back to the syscall backend and
-    /// still land the data correctly — a degraded write, never a failed one.
     #[test]
-    fn degrades_to_sync_when_ring_disabled() {
+    fn physical_completions_expand_to_coalesced_originals_with_global_offset() {
+        let groups = vec![vec![2, 0], vec![1], vec![3, 4]];
+        let completions = vec![
+            ValidatedCompletion {
+                index: 2,
+                result: 8192,
+            },
+            ValidatedCompletion {
+                index: 0,
+                result: 8192,
+            },
+        ];
+
+        assert_eq!(
+            map_physical_completions(&groups, &completions, 64),
+            vec![67, 68, 66, 64]
+        );
+    }
+
+    #[test]
+    fn short_write_callback_waits_for_exact_recovery_then_expands_coalesced_indices() {
+        let ptrs = vec![(std::ptr::null(), 4096)];
+        let arrivals = [ValidatedCompletion {
+            index: 0,
+            result: 2048,
+        }];
+        let mut short_indices = Vec::new();
+        let terminal = partition_write_completions(&arrivals, &ptrs, &mut short_indices);
+        assert!(terminal.is_empty());
+        assert_eq!(short_indices, vec![0]);
+
+        let recovered = Cell::new(false);
+        let published = RefCell::new(Vec::new());
+        let groups = vec![vec![0, 2]];
+        let mut observer = |completions: &[ValidatedCompletion]| {
+            assert!(
+                recovered.get(),
+                "short completion escaped before exact retry"
+            );
+            published
+                .borrow_mut()
+                .extend(map_physical_completions(&groups, completions, 64));
+        };
+        let mut callback = CompletionCallback::new(&mut observer);
+        callback.notify(&terminal);
+        assert!(published.borrow().is_empty());
+
+        let results = attempt_all_indices(
+            &short_indices,
+            |_| {
+                recovered.set(true);
+                Ok(())
+            },
+            |index, result| {
+                callback.notify(&[ValidatedCompletion {
+                    index,
+                    result: if result.is_ok() { 4096 } else { -libc::EIO },
+                }]);
+            },
+        );
+        callback.resume_if_panicked();
+
+        assert!(results[0].1.is_ok());
+        assert_eq!(*published.borrow(), vec![64, 66]);
+    }
+
+    #[test]
+    fn short_recovery_attempts_every_index_after_an_early_error() {
+        let attempted = RefCell::new(Vec::new());
+        let terminal = RefCell::new(Vec::new());
+        let results = attempt_all_indices(
+            &[2, 0, 1],
+            |index| {
+                attempted.borrow_mut().push(index);
+                if index == 2 {
+                    Err(ChunkletError::Invariant("first recovery error".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            |index, _| terminal.borrow_mut().push(index),
+        );
+
+        assert_eq!(*attempted.borrow(), vec![2, 0, 1]);
+        assert_eq!(*terminal.borrow(), vec![2, 0, 1]);
+        assert!(results[0].1.is_err());
+        assert!(results[1].1.is_ok());
+        assert!(results[2].1.is_ok());
+    }
+
+    #[test]
+    fn observer_panic_during_short_recovery_waits_for_every_retry() {
+        let attempts = Cell::new(0usize);
+        let callbacks = Cell::new(0usize);
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let mut observer = |_completions: &[ValidatedCompletion]| {
+                callbacks.set(callbacks.get() + 1);
+                panic!("recovery observer panic");
+            };
+            let mut callback = CompletionCallback::new(&mut observer);
+            let _ = attempt_all_indices(
+                &[0, 1],
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    Ok(())
+                },
+                |index, result| {
+                    callback.notify(&[ValidatedCompletion {
+                        index,
+                        result: if result.is_ok() { 4096 } else { -libc::EIO },
+                    }]);
+                },
+            );
+            callback.resume_if_panicked();
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(callbacks.get(), 1);
+    }
+
+    #[test]
+    fn zero_and_oversized_completions_are_terminal_not_retryable() {
+        assert!(is_positive_short(2048, 4096));
+        assert!(!is_positive_short(0, 4096));
+        assert!(!is_positive_short(4096, 4096));
+        assert!(!is_positive_short(8192, 4096));
+        assert!(!is_positive_short(-libc::EIO, 4096));
+    }
+
+    #[test]
+    fn serial_read_fallback_attempts_all_ops_and_returns_first_error() {
+        let dir = TempDir::new().unwrap();
+        let first = test_pd(&dir, "pd0", 0, false);
+        let second = test_pd(&dir, "pd1", 1, false);
+        let mut first_data = [0_u8; 4096];
+        let mut second_data = [0_u8; 4096];
+        let mut third_data = [0_u8; 4096];
+        let mut ops = vec![
+            StripRead {
+                pd: first.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &mut first_data,
+            },
+            StripRead {
+                pd: second,
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &mut second_data,
+            },
+            StripRead {
+                pd: first,
+                chunklet_index: 0,
+                in_chunklet_off: 4096,
+                data: &mut third_data,
+            },
+        ];
+        let attempts = RefCell::new(Vec::new());
+
+        let error = submit_reads_serial_with(&mut ops, |op| {
+            let attempt = attempts.borrow().len();
+            attempts.borrow_mut().push(op.pd.pd_id());
+            Err(ChunkletError::Invariant(format!("read-error-{attempt}")))
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts.borrow().len(), 3);
+        assert!(error.to_string().contains("read-error-0"));
+    }
+
+    #[test]
+    fn serial_flush_fallback_attempts_each_distinct_pd_and_returns_first_error() {
+        let dir = TempDir::new().unwrap();
+        let first = test_pd(&dir, "pd0", 0, true);
+        let second = test_pd(&dir, "pd1", 1, true);
+        let third = test_pd(&dir, "pd2", 2, true);
+        let pds = vec![first.clone(), second, first, third];
+        let attempts = RefCell::new(Vec::new());
+
+        let error = submit_flushes_serial_with(&pds, |pd| {
+            let attempt = attempts.borrow().len();
+            attempts.borrow_mut().push(pd.pd_id());
+            if attempt == 1 {
+                Ok(())
+            } else {
+                Err(ChunkletError::Invariant(format!("flush-error-{attempt}")))
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts.borrow().len(), 3);
+        assert!(error.to_string().contains("flush-error-0"));
+    }
+
+    #[test]
+    fn caller_ring_observer_reports_each_coalesced_original_once() {
+        let backend = match UringBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("io_uring unavailable; skipping observed caller-ring test: {error}");
+                return;
+            }
+        };
+        let dir = TempDir::new().unwrap();
+        let first = test_pd(&dir, "pd0", 0, false);
+        let second = test_pd(&dir, "pd1", 1, false);
+        let pages = [[0x31; 4096], [0x42; 4096], [0x53; 4096]];
+        let writes = vec![
+            StripWrite {
+                pd: first.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &pages[0],
+            },
+            StripWrite {
+                pd: second,
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &pages[1],
+            },
+            StripWrite {
+                pd: first,
+                chunklet_index: 0,
+                in_chunklet_off: 4096,
+                data: &pages[2],
+            },
+        ];
+        let observer = RecordingObserver::default();
+
+        let results = backend.submit_writes_detailed_observed_with_class(
+            IoClass::DrainData,
+            &writes,
+            &observer,
+        );
+        assert!(results.iter().all(Result::is_ok));
+        let completions = observer.completions.lock();
+        assert!(completions.iter().all(|(_, service_ns)| *service_ns > 0));
+        let mut indices: Vec<_> = completions
+            .iter()
+            .flat_map(|(indices, _)| indices.iter().copied())
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    /// When the thread's ring is disabled (the EMFILE outcome), reads and
+    /// writes run serially on this same thread without rebinding its affinity.
+    #[test]
+    fn disabled_ring_uses_same_thread_serial_fallback() {
         let dir = TempDir::new().unwrap();
         let raw =
             crate::io::RawDevice::open_or_create(&dir.path().join("pd0"), 4 * 1024 * 1024 * 1024)
@@ -797,9 +1433,8 @@ mod tests {
             in_chunklet_off: 0,
             data: &payload,
         }];
-        // Hard-fails today on a disabled ring; with the degrade fix it returns Ok
-        // via SyncBackend.
-        UringBackend.submit_writes(&writes).unwrap();
+        let backend = UringBackend::new().unwrap();
+        backend.submit_writes(&writes).unwrap();
 
         let mut got = vec![0u8; 4096];
         {
@@ -809,11 +1444,65 @@ mod tests {
                 in_chunklet_off: 0,
                 data: &mut got,
             }];
-            UringBackend.submit_reads(&mut reads).unwrap();
+            backend.submit_reads(&mut reads).unwrap();
         }
         assert_eq!(
             got, payload,
             "degraded read-back must match the degraded write"
         );
+    }
+
+    #[test]
+    fn pooled_backend_writes_on_pd_groups_and_reports_class_metrics() {
+        let dir = TempDir::new().unwrap();
+        let first = test_pd(&dir, "pd0", 0, false);
+        let second = test_pd(&dir, "pd1", 1, false);
+        let backend = match UringBackend::new_pooled(2, 1) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("io_uring unavailable; skipping pooled ring exercise: {error}");
+                return;
+            }
+        };
+        let first_page = [0x71; 4096];
+        let second_page = [0x82; 4096];
+        let writes = vec![
+            StripWrite {
+                pd: first.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &first_page,
+            },
+            StripWrite {
+                pd: second.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &second_page,
+            },
+        ];
+
+        let results = backend.submit_writes_detailed_with_class(IoClass::DrainData, &writes);
+        assert!(results.iter().all(Result::is_ok));
+        let mut first_readback = [0u8; 4096];
+        let mut second_readback = [0u8; 4096];
+        first.read_chunklet_user(0, 0, &mut first_readback).unwrap();
+        second
+            .read_chunklet_user(0, 0, &mut second_readback)
+            .unwrap();
+        assert_eq!(first_readback, first_page);
+        assert_eq!(second_readback, second_page);
+
+        let snapshot = backend.execution_snapshot().unwrap();
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.foreground_workers, 2);
+        assert_eq!(snapshot.background_workers, 1);
+        let drain_data = snapshot
+            .classes
+            .iter()
+            .find(|class| class.class == IoClass::DrainData)
+            .unwrap();
+        assert_eq!(drain_data.batches, 1);
+        assert_eq!(drain_data.groups, 2);
+        assert_eq!(drain_data.ops, 2);
     }
 }

@@ -41,6 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+rayon = "1.10"
 
 [dev-dependencies]
 proptest = "1"

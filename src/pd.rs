@@ -405,6 +405,17 @@ impl PhysicalDisk {
         buf: &mut [u8],
     ) -> ChunkletResult<()> {
         self.bind_current_to_local_node();
+        self.read_chunklet_user_unbound(chunklet_index, offset, buf)
+    }
+
+    /// Caller-thread fallback for an execution context whose affinity is
+    /// already owned by the upper scheduler.
+    pub(crate) fn read_chunklet_user_unbound(
+        &self,
+        chunklet_index: u32,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> ChunkletResult<()> {
         if self
             .read_faulting
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -425,6 +436,16 @@ impl PhysicalDisk {
         buf: &[u8],
     ) -> ChunkletResult<()> {
         self.bind_current_to_local_node();
+        self.write_chunklet_user_unbound(chunklet_index, offset, buf)
+    }
+
+    /// Caller-thread fallback that preserves the scheduler worker's affinity.
+    pub(crate) fn write_chunklet_user_unbound(
+        &self,
+        chunklet_index: u32,
+        offset: u64,
+        buf: &[u8],
+    ) -> ChunkletResult<()> {
         let abs = self.chunklet_user_abs_offset(chunklet_index, offset, buf.len() as u64)?;
         self.raw.write_at(buf, abs)
     }
