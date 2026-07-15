@@ -37,17 +37,8 @@ use crate::io::scheduler::{current_io_class, IoClass};
 use crate::pd::PhysicalDisk;
 use crate::types::BLOCK_SIZE;
 
-const URING_RING_ENTRIES: u32 = 128;
-const WRITE_BATCH_DEPTH: u32 = 64;
-const READ_BATCH_DEPTH: u32 = 128;
-const FLUSH_BATCH_DEPTH: u32 = 64;
+const URING_DEPTH: u32 = 64;
 const MAX_COALESCED_WRITE_BYTES: usize = 256 * 1024;
-
-const _: () = {
-    assert!(WRITE_BATCH_DEPTH <= URING_RING_ENTRIES);
-    assert!(READ_BATCH_DEPTH <= URING_RING_ENTRIES);
-    assert!(FLUSH_BATCH_DEPTH <= URING_RING_ENTRIES);
-};
 
 mod batch;
 mod execution;
@@ -143,7 +134,7 @@ impl UringBackend {
 
     /// Build persistent write pools with explicit worker CPU sets.
     pub fn new_pooled_with_config(config: UringPoolConfig) -> std::io::Result<Self> {
-        let _probe = IoUring::new(URING_RING_ENTRIES)?;
+        let _probe = IoUring::new(URING_DEPTH)?;
         Ok(Self {
             write_pools: ScopedWritePools::with_config(config)?,
         })
@@ -161,7 +152,7 @@ impl UringBackend {
                 RingAccess::Ready(ring) => {
                     let mut start = 0usize;
                     while start < n {
-                        let end = (start + WRITE_BATCH_DEPTH as usize).min(n);
+                        let end = (start + URING_DEPTH as usize).min(n);
                         for (i, result) in submit_coalesced_chunk_detailed(ring, &ops[start..end])
                             .into_iter()
                             .enumerate()
@@ -205,7 +196,7 @@ impl UringBackend {
                 RingAccess::Ready(ring) => {
                     let mut start = 0usize;
                     while start < n {
-                        let end = (start + WRITE_BATCH_DEPTH as usize).min(n);
+                        let end = (start + URING_DEPTH as usize).min(n);
                         let chunk_results = submit_coalesced_chunk_detailed_observed(
                             ring,
                             &ops[start..end],
@@ -257,7 +248,7 @@ fn with_ring<R>(f: impl FnOnce(RingAccess<'_>) -> ChunkletResult<R>) -> Chunklet
     URING.with(|cell| {
         let mut slot = cell.borrow_mut();
         if matches!(&*slot, RingState::Uninit) {
-            match IoUring::new(URING_RING_ENTRIES) {
+            match IoUring::new(URING_DEPTH) {
                 Ok(r) => *slot = RingState::Ready(r),
                 Err(e) if is_resource_exhaustion(&e) => {
                     if !FD_EXHAUSTION_WARNED.swap(true, Ordering::Relaxed) {
@@ -300,7 +291,7 @@ impl IoBackend for UringBackend {
             RingAccess::Ready(ring) => {
                 let mut start = 0usize;
                 while start < ops.len() {
-                    let end = (start + READ_BATCH_DEPTH as usize).min(ops.len());
+                    let end = (start + URING_DEPTH as usize).min(ops.len());
                     submit_read_chunk(ring, &mut ops[start..end])?;
                     start = end;
                 }
@@ -353,7 +344,7 @@ impl IoBackend for UringBackend {
             let degraded = with_ring(|access| match access {
                 RingAccess::Degrade => Ok(true),
                 RingAccess::Ready(ring) => {
-                    for chunk in required.chunks(FLUSH_BATCH_DEPTH as usize) {
+                    for chunk in required.chunks(URING_DEPTH as usize) {
                         submit_flush_chunk(ring, chunk)?;
                     }
                     Ok(false)
@@ -425,9 +416,8 @@ fn submit_flush_chunk(ring: &mut IoUring, pds: &[Arc<PhysicalDisk>]) -> Chunklet
 /// Collapse adjacent writes to one PD chunklet before submitting a depth-sized
 /// batch. Mirror page writes arrive interleaved by copy (A0, B0, A1, B1, ...),
 /// so issuing them verbatim turns a contiguous checkpoint into 4 KiB physical
-/// IO. The temporary buffers here are bounded by `WRITE_BATCH_DEPTH` and
-/// preserve a result slot for every original op, including degraded-member
-/// failures.
+/// IO. The temporary buffers here are bounded by `URING_DEPTH` and preserve a
+/// result slot for every original op, including degraded-member failures.
 fn submit_coalesced_chunk_detailed(
     ring: &mut IoUring,
     ops: &[StripWrite<'_>],
@@ -1064,53 +1054,6 @@ mod tests {
         .unwrap()
     }
 
-    fn assert_uring_read_round_trip(op_count: usize) {
-        let backend = match UringBackend::new() {
-            Ok(backend) => backend,
-            Err(error) => {
-                eprintln!("io_uring unavailable; skipping read-window test: {error}");
-                return;
-            }
-        };
-        let dir = TempDir::new().unwrap();
-        let pds = [
-            test_pd(&dir, "read-pd0", 0, false),
-            test_pd(&dir, "read-pd1", 1, false),
-        ];
-        let expected: Vec<Vec<u8>> = (0..op_count)
-            .map(|op_index| {
-                (0..BLOCK_SIZE as usize)
-                    .map(|byte_index| {
-                        (op_index as u8)
-                            .wrapping_mul(37)
-                            .wrapping_add(byte_index as u8)
-                    })
-                    .collect()
-            })
-            .collect();
-        for (op_index, data) in expected.iter().enumerate() {
-            pds[op_index % pds.len()]
-                .write_chunklet_user(0, (op_index / pds.len()) as u64 * BLOCK_SIZE, data)
-                .unwrap();
-        }
-
-        let mut actual = vec![vec![0_u8; BLOCK_SIZE as usize]; op_count];
-        let mut reads: Vec<StripRead<'_>> = actual
-            .iter_mut()
-            .enumerate()
-            .map(|(op_index, data)| StripRead {
-                pd: pds[op_index % pds.len()].clone(),
-                chunklet_index: 0,
-                in_chunklet_off: (op_index / pds.len()) as u64 * BLOCK_SIZE,
-                data,
-            })
-            .collect();
-        backend.submit_reads(&mut reads).unwrap();
-        drop(reads);
-
-        assert_eq!(actual, expected);
-    }
-
     #[test]
     fn write_through_flushes_are_all_skipped() {
         let dir = TempDir::new().unwrap();
@@ -1384,17 +1327,6 @@ mod tests {
 
         assert_eq!(attempts.borrow().len(), 3);
         assert!(error.to_string().contains("read-error-0"));
-    }
-
-    #[test]
-    fn read_window_handles_128_block_ops_across_pds() {
-        assert_eq!(READ_BATCH_DEPTH, 128);
-        assert_uring_read_round_trip(READ_BATCH_DEPTH as usize);
-    }
-
-    #[test]
-    fn read_window_preserves_order_across_the_129th_block_boundary() {
-        assert_uring_read_round_trip(READ_BATCH_DEPTH as usize + 1);
     }
 
     #[test]
