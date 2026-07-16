@@ -214,6 +214,8 @@ struct Waiter {
     ticket: u64,
     class: IoClass,
     demand: Demand,
+    // True only while the owner is polling or sleeping in wait_ready().
+    grant_requested: bool,
     recorded_wait: bool,
     wait_started_at: Option<Instant>,
     accumulated_wait_ns: u64,
@@ -251,6 +253,8 @@ struct ClassState {
 #[derive(Debug)]
 struct PdState {
     classes: [ClassState; IoClass::COUNT],
+    // Last stable lane granted in each class; stale tickets wrap naturally.
+    class_grant_cursors: [Option<u64>; IoClass::COUNT],
     total_queued_blocks_max: u64,
     total_active_blocks_max: u64,
     flush_waiters: u64,
@@ -261,6 +265,7 @@ impl Default for PdState {
     fn default() -> Self {
         Self {
             classes: std::array::from_fn(|_| ClassState::default()),
+            class_grant_cursors: [None; IoClass::COUNT],
             total_queued_blocks_max: 0,
             total_active_blocks_max: 0,
             flush_waiters: 0,
@@ -413,6 +418,7 @@ impl AdmissionController {
                 ticket,
                 class,
                 demand,
+                grant_requested: false,
                 recorded_wait: false,
                 wait_started_at: None,
                 accumulated_wait_ns: 0,
@@ -424,22 +430,19 @@ impl AdmissionController {
     }
 
     fn next_admissible_ticket_for_pd(&self, state: &State, pd_id: PdId) -> Option<u64> {
+        let mut class_tickets = [None; IoClass::COUNT];
+        for class in IoClass::ALL {
+            class_tickets[class.index()] =
+                self.next_admissible_ticket_for_class(state, pd_id, class);
+        }
+
         let mut first = None;
         for waiter in state
             .waiters
             .iter()
             .filter(|waiter| waiter.demand.pd_id == pd_id)
         {
-            let next_blocks = waiter
-                .demand
-                .grant_units
-                .front()
-                .expect("queued demand has no grant unit")
-                .blocks;
-            if self
-                .admissible_budget(state, waiter)
-                .is_none_or(|budget| next_blocks > budget)
-            {
+            if class_tickets[waiter.class.index()] != Some(waiter.ticket) {
                 continue;
             }
             if first.is_none() {
@@ -452,6 +455,50 @@ impl AdmissionController {
         first
     }
 
+    fn next_admissible_ticket_for_class(
+        &self,
+        state: &State,
+        pd_id: PdId,
+        class: IoClass,
+    ) -> Option<u64> {
+        let oldest = state
+            .waiters
+            .iter()
+            .find(|waiter| waiter.demand.pd_id == pd_id && waiter.class == class)?;
+        // A smaller op may rotate ahead only when the class head already fits.
+        if !self.waiter_fits(state, oldest) {
+            return None;
+        }
+
+        let cursor = state.pds[&pd_id].class_grant_cursors[class.index()];
+        let mut wrapped = None;
+        for waiter in state
+            .waiters
+            .iter()
+            .filter(|waiter| waiter.demand.pd_id == pd_id && waiter.class == class)
+        {
+            if !waiter.grant_requested || !self.waiter_fits(state, waiter) {
+                continue;
+            }
+            wrapped.get_or_insert(waiter.ticket);
+            if cursor.is_none_or(|cursor| waiter.ticket > cursor) {
+                return Some(waiter.ticket);
+            }
+        }
+        wrapped
+    }
+
+    fn waiter_fits(&self, state: &State, waiter: &Waiter) -> bool {
+        let next_blocks = waiter
+            .demand
+            .grant_units
+            .front()
+            .expect("queued demand has no grant unit")
+            .blocks;
+        self.admissible_budget(state, waiter)
+            .is_some_and(|budget| next_blocks <= budget)
+    }
+
     fn has_background_deficit(&self, state: &State, waiter: &Waiter) -> bool {
         waiter.class.is_background()
             && state.pds[&waiter.demand.pd_id].classes[waiter.class.index()].active_blocks
@@ -459,9 +506,7 @@ impl AdmissionController {
     }
 
     fn admissible_budget(&self, state: &State, waiter: &Waiter) -> Option<u64> {
-        if self.must_yield_to_older_same_class(state, waiter)
-            || self.must_yield_to_background_deficit(state, waiter)
-        {
+        if self.must_yield_to_background_deficit(state, waiter) {
             return None;
         }
         let demand = &waiter.demand;
@@ -508,17 +553,11 @@ impl AdmissionController {
         )
     }
 
-    fn must_yield_to_older_same_class(&self, state: &State, waiter: &Waiter) -> bool {
-        state.waiters.iter().any(|older| {
-            older.ticket < waiter.ticket
-                && older.class == waiter.class
-                && older.demand.pd_id == waiter.demand.pd_id
-        })
-    }
-
     fn must_yield_to_background_deficit(&self, state: &State, waiter: &Waiter) -> bool {
         state.waiters.iter().any(|background| {
             background.ticket != waiter.ticket
+                && background.class != waiter.class
+                && background.grant_requested
                 && self.has_background_deficit(state, background)
                 && (waiter.class == IoClass::Foreground || background.ticket < waiter.ticket)
                 && background.demand.pd_id == waiter.demand.pd_id
@@ -539,6 +578,7 @@ impl AdmissionController {
             .expect("queued demand has no grant unit");
         let pd_id = waiter.demand.pd_id;
         let class = waiter.class;
+        let ticket = waiter.ticket;
         waiter.demand.blocks = waiter
             .demand
             .blocks
@@ -552,6 +592,7 @@ impl AdmissionController {
         let finished_ticket = waiter.demand.grant_units.is_empty();
 
         let pd = state.pds.get_mut(&pd_id).expect("queued PD missing");
+        pd.class_grant_cursors[class.index()] = Some(ticket);
         let active_total = pd.classes.iter().fold(0_u64, |total, class| {
             total.saturating_add(class.active_blocks)
         });
@@ -828,6 +869,20 @@ impl PendingAdmission {
         Ok(())
     }
 
+    fn set_grant_requested(&self, state: &mut State, requested: bool) {
+        for ticket in self.tickets.values() {
+            let waiter = state
+                .waiters
+                .iter_mut()
+                .find(|waiter| waiter.ticket == *ticket)
+                .expect("admission ticket disappeared");
+            if waiter.grant_requested && !requested {
+                close_wait_interval(waiter);
+            }
+            waiter.grant_requested = requested;
+        }
+    }
+
     fn take_ready(
         &mut self,
         controller: &Arc<AdmissionController>,
@@ -968,7 +1023,9 @@ impl PendingAdmission {
         }
         let controller = self.controller.clone();
         let mut state = controller.state.lock();
+        self.set_grant_requested(&mut state, true);
         let admitted = self.take_ready(&controller, &mut state, max_units);
+        self.set_grant_requested(&mut state, false);
         drop(state);
         if admitted.is_some() {
             controller.changed.notify_all();
@@ -986,8 +1043,11 @@ impl PendingAdmission {
         assert!(max_units > 0, "cannot admit zero units");
         let controller = self.controller.clone();
         let mut state = controller.state.lock();
+        self.set_grant_requested(&mut state, true);
+        controller.changed.notify_all();
         loop {
             if let Some(admitted) = self.take_ready(&controller, &mut state, max_units) {
+                self.set_grant_requested(&mut state, false);
                 drop(state);
                 controller.changed.notify_all();
                 return admitted;

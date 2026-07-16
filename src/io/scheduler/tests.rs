@@ -714,6 +714,34 @@ fn background_reservation_deficit_precedes_older_foreground() {
 }
 
 #[test]
+fn unpolled_background_reserves_its_floor_without_blocking_foreground_headroom() {
+    let scheduler =
+        controller(SchedulerConfig::new(4).with_min_active_blocks(IoClass::DrainData, 2));
+    let pd_id = PdId::new_v4();
+    let mut background = scheduler
+        .queue(IoClass::DrainData, vec![demand(pd_id, 2)])
+        .unwrap();
+    let mut foreground = scheduler
+        .queue(IoClass::Foreground, vec![demand(pd_id, 2)])
+        .unwrap();
+
+    let foreground_active = foreground
+        .try_admit_ready()
+        .expect("unpolled background demand blocked unreserved foreground credit");
+    let reserved = scheduler.snapshot().pds.pop().unwrap();
+    assert_eq!(reserved.total_active_blocks, 2);
+    assert_eq!(reserved.total_queued_blocks, 2);
+
+    let background_active = background
+        .try_admit_ready()
+        .expect("requested background demand did not receive its reserved floor");
+    let full = scheduler.snapshot().pds.pop().unwrap();
+    assert_eq!(full.total_active_blocks, 4);
+    assert_eq!(full.total_queued_blocks, 0);
+    drop((foreground_active.permit, background_active.permit));
+}
+
+#[test]
 fn safe_wave_caps_prevent_foreground_background_reservation_deadlock() {
     let config = SchedulerConfig::new(4)
         .with_min_active_blocks(IoClass::Foreground, 1)
@@ -1149,33 +1177,141 @@ fn stable_lane_ticket_blocks_later_flush_across_old_wave_boundary() {
 }
 
 #[test]
-fn younger_same_class_waits_until_stable_lane_is_fully_granted() {
+fn same_class_round_robin_fills_credit_when_older_owner_stops_polling() {
     let scheduler = controller(SchedulerConfig::new(2));
     let pd_id = PdId::new_v4();
     let mut older = scheduler
         .queue(IoClass::DrainData, vec![unit_demand(pd_id, 3)])
         .unwrap();
+    let mut younger = scheduler
+        .queue(IoClass::DrainData, vec![demand(pd_id, 1)])
+        .unwrap();
     let first = older.admit_ready_limited(1);
+
+    let younger_ready = younger
+        .try_admit_ready()
+        .expect("younger same-class lane did not fill idle credit after the older grant");
+    let full = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!((full.queued_blocks, full.active_blocks), (2, 2));
+    assert!(older.try_admit_ready().is_none());
+
+    drop((first.permit, younger_ready.permit));
+    let rest = older.admit_ready();
+    assert!(older.is_empty());
+    assert_eq!(rest.prefixes[0].units, 2);
+    drop(rest.permit);
+    let drained = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!((drained.queued_blocks, drained.active_blocks), (0, 0));
+}
+
+#[test]
+fn same_class_cursor_skips_an_eligible_owner_that_is_not_polling() {
+    let scheduler = controller(SchedulerConfig::new(4));
+    let pd_id = PdId::new_v4();
+    let mut lane_a = scheduler
+        .queue(IoClass::DrainData, vec![unit_demand(pd_id, 3)])
+        .unwrap();
+    let mut lane_b = scheduler
+        .queue(IoClass::DrainData, vec![unit_demand(pd_id, 2)])
+        .unwrap();
+
+    let a_first = lane_a.admit_ready_limited(1);
+    let b_active = lane_b
+        .try_admit_ready_limited(1)
+        .expect("lane B did not receive its first round-robin grant");
+    let a_second = lane_a
+        .try_admit_ready_limited(1)
+        .expect("lane A did not receive its second round-robin grant");
+    let mut lane_c = scheduler
+        .queue(IoClass::DrainData, vec![demand(pd_id, 1)])
+        .unwrap();
+
+    let c_active = lane_c.try_admit_ready_limited(1).expect(
+        "idle credit was stranded behind lane B even though only lane C was polling for a grant",
+    );
+    let full = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!((full.queued_blocks, full.active_blocks), (2, 4));
+
+    drop((
+        a_first.permit,
+        b_active.permit,
+        a_second.permit,
+        c_active.permit,
+    ));
+}
+
+#[test]
+fn blocked_large_same_class_head_cannot_be_bypassed_by_small_younger_op() {
+    let scheduler = controller(SchedulerConfig::new(4));
+    let pd_id = PdId::new_v4();
+    let holder = scheduler
+        .admit(IoClass::Foreground, vec![demand(pd_id, 2)])
+        .unwrap();
+    let mut older = scheduler
+        .queue(IoClass::DrainData, vec![demand(pd_id, 3)])
+        .unwrap();
     let mut younger = scheduler
         .queue(IoClass::DrainData, vec![demand(pd_id, 1)])
         .unwrap();
 
-    drop(first.permit);
-    assert!(younger.try_admit_ready().is_none());
-    let second = older.admit_ready_limited(1);
-    drop(second.permit);
-    assert!(younger.try_admit_ready().is_none());
+    assert!(older.try_admit_ready().is_none());
+    assert!(
+        younger.try_admit_ready().is_none(),
+        "younger small op bypassed a large same-class head waiting for credit"
+    );
+    drop(holder);
 
+    let large = older
+        .try_admit_ready()
+        .expect("large same-class head did not run after enough credit accumulated");
+    assert_eq!(large.prefixes[0].blocks, 3);
+    let small = younger
+        .try_admit_ready()
+        .expect("younger op did not use the final free credit after the head ran");
+    drop((large.permit, small.permit));
+}
+
+#[test]
+fn same_class_rotation_preserves_later_flush_fence_ordering() {
+    let scheduler = controller(SchedulerConfig::new(2));
+    let pd_id = PdId::new_v4();
+    let mut older = scheduler
+        .queue(IoClass::DrainData, vec![unit_demand(pd_id, 3)])
+        .unwrap();
+    let mut younger = scheduler
+        .queue(IoClass::DrainData, vec![demand(pd_id, 1)])
+        .unwrap();
+    let first = older.admit_ready_limited(1);
+    let rotated = younger
+        .try_admit_ready()
+        .expect("younger same-class lane did not receive its round-robin grant");
+
+    let (fenced_tx, fenced_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let flush_scheduler = scheduler.clone();
+    let flush = thread::spawn(move || {
+        let fence = flush_scheduler.fence(vec![pd_id]);
+        fenced_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(fence);
+    });
+    wait_until(|| scheduler.snapshot().pds[0].flush_waiters == 1);
+
+    drop((first.permit, rotated.permit));
+    assert!(fenced_rx.try_recv().is_err());
+    let middle = older.admit_ready_limited(1);
+    drop(middle.permit);
+    assert!(fenced_rx.try_recv().is_err());
     let last = older.admit_ready_limited(1);
     assert!(older.is_empty());
-    let younger_ready = younger
-        .try_admit_ready()
-        .expect("younger request stayed blocked after the older lane was fully granted");
-    let snapshot = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
-    assert_eq!((snapshot.queued_blocks, snapshot.active_blocks), (0, 2));
-    drop((last.permit, younger_ready.permit));
-    let drained = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
-    assert_eq!((drained.queued_blocks, drained.active_blocks), (0, 0));
+    assert!(fenced_rx.try_recv().is_err());
+    drop(last.permit);
+
+    fenced_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(scheduler.snapshot().pds[0].flush_fenced);
+    release_tx.send(()).unwrap();
+    flush.join().unwrap();
+    assert!(!scheduler.snapshot().pds[0].flush_fenced);
 }
 
 #[test]
@@ -1213,20 +1349,33 @@ fn partial_lane_wait_metrics_track_credit_blocking_not_max_ops_truncation() {
     assert_eq!((blocked.queued_blocks, blocked.active_blocks), (2, 2));
     assert_eq!(blocked.wait_events, 1);
     assert_eq!(blocked.wait_ns, 0);
-    {
+    let poll_wait_ns = {
         let state = scheduler.state.lock();
         let waiter = state
             .waiters
             .iter()
             .find(|waiter| waiter.ticket == ticket)
             .unwrap();
-        assert!(waiter.wait_started_at.is_some());
-        assert_eq!(waiter.accumulated_wait_ns, 0);
-    }
+        assert!(!waiter.grant_requested);
+        assert!(waiter.wait_started_at.is_none());
+        waiter.accumulated_wait_ns
+    };
 
+    let waiter_thread = thread::spawn(move || {
+        let middle = pending.admit_ready_limited(1);
+        (pending, middle)
+    });
+    wait_until(|| {
+        let state = scheduler.state.lock();
+        state
+            .waiters
+            .iter()
+            .find(|waiter| waiter.ticket == ticket)
+            .is_some_and(|waiter| waiter.grant_requested && waiter.wait_started_at.is_some())
+    });
     thread::sleep(Duration::from_millis(2));
     drop(first.permit);
-    let middle = pending.admit_ready_limited(1);
+    let (mut pending, middle) = waiter_thread.join().unwrap();
     let blocked_wait_ns = {
         let state = scheduler.state.lock();
         let waiter = state
@@ -1234,8 +1383,9 @@ fn partial_lane_wait_metrics_track_credit_blocking_not_max_ops_truncation() {
             .iter()
             .find(|waiter| waiter.ticket == ticket)
             .unwrap();
+        assert!(!waiter.grant_requested);
         assert!(waiter.wait_started_at.is_none());
-        assert!(waiter.accumulated_wait_ns > 0);
+        assert!(waiter.accumulated_wait_ns > poll_wait_ns);
         waiter.accumulated_wait_ns
     };
 
@@ -1273,6 +1423,44 @@ fn partial_lane_wait_metrics_track_credit_blocking_not_max_ops_truncation() {
     assert_eq!(fully_granted.wait_events, 0);
     assert_eq!(fully_granted.wait_ns, 0);
     drop((one.permit, two.permit));
+}
+
+#[test]
+fn nonblocking_poll_does_not_count_inflight_sleep_as_scheduler_wait() {
+    let scheduler = controller(SchedulerConfig::new(1));
+    let pd_id = PdId::new_v4();
+    let holder = scheduler
+        .admit(IoClass::Foreground, vec![demand(pd_id, 1)])
+        .unwrap();
+    let mut pending = scheduler
+        .queue(IoClass::DrainData, vec![demand(pd_id, 1)])
+        .unwrap();
+    let ticket = pending.tickets[&pd_id];
+
+    assert!(pending.try_admit_ready().is_none());
+    let wait_before_sleep = {
+        let state = scheduler.state.lock();
+        let waiter = state
+            .waiters
+            .iter()
+            .find(|waiter| waiter.ticket == ticket)
+            .unwrap();
+        assert!(!waiter.grant_requested);
+        assert!(
+            waiter.wait_started_at.is_none(),
+            "nonblocking poll left scheduler wait timing active after returning"
+        );
+        waiter.accumulated_wait_ns
+    };
+
+    thread::sleep(Duration::from_millis(5));
+    drop(holder);
+    let admitted = pending
+        .try_admit_ready()
+        .expect("pending op did not run after credit was reclaimed");
+    let settled = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!(settled.wait_ns, wait_before_sleep);
+    drop(admitted.permit);
 }
 
 #[test]
