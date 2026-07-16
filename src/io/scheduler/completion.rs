@@ -5,6 +5,7 @@ use crate::io::backend::{
 
 struct ActiveWave {
     indices: Vec<usize>,
+    granted_end: usize,
     next_to_dispatch: usize,
     remaining: usize,
 }
@@ -95,22 +96,41 @@ impl<'ops, 'data> SchedulerDispatch<'ops, 'data> {
     }
 
     fn install_admitted(&mut self, admitted: AdmittedSubset) {
-        for pd_id in &admitted.pd_ids {
+        for prefix in &admitted.prefixes {
+            let pd_id = prefix.pd_id;
             let wave = self
                 .lanes
-                .get(pd_id)
+                .get(&pd_id)
                 .and_then(|lane| lane.front())
                 .expect("admitted PD lane disappeared");
-            debug_assert_eq!(wave.pd_id, *pd_id);
-            let previous = self.active.insert(
-                *pd_id,
-                ActiveWave {
-                    indices: wave.indices.clone(),
-                    next_to_dispatch: 0,
-                    remaining: wave.indices.len(),
-                },
+            debug_assert_eq!(wave.pd_id, pd_id);
+            self.active.entry(pd_id).or_insert_with(|| ActiveWave {
+                indices: wave.indices.clone(),
+                granted_end: 0,
+                next_to_dispatch: 0,
+                remaining: wave.indices.len(),
+            });
+            let active = self.active.get_mut(&pd_id).expect("active PD disappeared");
+            let next_granted_end = active
+                .granted_end
+                .checked_add(prefix.units)
+                .expect("granted wave prefix overflow");
+            assert!(
+                next_granted_end <= active.indices.len(),
+                "grant exceeds planned PD wave"
             );
-            debug_assert!(previous.is_none(), "PD already has an active wave");
+            let expected_blocks = wave
+                .demand
+                .grant_units
+                .iter()
+                .skip(active.granted_end)
+                .take(prefix.units)
+                .fold(0_u64, |total, unit| total.saturating_add(unit.blocks));
+            assert_eq!(
+                expected_blocks, prefix.blocks,
+                "granted prefix blocks diverged from planned PD wave"
+            );
+            active.granted_end = next_granted_end;
         }
         self.permits.push(admitted.permit);
     }
@@ -132,6 +152,9 @@ impl<'ops, 'data> SchedulerDispatch<'ops, 'data> {
                 }
                 let pd_id = &pd_ids[(start + offset) % pd_ids.len()];
                 let wave = self.active.get_mut(pd_id).expect("active PD disappeared");
+                if wave.next_to_dispatch >= wave.granted_end {
+                    continue;
+                }
                 let Some(&index) = wave.indices.get(wave.next_to_dispatch) else {
                     continue;
                 };
@@ -159,9 +182,30 @@ impl<'ops, 'data> SchedulerDispatch<'ops, 'data> {
             && self.lanes.values().all(VecDeque::is_empty)
     }
 
+    fn reclaim_admitted_blocks(&self, pd_id: PdId, blocks: u64) -> u64 {
+        let mut remaining = blocks;
+        let mut released = 0_u64;
+        for permit in &self.permits {
+            if remaining == 0 {
+                break;
+            }
+            let current = permit.reclaim(&[(pd_id, remaining)]);
+            released = released.saturating_add(current);
+            remaining = remaining.saturating_sub(current);
+        }
+        released
+    }
+
     fn poll_inner(&mut self, max_ops: usize, may_wait: bool) -> WriteDispatchStatus<'data> {
         if self.protocol_error.is_some() {
             return WriteDispatchStatus::Complete;
+        }
+        if max_ops == 0 {
+            return if self.complete() {
+                WriteDispatchStatus::Complete
+            } else {
+                WriteDispatchStatus::Pending
+            };
         }
         let ready = self.take_unsent(max_ops);
         if !ready.is_empty() {
@@ -171,10 +215,10 @@ impl<'ops, 'data> SchedulerDispatch<'ops, 'data> {
             return WriteDispatchStatus::Complete;
         }
 
-        let admitted = if may_wait && self.active.is_empty() && !self.pending.is_empty() {
-            Some(self.pending.admit_ready())
+        let admitted = if may_wait && !self.pending.is_empty() {
+            Some(self.pending.admit_ready_limited(max_ops))
         } else {
-            self.pending.try_admit_ready()
+            self.pending.try_admit_ready_limited(max_ops)
         };
         if let Some(admitted) = admitted {
             self.install_admitted(admitted);
@@ -254,12 +298,7 @@ impl<'data> WriteDispatch<'data> for SchedulerDispatch<'_, 'data> {
             let blocks =
                 blocks_for_len(op.data.len()).expect("planned write length became invalid");
             let admitted_blocks = blocks.min(self.admission.config.max_active_blocks_per_pd);
-            let released = self
-                .permits
-                .iter()
-                .map(|permit| permit.reclaim(&[(pd_id, admitted_blocks)]))
-                .find(|&released| released > 0)
-                .unwrap_or(0);
+            let released = self.reclaim_admitted_blocks(pd_id, admitted_blocks);
             if released != admitted_blocks {
                 self.set_protocol_error(format!(
                     "write completion index {index} released {released}/{admitted_blocks} admitted blocks"
@@ -294,19 +333,26 @@ impl<'data> WriteDispatch<'data> for SchedulerDispatch<'_, 'data> {
         }
 
         for pd_id in finished_pds {
-            self.active.remove(&pd_id).expect("finished PD disappeared");
+            let active = self.active.remove(&pd_id).expect("finished PD disappeared");
+            assert_eq!(
+                active.granted_end,
+                active.indices.len(),
+                "PD wave completed before every op received credit"
+            );
+            assert!(
+                !self.pending.tickets.contains_key(&pd_id),
+                "PD wave completed while its stable ticket retained queued units"
+            );
             let lane = self
                 .lanes
                 .get_mut(&pd_id)
                 .expect("finished PD lane disappeared");
             let completed = lane.pop_front().expect("finished PD wave disappeared");
             debug_assert_eq!(completed.pd_id, pd_id);
-            if let Some(next) = lane.front() {
-                if let Err(message) = self.pending.enqueue(vec![next.demand.clone()]) {
-                    self.set_protocol_error(message);
-                    return;
-                }
-            }
+            assert!(
+                lane.is_empty(),
+                "one PD submit unexpectedly contains multiple tickets"
+            );
         }
     }
 }

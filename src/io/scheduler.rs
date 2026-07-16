@@ -195,11 +195,18 @@ pub struct SchedulerSnapshot {
 }
 
 #[derive(Clone, Debug)]
+struct GrantUnit {
+    blocks: u64,
+    requested_blocks: u64,
+    exclusive: bool,
+}
+
+#[derive(Clone, Debug)]
 struct Demand {
     pd_id: PdId,
     blocks: u64,
     requested_blocks: u64,
-    exclusive: bool,
+    grant_units: VecDeque<GrantUnit>,
 }
 
 #[derive(Debug)]
@@ -207,8 +214,9 @@ struct Waiter {
     ticket: u64,
     class: IoClass,
     demand: Demand,
-    enqueued_at: Instant,
     recorded_wait: bool,
+    wait_started_at: Option<Instant>,
+    accumulated_wait_ns: u64,
 }
 
 #[derive(Debug)]
@@ -288,11 +296,18 @@ struct PendingAdmission {
     controller: Arc<AdmissionController>,
     class: IoClass,
     tickets: BTreeMap<PdId, u64>,
+    grant_cursor: Option<PdId>,
 }
 
 struct AdmittedSubset {
-    pd_ids: Vec<PdId>,
+    prefixes: Vec<AdmittedPrefix>,
     permit: AdmissionPermit,
+}
+
+struct AdmittedPrefix {
+    pd_id: PdId,
+    units: usize,
+    blocks: u64,
 }
 
 struct AdmissionController {
@@ -320,6 +335,7 @@ impl AdmissionController {
             controller: self.clone(),
             class,
             tickets: BTreeMap::new(),
+            grant_cursor: None,
         };
         pending.enqueue(demands)?;
         Ok(pending)
@@ -353,8 +369,22 @@ impl AdmissionController {
         if demands.iter().any(|demand| !seen.insert(demand.pd_id)) {
             return Err("scheduler admission batch contains duplicate PD demand".into());
         }
+        for demand in &demands {
+            let charged = demand
+                .grant_units
+                .iter()
+                .try_fold(0_u64, |total, unit| total.checked_add(unit.blocks));
+            let requested = demand.grant_units.iter().try_fold(0_u64, |total, unit| {
+                total.checked_add(unit.requested_blocks)
+            });
+            if demand.grant_units.is_empty()
+                || charged != Some(demand.blocks)
+                || requested != Some(demand.requested_blocks)
+            {
+                return Err("scheduler demand has invalid grant units".into());
+            }
+        }
 
-        let enqueued_at = Instant::now();
         let mut state = self.state.lock();
         for demand in &demands {
             let queued = state
@@ -383,8 +413,9 @@ impl AdmissionController {
                 ticket,
                 class,
                 demand,
-                enqueued_at,
                 recorded_wait: false,
+                wait_started_at: None,
+                accumulated_wait_ns: 0,
             });
         }
         drop(state);
@@ -399,7 +430,16 @@ impl AdmissionController {
             .iter()
             .filter(|waiter| waiter.demand.pd_id == pd_id)
         {
-            if !self.can_admit(state, waiter) {
+            let next_blocks = waiter
+                .demand
+                .grant_units
+                .front()
+                .expect("queued demand has no grant unit")
+                .blocks;
+            if self
+                .admissible_budget(state, waiter)
+                .is_none_or(|budget| next_blocks > budget)
+            {
                 continue;
             }
             if first.is_none() {
@@ -418,13 +458,17 @@ impl AdmissionController {
                 < self.config.min_active_blocks(waiter.class)
     }
 
-    fn can_admit(&self, state: &State, waiter: &Waiter) -> bool {
+    fn admissible_budget(&self, state: &State, waiter: &Waiter) -> Option<u64> {
         if self.must_yield_to_older_same_class(state, waiter)
             || self.must_yield_to_background_deficit(state, waiter)
         {
-            return false;
+            return None;
         }
         let demand = &waiter.demand;
+        let next = demand
+            .grant_units
+            .front()
+            .expect("queued demand has no grant unit");
         let pd = &state.pds[&demand.pd_id];
         if pd.flush_fenced
             || state
@@ -432,21 +476,13 @@ impl AdmissionController {
                 .iter()
                 .any(|flush| flush.ticket < waiter.ticket && flush.pd_ids.contains(&demand.pd_id))
         {
-            return false;
+            return None;
         }
         let active_total = pd.classes.iter().fold(0_u64, |total, class| {
             total.saturating_add(class.active_blocks)
         });
-        if demand.exclusive {
-            return active_total == 0;
-        }
-        if demand.blocks
-            > self
-                .config
-                .max_active_blocks_per_pd
-                .saturating_sub(active_total)
-        {
-            return false;
+        if next.exclusive {
+            return (active_total == 0).then_some(next.blocks);
         }
 
         let protected_other = IoClass::ALL
@@ -464,12 +500,12 @@ impl AdmissionController {
                     .min(other_state.queued_blocks);
                 total.saturating_add(deficit)
             });
-        demand.blocks
-            <= self
-                .config
+        Some(
+            self.config
                 .max_active_blocks_per_pd
                 .saturating_sub(active_total)
-                .saturating_sub(protected_other)
+                .saturating_sub(protected_other),
+        )
     }
 
     fn must_yield_to_older_same_class(&self, state: &State, waiter: &Waiter) -> bool {
@@ -489,45 +525,72 @@ impl AdmissionController {
         })
     }
 
-    fn activate(&self, state: &mut State, waiter: Waiter) -> Allocation {
-        let demand = waiter.demand;
-        let pd = state.pds.get_mut(&demand.pd_id).expect("queued PD missing");
+    fn activate_one(
+        &self,
+        state: &mut State,
+        waiter: &mut Waiter,
+        admission_event: bool,
+    ) -> Allocation {
+        close_wait_interval(waiter);
+        let unit = waiter
+            .demand
+            .grant_units
+            .pop_front()
+            .expect("queued demand has no grant unit");
+        let pd_id = waiter.demand.pd_id;
+        let class = waiter.class;
+        waiter.demand.blocks = waiter
+            .demand
+            .blocks
+            .checked_sub(unit.blocks)
+            .expect("grant exceeds queued demand blocks");
+        waiter.demand.requested_blocks = waiter
+            .demand
+            .requested_blocks
+            .checked_sub(unit.requested_blocks)
+            .expect("grant exceeds queued requested blocks");
+        let finished_ticket = waiter.demand.grant_units.is_empty();
+
+        let pd = state.pds.get_mut(&pd_id).expect("queued PD missing");
         let active_total = pd.classes.iter().fold(0_u64, |total, class| {
             total.saturating_add(class.active_blocks)
         });
-        let other_reservations = IoClass::ALL
-            .iter()
-            .filter(|&&other| other != waiter.class)
-            .fold(0_u64, |total, &other| {
-                total.saturating_add(
-                    self.config
-                        .min_active_blocks(other)
-                        .saturating_sub(pd.classes[other.index()].active_blocks),
-                )
-            });
+        let other_reservations =
+            IoClass::ALL
+                .iter()
+                .filter(|&&other| other != class)
+                .fold(0_u64, |total, &other| {
+                    total.saturating_add(
+                        self.config
+                            .min_active_blocks(other)
+                            .saturating_sub(pd.classes[other.index()].active_blocks),
+                    )
+                });
         let non_borrowed_available = self
             .config
             .max_active_blocks_per_pd
             .saturating_sub(active_total)
             .saturating_sub(other_reservations);
-        let borrowed_blocks = demand.blocks.saturating_sub(non_borrowed_available);
-        let wait_ns = if waiter.recorded_wait {
-            elapsed_ns(waiter.enqueued_at)
+        let borrowed_blocks = unit.blocks.saturating_sub(non_borrowed_available);
+        let wait_ns = if finished_ticket {
+            std::mem::take(&mut waiter.accumulated_wait_ns)
         } else {
             0
         };
 
-        let class_state = &mut pd.classes[waiter.class.index()];
-        class_state.queued_blocks -= demand.blocks;
-        class_state.active_blocks += demand.blocks;
+        let class_state = &mut pd.classes[class.index()];
+        class_state.queued_blocks -= unit.blocks;
+        class_state.active_blocks += unit.blocks;
         class_state.active_blocks_max =
             class_state.active_blocks_max.max(class_state.active_blocks);
         class_state.wait_ns = class_state.wait_ns.saturating_add(wait_ns);
         class_state.wait_max_ns = class_state.wait_max_ns.max(wait_ns);
-        class_state.admission_events = class_state.admission_events.saturating_add(1);
+        if admission_event {
+            class_state.admission_events = class_state.admission_events.saturating_add(1);
+        }
         class_state.admitted_blocks = class_state
             .admitted_blocks
-            .saturating_add(demand.requested_blocks);
+            .saturating_add(unit.requested_blocks);
         if borrowed_blocks > 0 {
             class_state.borrow_events = class_state.borrow_events.saturating_add(1);
             class_state.borrowed_blocks += borrowed_blocks;
@@ -540,9 +603,9 @@ impl AdmissionController {
         }
         pd.total_active_blocks_max = pd.total_active_blocks_max.max(total_active_blocks(pd));
         Allocation {
-            pd_id: demand.pd_id,
-            class: waiter.class,
-            blocks: demand.blocks,
+            pd_id,
+            class,
+            blocks: unit.blocks,
             borrowed_blocks,
         }
     }
@@ -769,34 +832,107 @@ impl PendingAdmission {
         &mut self,
         controller: &Arc<AdmissionController>,
         state: &mut State,
+        max_units: usize,
     ) -> Option<AdmittedSubset> {
-        let ready: Vec<_> = self
+        if max_units == 0 {
+            return None;
+        }
+        let mut pd_order: Vec<_> = self.tickets.keys().copied().collect();
+        if let Some(cursor) = self.grant_cursor {
+            let start = pd_order
+                .iter()
+                .position(|pd_id| *pd_id > cursor)
+                .unwrap_or(0);
+            pd_order.rotate_left(start);
+        }
+
+        let mut allocations = BTreeMap::<PdId, Allocation>::new();
+        let mut prefixes = BTreeMap::<PdId, AdmittedPrefix>::new();
+        let mut units_left = max_units;
+        while units_left > 0 {
+            let mut progressed = false;
+            for &pd_id in &pd_order {
+                if units_left == 0 {
+                    break;
+                }
+                let Some(&ticket) = self.tickets.get(&pd_id) else {
+                    continue;
+                };
+                if controller.next_admissible_ticket_for_pd(state, pd_id) != Some(ticket) {
+                    continue;
+                }
+                let position = state
+                    .waiters
+                    .iter()
+                    .position(|waiter| waiter.ticket == ticket)
+                    .expect("admission ticket disappeared");
+                let mut waiter = state
+                    .waiters
+                    .remove(position)
+                    .expect("admission ticket disappeared");
+                debug_assert_eq!(waiter.demand.pd_id, pd_id);
+                let first_for_pd = !prefixes.contains_key(&pd_id);
+                let allocation = controller.activate_one(state, &mut waiter, first_for_pd);
+                let allocation_entry = allocations.entry(pd_id).or_insert(Allocation {
+                    pd_id,
+                    class: allocation.class,
+                    blocks: 0,
+                    borrowed_blocks: 0,
+                });
+                allocation_entry.blocks = allocation_entry.blocks.saturating_add(allocation.blocks);
+                allocation_entry.borrowed_blocks = allocation_entry
+                    .borrowed_blocks
+                    .saturating_add(allocation.borrowed_blocks);
+                let prefix = prefixes.entry(pd_id).or_insert(AdmittedPrefix {
+                    pd_id,
+                    units: 0,
+                    blocks: 0,
+                });
+                prefix.units += 1;
+                prefix.blocks = prefix.blocks.saturating_add(allocation.blocks);
+                units_left -= 1;
+                self.grant_cursor = Some(pd_id);
+                progressed = true;
+
+                if waiter.demand.grant_units.is_empty() {
+                    debug_assert_eq!(waiter.demand.blocks, 0);
+                    debug_assert_eq!(waiter.demand.requested_blocks, 0);
+                    self.tickets.remove(&pd_id);
+                } else {
+                    state.waiters.insert(position, waiter);
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+
+        for (pd_id, ticket) in self
             .tickets
             .iter()
-            .filter_map(|(&pd_id, &ticket)| {
-                (controller.next_admissible_ticket_for_pd(state, pd_id) == Some(ticket))
-                    .then_some((pd_id, ticket))
-            })
-            .collect();
-        let ready_tickets: BTreeSet<_> = ready.iter().map(|(_, ticket)| *ticket).collect();
-        let waiting_tickets: Vec<_> = self
-            .tickets
-            .values()
-            .filter(|ticket| !ready_tickets.contains(ticket))
-            .copied()
-            .collect();
-        for ticket in waiting_tickets {
+            .map(|(&pd_id, &ticket)| (pd_id, ticket))
+            .collect::<Vec<_>>()
+        {
+            let admissible = controller.next_admissible_ticket_for_pd(state, pd_id) == Some(ticket);
             let waiting_on = {
                 let waiter = state
                     .waiters
                     .iter_mut()
                     .find(|waiter| waiter.ticket == ticket)
                     .expect("admission ticket disappeared");
-                if waiter.recorded_wait {
+                if admissible {
+                    close_wait_interval(waiter);
                     None
                 } else {
-                    waiter.recorded_wait = true;
-                    Some((waiter.demand.pd_id, waiter.class.index()))
+                    if waiter.wait_started_at.is_none() {
+                        waiter.wait_started_at = Some(Instant::now());
+                    }
+                    if waiter.recorded_wait {
+                        None
+                    } else {
+                        waiter.recorded_wait = true;
+                        Some((waiter.demand.pd_id, waiter.class.index()))
+                    }
                 }
             };
             let Some((pd_id, class_index)) = waiting_on else {
@@ -809,43 +945,30 @@ impl PendingAdmission {
                 .classes[class_index];
             class_state.wait_events = class_state.wait_events.saturating_add(1);
         }
-        if ready.is_empty() {
+        if prefixes.is_empty() {
             return None;
         }
-
-        let mut allocations = Vec::with_capacity(ready.len());
-        let mut pd_ids = Vec::with_capacity(ready.len());
-        for (pd_id, ticket) in ready {
-            let position = state
-                .waiters
-                .iter()
-                .position(|waiter| waiter.ticket == ticket)
-                .expect("admission ticket disappeared");
-            let waiter = state
-                .waiters
-                .remove(position)
-                .expect("admission ticket disappeared");
-            debug_assert_eq!(waiter.demand.pd_id, pd_id);
-            allocations.push(controller.activate(state, waiter));
-            self.tickets.remove(&pd_id);
-            pd_ids.push(pd_id);
-        }
         Some(AdmittedSubset {
-            pd_ids,
+            prefixes: prefixes.into_values().collect(),
             permit: AdmissionPermit {
                 controller: controller.clone(),
-                allocations: Mutex::new(allocations),
+                allocations: Mutex::new(allocations.into_values().collect()),
             },
         })
     }
 
+    #[cfg(test)]
     fn try_admit_ready(&mut self) -> Option<AdmittedSubset> {
+        self.try_admit_ready_limited(usize::MAX)
+    }
+
+    fn try_admit_ready_limited(&mut self, max_units: usize) -> Option<AdmittedSubset> {
         if self.tickets.is_empty() {
             return None;
         }
         let controller = self.controller.clone();
         let mut state = controller.state.lock();
-        let admitted = self.take_ready(&controller, &mut state);
+        let admitted = self.take_ready(&controller, &mut state, max_units);
         drop(state);
         if admitted.is_some() {
             controller.changed.notify_all();
@@ -853,12 +976,18 @@ impl PendingAdmission {
         admitted
     }
 
+    #[cfg(test)]
     fn admit_ready(&mut self) -> AdmittedSubset {
+        self.admit_ready_limited(usize::MAX)
+    }
+
+    fn admit_ready_limited(&mut self, max_units: usize) -> AdmittedSubset {
         assert!(!self.tickets.is_empty(), "no pending admission demand");
+        assert!(max_units > 0, "cannot admit zero units");
         let controller = self.controller.clone();
         let mut state = controller.state.lock();
         loop {
-            if let Some(admitted) = self.take_ready(&controller, &mut state) {
+            if let Some(admitted) = self.take_ready(&controller, &mut state, max_units) {
                 drop(state);
                 controller.changed.notify_all();
                 return admitted;
@@ -884,6 +1013,8 @@ impl Drop for PendingAdmission {
                 .waiters
                 .remove(position)
                 .expect("pending admission ticket disappeared");
+            let mut waiter = waiter;
+            close_wait_interval(&mut waiter);
             let class_state = &mut state
                 .pds
                 .get_mut(&waiter.demand.pd_id)
@@ -892,7 +1023,7 @@ impl Drop for PendingAdmission {
             debug_assert!(class_state.queued_blocks >= waiter.demand.blocks);
             class_state.queued_blocks -= waiter.demand.blocks;
             if waiter.recorded_wait {
-                let wait_ns = elapsed_ns(waiter.enqueued_at);
+                let wait_ns = waiter.accumulated_wait_ns;
                 class_state.wait_ns = class_state.wait_ns.saturating_add(wait_ns);
                 class_state.wait_max_ns = class_state.wait_max_ns.max(wait_ns);
             }
@@ -1034,57 +1165,45 @@ fn plan_work(
 
     let mut lanes = BTreeMap::new();
     for (pd_id, work) in work_by_pd {
-        let mut waves = VecDeque::new();
-        let mut indices = Vec::new();
+        let mut indices = Vec::with_capacity(work.len());
+        let mut grant_units = VecDeque::with_capacity(work.len());
         let mut planned_blocks = 0_u64;
+        let mut requested_blocks = 0_u64;
         for (index, blocks) in work {
-            if blocks > wave_cap {
-                seal_pd_wave(&mut waves, pd_id, &mut indices, &mut planned_blocks);
-                waves.push_back(PlannedPdWave {
-                    pd_id,
-                    indices: vec![index],
-                    demand: Demand {
-                        pd_id,
-                        blocks: blocks.min(max_blocks),
-                        requested_blocks: blocks,
-                        exclusive: true,
-                    },
-                });
-                continue;
-            }
-
-            if !indices.is_empty() && blocks > wave_cap.saturating_sub(planned_blocks) {
-                seal_pd_wave(&mut waves, pd_id, &mut indices, &mut planned_blocks);
-            }
+            let exclusive = blocks > wave_cap;
+            let charged_blocks = if exclusive {
+                blocks.min(max_blocks)
+            } else {
+                blocks
+            };
             indices.push(index);
-            planned_blocks += blocks;
+            grant_units.push_back(GrantUnit {
+                blocks: charged_blocks,
+                requested_blocks: blocks,
+                exclusive,
+            });
+            planned_blocks = planned_blocks
+                .checked_add(charged_blocks)
+                .ok_or_else(|| "scheduler charged block accounting overflow".to_string())?;
+            requested_blocks = requested_blocks
+                .checked_add(blocks)
+                .ok_or_else(|| "scheduler requested block accounting overflow".to_string())?;
         }
-        seal_pd_wave(&mut waves, pd_id, &mut indices, &mut planned_blocks);
-        lanes.insert(pd_id, waves);
+        lanes.insert(
+            pd_id,
+            VecDeque::from([PlannedPdWave {
+                pd_id,
+                indices,
+                demand: Demand {
+                    pd_id,
+                    blocks: planned_blocks,
+                    requested_blocks,
+                    grant_units,
+                },
+            }]),
+        );
     }
     Ok(lanes)
-}
-
-fn seal_pd_wave(
-    waves: &mut VecDeque<PlannedPdWave>,
-    pd_id: PdId,
-    indices: &mut Vec<usize>,
-    blocks: &mut u64,
-) {
-    if indices.is_empty() {
-        return;
-    }
-    waves.push_back(PlannedPdWave {
-        pd_id,
-        indices: std::mem::take(indices),
-        demand: Demand {
-            pd_id,
-            blocks: *blocks,
-            requested_blocks: *blocks,
-            exclusive: false,
-        },
-    });
-    *blocks = 0;
 }
 
 fn admission_errors(len: usize, message: String) -> Vec<ChunkletResult<()>> {
@@ -1095,6 +1214,14 @@ fn admission_errors(len: usize, message: String) -> Vec<ChunkletResult<()>> {
 
 fn elapsed_ns(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn close_wait_interval(waiter: &mut Waiter) {
+    if let Some(started_at) = waiter.wait_started_at.take() {
+        waiter.accumulated_wait_ns = waiter
+            .accumulated_wait_ns
+            .saturating_add(elapsed_ns(started_at));
+    }
 }
 
 #[cfg(test)]

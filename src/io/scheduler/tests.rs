@@ -23,6 +23,13 @@ struct OneAtATimeDispatchBackend {
 
 struct DuplicateDispatchCompletionBackend;
 
+struct ReverseSamePdCompletionBackend;
+
+struct PrefixProbeBackend {
+    first_issued: mpsc::Sender<usize>,
+    release_first: Mutex<mpsc::Receiver<()>>,
+}
+
 struct StreamingGateBackend {
     first_pd_done: mpsc::Sender<()>,
     release_second_pd: Mutex<mpsc::Receiver<()>>,
@@ -64,6 +71,10 @@ impl IoBackend for StreamingGateBackend {
         total_ops: usize,
         dispatch: &mut dyn WriteDispatch<'a>,
     ) -> Vec<ChunkletResult<()>> {
+        assert!(matches!(
+            dispatch.poll_ready(0),
+            WriteDispatchStatus::Pending
+        ));
         let mut output: Vec<Option<ChunkletResult<()>>> =
             std::iter::repeat_with(|| None).take(total_ops).collect();
         let initial = match dispatch.wait_ready(total_ops.max(1)) {
@@ -376,6 +387,117 @@ impl IoBackend for DuplicateDispatchCompletionBackend {
     }
 }
 
+impl IoBackend for ReverseSamePdCompletionBackend {
+    fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        Ok(())
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        (0..ops.len()).map(|_| Ok(())).collect()
+    }
+
+    fn submit_writes_dispatched_with_class<'a>(
+        &self,
+        _class: IoClass,
+        total_ops: usize,
+        dispatch: &mut dyn WriteDispatch<'a>,
+    ) -> Vec<ChunkletResult<()>> {
+        assert_eq!(total_ops, 2);
+        let first = match dispatch.wait_ready(1) {
+            WriteDispatchStatus::Ready(admitted) => admitted,
+            WriteDispatchStatus::Pending => panic!("first heterogeneous op unexpectedly pending"),
+            WriteDispatchStatus::Complete => panic!("heterogeneous dispatch completed early"),
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].index, 0);
+        assert_eq!(first[0].write.data.len(), 3 * BLOCK_SIZE as usize);
+
+        let second = match dispatch.poll_ready(1) {
+            WriteDispatchStatus::Ready(admitted) => admitted,
+            WriteDispatchStatus::Pending => panic!("second heterogeneous op was not granted"),
+            WriteDispatchStatus::Complete => panic!("heterogeneous dispatch completed early"),
+        };
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].index, 1);
+        assert_eq!(second[0].write.data.len(), BLOCK_SIZE as usize);
+
+        dispatch.writes_completed(
+            &[DispatchedCompletion {
+                index: second[0].index,
+                failed: false,
+            }],
+            1,
+        );
+        dispatch.writes_completed(
+            &[DispatchedCompletion {
+                index: first[0].index,
+                failed: false,
+            }],
+            2,
+        );
+        assert!(matches!(
+            dispatch.poll_ready(1),
+            WriteDispatchStatus::Complete
+        ));
+        vec![Ok(()), Ok(())]
+    }
+
+    fn name(&self) -> &'static str {
+        "reverse-same-pd-completion"
+    }
+}
+
+impl IoBackend for PrefixProbeBackend {
+    fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        Ok(())
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        (0..ops.len()).map(|_| Ok(())).collect()
+    }
+
+    fn submit_writes_dispatched_with_class<'a>(
+        &self,
+        _class: IoClass,
+        total_ops: usize,
+        dispatch: &mut dyn WriteDispatch<'a>,
+    ) -> Vec<ChunkletResult<()>> {
+        let mut output: Vec<Option<ChunkletResult<()>>> =
+            std::iter::repeat_with(|| None).take(total_ops).collect();
+        let mut first = true;
+        loop {
+            let admitted = match dispatch.wait_ready(1) {
+                WriteDispatchStatus::Ready(admitted) => admitted,
+                WriteDispatchStatus::Pending => panic!("prefix probe unexpectedly pending"),
+                WriteDispatchStatus::Complete => break,
+            };
+            assert_eq!(admitted.len(), 1);
+            if first {
+                self.first_issued.send(admitted.len()).unwrap();
+                self.release_first.lock().recv().unwrap();
+                first = false;
+            }
+            let index = admitted[0].index;
+            output[index] = Some(Ok(()));
+            dispatch.writes_completed(
+                &[DispatchedCompletion {
+                    index,
+                    failed: false,
+                }],
+                1,
+            );
+        }
+        output
+            .into_iter()
+            .map(|result| result.expect("prefix probe omitted result"))
+            .collect()
+    }
+
+    fn name(&self) -> &'static str {
+        "prefix-probe"
+    }
+}
+
 fn controller(config: SchedulerConfig) -> Arc<AdmissionController> {
     AdmissionController::new(config).unwrap()
 }
@@ -385,7 +507,26 @@ fn demand(pd_id: PdId, blocks: u64) -> Demand {
         pd_id,
         blocks,
         requested_blocks: blocks,
-        exclusive: false,
+        grant_units: VecDeque::from([GrantUnit {
+            blocks,
+            requested_blocks: blocks,
+            exclusive: false,
+        }]),
+    }
+}
+
+fn unit_demand(pd_id: PdId, units: usize) -> Demand {
+    Demand {
+        pd_id,
+        blocks: units as u64,
+        requested_blocks: units as u64,
+        grant_units: (0..units)
+            .map(|_| GrantUnit {
+                blocks: 1,
+                requested_blocks: 1,
+                exclusive: false,
+            })
+            .collect(),
     }
 }
 
@@ -404,6 +545,14 @@ fn class_snapshot(
         .into_iter()
         .find(|current| current.class == class)
         .unwrap()
+}
+
+fn admitted_pd_ids(admitted: &AdmittedSubset) -> Vec<PdId> {
+    admitted
+        .prefixes
+        .iter()
+        .map(|prefix| prefix.pd_id)
+        .collect()
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool) {
@@ -475,13 +624,13 @@ fn multi_pd_queue_admits_ready_pd_without_waiting_for_busy_pd() {
             )
             .unwrap();
         let admitted = pending.admit_ready();
-        assert_eq!(admitted.pd_ids, vec![ready_pd]);
+        assert_eq!(admitted_pd_ids(&admitted), vec![ready_pd]);
         ready_tx.send(()).unwrap();
         release_ready_rx.recv().unwrap();
         drop(admitted.permit);
 
         let admitted = pending.admit_ready();
-        assert_eq!(admitted.pd_ids, vec![busy_pd]);
+        assert_eq!(admitted_pd_ids(&admitted), vec![busy_pd]);
         busy_tx.send(()).unwrap();
         drop(admitted.permit);
     });
@@ -774,7 +923,7 @@ fn error_and_unwind_drop_release_every_credit() {
 }
 
 #[test]
-fn plans_bounded_waves_in_original_order_and_caps_oversized_op() {
+fn plans_one_stable_lane_per_pd_and_caps_only_oversized_units() {
     let first = PdId::new_v4();
     let second = PdId::new_v4();
     let lanes = plan_work(
@@ -783,13 +932,20 @@ fn plans_bounded_waves_in_original_order_and_caps_oversized_op() {
         4,
     )
     .unwrap();
-    assert_eq!(lanes[&first].len(), 3);
-    assert_eq!(lanes[&first][0].indices, vec![0]);
-    assert_eq!(lanes[&first][1].indices, vec![2]);
-    assert_eq!(lanes[&first][2].indices, vec![4]);
-    assert_eq!(lanes[&first][2].demand.blocks, 4);
-    assert_eq!(lanes[&first][2].demand.requested_blocks, 9);
-    assert!(lanes[&first][2].demand.exclusive);
+    assert_eq!(lanes[&first].len(), 1);
+    assert_eq!(lanes[&first][0].indices, vec![0, 2, 4]);
+    assert_eq!(lanes[&first][0].demand.blocks, 10);
+    assert_eq!(lanes[&first][0].demand.requested_blocks, 15);
+    let first_units: Vec<_> = lanes[&first][0]
+        .demand
+        .grant_units
+        .iter()
+        .map(|unit| (unit.blocks, unit.requested_blocks, unit.exclusive))
+        .collect();
+    assert_eq!(
+        first_units,
+        vec![(3, 3, false), (3, 3, false), (4, 9, true)]
+    );
     assert_eq!(lanes[&second].len(), 1);
     assert_eq!(lanes[&second][0].indices, vec![1, 3]);
     assert_eq!(lanes[&second][0].demand.blocks, 3);
@@ -928,6 +1084,198 @@ fn older_pending_write_precedes_later_flush_fence() {
 }
 
 #[test]
+fn stable_lane_ticket_blocks_later_flush_across_old_wave_boundary() {
+    let config = SchedulerConfig::new(4)
+        .with_min_active_blocks(IoClass::Foreground, 1)
+        .with_min_active_blocks(IoClass::DrainData, 1);
+    assert_eq!(config.wave_cap(IoClass::DrainData), 3);
+    let scheduler = controller(config);
+    let pd_id = PdId::new_v4();
+    let mut pending = scheduler
+        .queue(IoClass::DrainData, vec![unit_demand(pd_id, 5)])
+        .unwrap();
+    let stable_ticket = pending.tickets[&pd_id];
+
+    let first = pending.admit_ready_limited(3);
+    assert_eq!(first.prefixes[0].units, 3);
+    assert_eq!(pending.tickets[&pd_id], stable_ticket);
+    let after_first = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!(
+        (after_first.queued_blocks, after_first.active_blocks),
+        (2, 3)
+    );
+
+    let (fenced_tx, fenced_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let flush_scheduler = scheduler.clone();
+    let flush = thread::spawn(move || {
+        let fence = flush_scheduler.fence(vec![pd_id]);
+        fenced_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(fence);
+    });
+    wait_until(|| scheduler.snapshot().pds[0].flush_waiters == 1);
+
+    drop(first.permit);
+    let queued_only = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!(
+        (queued_only.queued_blocks, queued_only.active_blocks),
+        (2, 0)
+    );
+    assert!(fenced_rx.try_recv().is_err());
+
+    let second = pending.admit_ready_limited(1);
+    assert_eq!(pending.tickets[&pd_id], stable_ticket);
+    let split = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!((split.queued_blocks, split.active_blocks), (1, 1));
+    drop(second.permit);
+    assert!(fenced_rx.try_recv().is_err());
+
+    let last = pending.admit_ready_limited(1);
+    assert!(pending.is_empty());
+    let active_only = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!(
+        (active_only.queued_blocks, active_only.active_blocks),
+        (0, 1)
+    );
+    assert!(fenced_rx.try_recv().is_err());
+
+    drop(last.permit);
+    fenced_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(scheduler.snapshot().pds[0].flush_fenced);
+    release_tx.send(()).unwrap();
+    flush.join().unwrap();
+    assert!(!scheduler.snapshot().pds[0].flush_fenced);
+}
+
+#[test]
+fn younger_same_class_waits_until_stable_lane_is_fully_granted() {
+    let scheduler = controller(SchedulerConfig::new(2));
+    let pd_id = PdId::new_v4();
+    let mut older = scheduler
+        .queue(IoClass::DrainData, vec![unit_demand(pd_id, 3)])
+        .unwrap();
+    let first = older.admit_ready_limited(1);
+    let mut younger = scheduler
+        .queue(IoClass::DrainData, vec![demand(pd_id, 1)])
+        .unwrap();
+
+    drop(first.permit);
+    assert!(younger.try_admit_ready().is_none());
+    let second = older.admit_ready_limited(1);
+    drop(second.permit);
+    assert!(younger.try_admit_ready().is_none());
+
+    let last = older.admit_ready_limited(1);
+    assert!(older.is_empty());
+    let younger_ready = younger
+        .try_admit_ready()
+        .expect("younger request stayed blocked after the older lane was fully granted");
+    let snapshot = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!((snapshot.queued_blocks, snapshot.active_blocks), (0, 2));
+    drop((last.permit, younger_ready.permit));
+    let drained = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!((drained.queued_blocks, drained.active_blocks), (0, 0));
+}
+
+#[test]
+fn dropping_partially_granted_lane_clears_queued_and_active_credit() {
+    let scheduler = controller(SchedulerConfig::new(4));
+    let pd_id = PdId::new_v4();
+    let mut pending = scheduler
+        .queue(IoClass::DrainMeta, vec![unit_demand(pd_id, 5)])
+        .unwrap();
+    let admitted = pending.admit_ready_limited(2);
+    let partial = class_snapshot(&scheduler, pd_id, IoClass::DrainMeta);
+    assert_eq!((partial.queued_blocks, partial.active_blocks), (3, 2));
+
+    drop(pending);
+    let active_only = class_snapshot(&scheduler, pd_id, IoClass::DrainMeta);
+    assert_eq!(
+        (active_only.queued_blocks, active_only.active_blocks),
+        (0, 2)
+    );
+    drop(admitted.permit);
+    let drained = class_snapshot(&scheduler, pd_id, IoClass::DrainMeta);
+    assert_eq!((drained.queued_blocks, drained.active_blocks), (0, 0));
+}
+
+#[test]
+fn partial_lane_wait_metrics_track_credit_blocking_not_max_ops_truncation() {
+    let pd_id = PdId::new_v4();
+    let scheduler = controller(SchedulerConfig::new(2));
+    let mut pending = scheduler
+        .queue(IoClass::DrainData, vec![unit_demand(pd_id, 4)])
+        .unwrap();
+    let ticket = pending.tickets[&pd_id];
+    let first = pending.admit_ready_limited(2);
+    let blocked = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!((blocked.queued_blocks, blocked.active_blocks), (2, 2));
+    assert_eq!(blocked.wait_events, 1);
+    assert_eq!(blocked.wait_ns, 0);
+    {
+        let state = scheduler.state.lock();
+        let waiter = state
+            .waiters
+            .iter()
+            .find(|waiter| waiter.ticket == ticket)
+            .unwrap();
+        assert!(waiter.wait_started_at.is_some());
+        assert_eq!(waiter.accumulated_wait_ns, 0);
+    }
+
+    thread::sleep(Duration::from_millis(2));
+    drop(first.permit);
+    let middle = pending.admit_ready_limited(1);
+    let blocked_wait_ns = {
+        let state = scheduler.state.lock();
+        let waiter = state
+            .waiters
+            .iter()
+            .find(|waiter| waiter.ticket == ticket)
+            .unwrap();
+        assert!(waiter.wait_started_at.is_none());
+        assert!(waiter.accumulated_wait_ns > 0);
+        waiter.accumulated_wait_ns
+    };
+
+    thread::sleep(Duration::from_millis(2));
+    {
+        let state = scheduler.state.lock();
+        let waiter = state
+            .waiters
+            .iter()
+            .find(|waiter| waiter.ticket == ticket)
+            .unwrap();
+        assert!(waiter.wait_started_at.is_none());
+        assert_eq!(waiter.accumulated_wait_ns, blocked_wait_ns);
+    }
+
+    let last = pending.admit_ready_limited(1);
+    let settled = class_snapshot(&scheduler, pd_id, IoClass::DrainData);
+    assert_eq!(settled.wait_events, 1);
+    assert_eq!(settled.wait_ns, blocked_wait_ns);
+    assert_eq!(settled.wait_max_ns, blocked_wait_ns);
+    drop((middle.permit, last.permit));
+
+    let no_wait_pd = PdId::new_v4();
+    let no_wait_scheduler = controller(SchedulerConfig::new(4));
+    let mut max_ops_limited = no_wait_scheduler
+        .queue(IoClass::DrainData, vec![unit_demand(no_wait_pd, 2)])
+        .unwrap();
+    let one = max_ops_limited.admit_ready_limited(1);
+    let truncated = class_snapshot(&no_wait_scheduler, no_wait_pd, IoClass::DrainData);
+    assert_eq!((truncated.queued_blocks, truncated.active_blocks), (1, 1));
+    assert_eq!(truncated.wait_events, 0);
+    assert_eq!(truncated.wait_ns, 0);
+    let two = max_ops_limited.admit_ready_limited(1);
+    let fully_granted = class_snapshot(&no_wait_scheduler, no_wait_pd, IoClass::DrainData);
+    assert_eq!(fully_granted.wait_events, 0);
+    assert_eq!(fully_granted.wait_ns, 0);
+    drop((one.permit, two.permit));
+}
+
+#[test]
 fn multi_pd_flush_waits_for_ready_and_blocked_older_writes() {
     let scheduler = controller(SchedulerConfig::new(1));
     let ready_pd = PdId::new_v4();
@@ -942,7 +1290,7 @@ fn multi_pd_flush_waits_for_ready_and_blocked_older_writes() {
         )
         .unwrap();
     let ready = pending.admit_ready();
-    assert_eq!(ready.pd_ids, vec![ready_pd]);
+    assert_eq!(admitted_pd_ids(&ready), vec![ready_pd]);
 
     let (fenced_tx, fenced_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -968,7 +1316,7 @@ fn multi_pd_flush_waits_for_ready_and_blocked_older_writes() {
     assert!(fenced_rx.try_recv().is_err());
     drop(blocked);
     let blocked_ready = pending.admit_ready();
-    assert_eq!(blocked_ready.pd_ids, vec![blocked_pd]);
+    assert_eq!(admitted_pd_ids(&blocked_ready), vec![blocked_pd]);
     assert!(fenced_rx.try_recv().is_err());
 
     drop(blocked_ready.permit);
@@ -1665,4 +2013,107 @@ fn duplicate_dispatch_completion_returns_protocol_error_and_releases_credit() {
         .pds
         .iter()
         .all(|pd| pd.total_active_blocks == 0 && pd.total_queued_blocks == 0));
+}
+
+#[test]
+fn reverse_same_pd_completion_reclaims_across_prefix_permits() {
+    let (_dir, pds) = make_test_pds(1);
+    let scheduled = ScheduledBackend::new(
+        Arc::new(ReverseSamePdCompletionBackend),
+        SchedulerConfig::new(4),
+    )
+    .unwrap();
+    let large = vec![1_u8; (3 * BLOCK_SIZE) as usize];
+    let small = vec![2_u8; BLOCK_SIZE as usize];
+    let ops = [
+        StripWrite {
+            pd: pds[0].clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 0,
+            data: &large,
+        },
+        StripWrite {
+            pd: pds[0].clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 3 * BLOCK_SIZE,
+            data: &small,
+        },
+    ];
+
+    assert!(scheduled
+        .submit_writes_detailed_with_class(IoClass::DrainData, &ops)
+        .into_iter()
+        .all(|result| result.is_ok()));
+    let snapshot = class_snapshot(&scheduled.admission, pds[0].pd_id(), IoClass::DrainData);
+    assert_eq!((snapshot.queued_blocks, snapshot.active_blocks), (0, 0));
+    assert_eq!(snapshot.admitted_blocks, 4);
+    assert_eq!(snapshot.reclaimed_blocks, 4);
+    assert_eq!(snapshot.completed_blocks, 4);
+}
+
+#[test]
+fn available_credit_issues_prefix_without_waiting_for_whole_wave() {
+    let (_dir, pds) = make_test_pds(1);
+    let pd = pds[0].clone();
+    let (first_issued_tx, first_issued_rx) = mpsc::channel();
+    let (release_first_tx, release_first_rx) = mpsc::channel();
+    let scheduled = Arc::new(
+        ScheduledBackend::new(
+            Arc::new(PrefixProbeBackend {
+                first_issued: first_issued_tx,
+                release_first: Mutex::new(release_first_rx),
+            }),
+            SchedulerConfig::new(8),
+        )
+        .unwrap(),
+    );
+    let mut holder = Some(
+        scheduled
+            .admission
+            .admit(IoClass::Foreground, vec![demand(pd.pd_id(), 3)])
+            .unwrap(),
+    );
+
+    let submitter = scheduled.clone();
+    let submit_pd = pd.clone();
+    let submit = thread::spawn(move || {
+        let data: Vec<_> = (0..6)
+            .map(|marker| vec![marker; BLOCK_SIZE as usize])
+            .collect();
+        let ops: Vec<_> = data
+            .iter()
+            .enumerate()
+            .map(|(index, data)| StripWrite {
+                pd: submit_pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: (index as u64) * BLOCK_SIZE,
+                data,
+            })
+            .collect();
+        submitter.submit_writes_detailed_with_class(IoClass::DrainData, &ops)
+    });
+
+    let issued_before_full_wave_fit = first_issued_rx.recv_timeout(Duration::from_millis(100));
+    if issued_before_full_wave_fit.is_err() {
+        drop(holder.take());
+        first_issued_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+    }
+    if issued_before_full_wave_fit.is_ok() {
+        let drain = class_snapshot(&scheduled.admission, pd.pd_id(), IoClass::DrainData);
+        assert_eq!(drain.queued_blocks, 5);
+        assert_eq!(drain.active_blocks, 1);
+        drop(holder.take());
+    }
+    release_first_tx.send(()).unwrap();
+    assert!(submit
+        .join()
+        .unwrap()
+        .into_iter()
+        .all(|result| result.is_ok()));
+    assert!(
+        issued_before_full_wave_fit.is_ok(),
+        "free per-PD credit was stranded behind an all-or-nothing wave"
+    );
 }
