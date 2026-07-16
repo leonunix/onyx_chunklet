@@ -26,7 +26,7 @@ impl RawDevice {
     pub fn open(path: &Path) -> ChunkletResult<Self> {
         let (file, direct_io) = Self::open_direct(path)?;
         let size_bytes = Self::query_size(&file, path)?;
-        let sync_required = Self::detect_sync_required(&file, path);
+        let sync_required = Self::detect_sync_required(&file, path, direct_io);
         Ok(Self {
             file,
             size_bytes,
@@ -173,8 +173,19 @@ impl RawDevice {
         }
     }
 
-    fn detect_sync_required(file: &File, path: &Path) -> bool {
+    fn detect_sync_required(file: &File, path: &Path, direct_io: bool) -> bool {
         use std::os::unix::fs::FileTypeExt;
+
+        // O_DIRECT was rejected and we silently fell back to buffered IO: every
+        // write now lands in the page cache and only reaches the device on an
+        // explicit fsync, regardless of the device's hardware write-cache mode.
+        // Skipping the flush here would drop acknowledged writes on power loss,
+        // so buffered handles ALWAYS require sync. The sysfs "write through"
+        // fast path below is only sound because O_DIRECT bypasses the page
+        // cache and a write-through device holds no volatile cache to flush.
+        if !direct_io {
+            return true;
+        }
 
         let Ok(metadata) = file.metadata() else {
             return true;
@@ -329,5 +340,22 @@ mod tests {
         let path = dir.path().join("pd");
         let raw = RawDevice::open_or_create(&path, 8 * 1024 * 1024).unwrap();
         assert!(raw.sync_required());
+    }
+
+    #[test]
+    fn buffered_fallback_always_requires_sync() {
+        // When O_DIRECT is rejected and we fall back to buffered IO, sync must
+        // never be skipped — even if the block device reports "write through" —
+        // because acknowledged writes still sit in the page cache. This locks
+        // the `!direct_io` short-circuit ahead of the sysfs fast path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pd");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        assert!(RawDevice::detect_sync_required(&file, &path, false));
     }
 }
