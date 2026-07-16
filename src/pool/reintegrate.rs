@@ -192,7 +192,7 @@ impl Pool {
 
         // Build the pool-wide view from a SURVIVOR (never the old PD): swap the
         // tombstone entry (old_pd_id @ seq, FAILED) for the fresh PD (new @ seq).
-        let (spare_pct, ld_bytes, cpg_bytes, new_pd_list, pool_pd_count) = {
+        let (spare_pct, ld_bytes, cpg_bytes, new_pd_list, pool_pd_count, shared_backend) = {
             let s = self.state.read();
             let survivor = s
                 .pds
@@ -222,8 +222,14 @@ impl Pool {
                 body.cpg_list_bytes.clone(),
                 list,
                 body.pool_pd_count,
+                survivor.backend(),
             )
         };
+
+        // No descriptor can issue new IO to old_pd_id after the safety gate.
+        // Remove its scheduler/execution state before wiping so a stale queued
+        // or active request aborts the replacement without touching the disk.
+        shared_backend.unregister_pd(old_pd_id)?;
 
         // Wipe + initialize the returned device as the fresh PD (init zeroes the
         // bitmap → no stale Used chunklets survive, so no fsck needed).
@@ -238,16 +244,6 @@ impl Pool {
             ld_bytes,
             cpg_bytes,
         )?;
-        if let Some(existing) = self
-            .state
-            .read()
-            .pds
-            .iter()
-            .find(|(id, _)| **id != old_pd_id)
-            .map(|(_, pd)| pd.clone())
-        {
-            new_pd.set_backend(existing.backend());
-        }
 
         // Commit the swapped pd_list to every SURVIVING PD (ascending PdId via
         // the BTreeMap). The old PD is excluded: its device is the one we just
@@ -269,6 +265,10 @@ impl Pool {
                 Ok(())
             })?;
         }
+        // Registration is deliberately after every fallible manifest write:
+        // an aborted replacement must not leave the fresh ID in shared lane
+        // accounting when it was never published into PoolState.
+        new_pd.set_backend(shared_backend);
 
         // Publish: drop the tombstone, install the fresh PD at the reused seq.
         {
@@ -337,6 +337,17 @@ impl Pool {
                 ));
             }
         }
+        // The failed ID is unreachable to new IO and has no live handle. Do
+        // this before the first manifest write so scheduler/execution backlog
+        // rejects retirement without partially changing the on-disk pd_list.
+        self.state
+            .read()
+            .pds
+            .values()
+            .next()
+            .expect("checked non-empty surviving PD set")
+            .backend()
+            .unregister_pd(old_pd_id)?;
 
         // Re-dense: survivors keep their flags, take new seqs [0, count-1) in
         // ascending old-seq order. Descriptors reference PdId (not seq), so no

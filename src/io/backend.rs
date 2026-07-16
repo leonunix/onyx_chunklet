@@ -252,6 +252,14 @@ pub trait IoBackend: Send + Sync {
         let _ = pd_id;
     }
 
+    /// Forget a pool member after lifecycle code has made it unreachable to
+    /// new IO. Stateful wrappers reject removal while the PD still owns queued
+    /// or active work; plain backends inherit this no-op.
+    fn unregister_pd(&self, pd_id: PdId) -> ChunkletResult<()> {
+        let _ = pd_id;
+        Ok(())
+    }
+
     /// Scheduler metrics when this backend is an admission wrapper.
     fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
         None

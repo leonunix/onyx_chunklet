@@ -1560,6 +1560,35 @@ fn registration_and_snapshot_include_idle_pd_limits_and_totals() {
 }
 
 #[test]
+fn unregister_pd_requires_idle_unfenced_state() {
+    let scheduler = controller(SchedulerConfig::new(8));
+    let pd_id = PdId::new_v4();
+    scheduler.register_pd(pd_id);
+
+    let active = scheduler
+        .admit(IoClass::Foreground, vec![demand(pd_id, 1)])
+        .unwrap();
+    let error = scheduler.unregister_pd(pd_id).unwrap_err().to_string();
+    assert!(
+        error.contains("active_blocks=1"),
+        "unexpected error: {error}"
+    );
+    drop(active);
+
+    let fence = scheduler.fence(vec![pd_id]);
+    let error = scheduler.unregister_pd(pd_id).unwrap_err().to_string();
+    assert!(
+        error.contains("flush_fenced=true"),
+        "unexpected error: {error}"
+    );
+    drop(fence);
+
+    assert!(scheduler.unregister_pd(pd_id).unwrap());
+    assert!(scheduler.snapshot().pds.is_empty());
+    assert!(!scheduler.unregister_pd(pd_id).unwrap());
+}
+
+#[test]
 fn tls_class_restores_after_nested_scope_and_panic() {
     assert_eq!(current_io_class(), IoClass::Foreground);
     with_io_class(IoClass::DrainData, || {

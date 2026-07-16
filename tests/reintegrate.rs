@@ -10,7 +10,7 @@
 mod common;
 
 use common::{make_pool, open_full, open_subset, path_for_member, pattern};
-use onyx_chunklet::io::RawDevice;
+use onyx_chunklet::io::{IoBackendKind, RawDevice, SchedulerConfig};
 use onyx_chunklet::pool::{LdSpec, RebalanceOptions};
 use onyx_chunklet::{LdId, Pool, PoolConfig};
 use std::path::PathBuf;
@@ -73,6 +73,17 @@ fn reintegrate_replace_in_place_keeps_count_and_data() {
     // "returns" as a fresh raw device.
     let pool2 = open_subset(&paths, &[victim_idx]);
     assert_eq!(pool2.pd_count(), 9, "victim missing → 9 live PDs");
+    pool2
+        .set_scheduled_io_backend(IoBackendKind::Sync, SchedulerConfig::new(64))
+        .unwrap();
+    let survivor = pool2.list_pds()[0].pd_id;
+    pool2.pd(survivor).unwrap().backend().register_pd(victim_pd);
+    assert!(pool2
+        .io_scheduler_snapshot()
+        .unwrap()
+        .pds
+        .iter()
+        .any(|pd| pd.pd_id == victim_pd));
 
     let returned = RawDevice::open(&paths[victim_idx]).unwrap();
     let report = pool2.reintegrate_wipe(returned).unwrap();
@@ -85,6 +96,9 @@ fn reintegrate_replace_in_place_keeps_count_and_data() {
         "already unreferenced → no safety-gate rebuild"
     );
     assert_eq!(report.referenced_members_blocking, 0);
+    let scheduler_pds = pool2.io_scheduler_snapshot().unwrap().pds;
+    assert!(scheduler_pds.iter().all(|pd| pd.pd_id != victim_pd));
+    assert!(scheduler_pds.iter().any(|pd| pd.pd_id == report.new_pd_id));
     assert_eq!(
         pool2.pd_count(),
         10,
@@ -302,7 +316,24 @@ fn retire_failed_pd_redenses_and_reopens_smaller() {
     // Pulled for good → reopen degraded, then retire the tombstone.
     let pool2 = open_subset(&paths, &[victim_idx]);
     assert_eq!(pool2.pd_count(), 9);
+    pool2
+        .set_scheduled_io_backend(IoBackendKind::Sync, SchedulerConfig::new(64))
+        .unwrap();
+    let survivor = pool2.list_pds()[0].pd_id;
+    pool2.pd(survivor).unwrap().backend().register_pd(victim_pd);
+    assert!(pool2
+        .io_scheduler_snapshot()
+        .unwrap()
+        .pds
+        .iter()
+        .any(|pd| pd.pd_id == victim_pd));
     pool2.retire_failed_pd(victim_pd).unwrap();
+    assert!(pool2
+        .io_scheduler_snapshot()
+        .unwrap()
+        .pds
+        .iter()
+        .all(|pd| pd.pd_id != victim_pd));
     assert_eq!(
         pool2.pd_count(),
         9,

@@ -362,6 +362,17 @@ impl IoBackend for ExecutionPoolBackend {
         self.write_pools.register_pd(pd_id);
     }
 
+    fn unregister_pd(&self, pd_id: PdId) -> ChunkletResult<()> {
+        let removed = self.write_pools.unregister_pd(pd_id)?;
+        if let Err(error) = self.inner.unregister_pd(pd_id) {
+            if removed {
+                self.write_pools.register_pd(pd_id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
         self.inner.scheduler_snapshot()
     }
@@ -508,6 +519,44 @@ impl ScopedWritePools {
     fn register_pd(&self, pd_id: PdId) {
         self.foreground_lanes.register_pd(pd_id);
         self.background_lanes.register_pd(pd_id);
+    }
+
+    fn unregister_pd(&self, pd_id: PdId) -> ChunkletResult<bool> {
+        // Take both lane maps in their fixed foreground -> background order so
+        // the idle check and removal are atomic across the two worker pools.
+        let mut foreground = self.foreground_lanes.state.lock();
+        let mut background = self.background_lanes.state.lock();
+        let foreground_status = foreground
+            .pds
+            .get(&pd_id)
+            .map(|lane| (lane.waiters.len(), lane.active))
+            .unwrap_or_default();
+        let background_status = background
+            .pds
+            .get(&pd_id)
+            .map(|lane| (lane.waiters.len(), lane.active))
+            .unwrap_or_default();
+        if foreground_status != (0, 0) || background_status != (0, 0) {
+            return Err(ChunkletError::Invariant(format!(
+                "cannot unregister execution PD {pd_id}: foreground_queued={} \
+                 foreground_active={} background_queued={} background_active={}",
+                foreground_status.0, foreground_status.1, background_status.0, background_status.1
+            )));
+        }
+
+        let removed =
+            foreground.pds.remove(&pd_id).is_some() | background.pds.remove(&pd_id).is_some();
+        if removed {
+            self.foreground_lanes.rebalance(&mut foreground);
+            self.background_lanes.rebalance(&mut background);
+        }
+        drop(background);
+        drop(foreground);
+        if removed {
+            self.foreground_lanes.changed.notify_all();
+            self.background_lanes.changed.notify_all();
+        }
+        Ok(removed)
     }
 
     pub(super) fn submit<'a, F>(
@@ -1270,6 +1319,32 @@ mod tests {
         assert_eq!(foreground.iter().map(|(_, cap, _)| cap).sum::<usize>(), 5);
         assert_eq!(background.len(), 3);
         assert_eq!(background.iter().map(|(_, cap, _)| cap).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn unregister_pd_removes_scheduler_and_rebalances_execution_lanes() {
+        let first = PdId::new_v4();
+        let second = PdId::new_v4();
+        let scheduled = Arc::new(
+            ScheduledBackend::new(Arc::new(SyncBackend), SchedulerConfig::new(1)).unwrap(),
+        );
+        scheduled.register_pd(first);
+        scheduled.register_pd(second);
+
+        let execution = ExecutionPoolBackend::new(scheduled, UringPoolConfig::new(5, 3)).unwrap();
+        execution.unregister_pd(first).unwrap();
+
+        let scheduler = execution.scheduler_snapshot().unwrap();
+        assert_eq!(scheduler.pds.len(), 1);
+        assert_eq!(scheduler.pds[0].pd_id, second);
+        assert_eq!(
+            execution.write_pools.foreground_lanes.snapshot(),
+            vec![(second, 5, 0)]
+        );
+        assert_eq!(
+            execution.write_pools.background_lanes.snapshot(),
+            vec![(second, 3, 0)]
+        );
     }
 
     #[test]

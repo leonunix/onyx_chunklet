@@ -823,6 +823,43 @@ impl AdmissionController {
         self.state.lock().pds.entry(pd_id).or_default();
     }
 
+    fn unregister_pd(&self, pd_id: PdId) -> ChunkletResult<bool> {
+        let mut state = self.state.lock();
+        let Some(pd) = state.pds.get(&pd_id) else {
+            return Ok(false);
+        };
+        let queued_blocks = total_queued_blocks(pd);
+        let active_blocks = total_active_blocks(pd);
+        let admission_waiters = state
+            .waiters
+            .iter()
+            .filter(|waiter| waiter.demand.pd_id == pd_id)
+            .count();
+        let flush_queue_refs = state
+            .flush_waiters
+            .iter()
+            .filter(|waiter| waiter.pd_ids.contains(&pd_id))
+            .count();
+        if queued_blocks > 0
+            || active_blocks > 0
+            || pd.flush_waiters > 0
+            || pd.flush_fenced
+            || admission_waiters > 0
+            || flush_queue_refs > 0
+        {
+            return Err(ChunkletError::Invariant(format!(
+                "cannot unregister scheduler PD {pd_id}: queued_blocks={queued_blocks} \
+                 active_blocks={active_blocks} admission_waiters={admission_waiters} \
+                 flush_waiters={} flush_queue_refs={flush_queue_refs} flush_fenced={}",
+                pd.flush_waiters, pd.flush_fenced
+            )));
+        }
+        state.pds.remove(&pd_id);
+        drop(state);
+        self.changed.notify_all();
+        Ok(true)
+    }
+
     fn record_completion(
         &self,
         class: IoClass,
@@ -1149,6 +1186,17 @@ impl IoBackend for ScheduledBackend {
     fn register_pd(&self, pd_id: PdId) {
         self.admission.register_pd(pd_id);
         self.inner.register_pd(pd_id);
+    }
+
+    fn unregister_pd(&self, pd_id: PdId) -> ChunkletResult<()> {
+        let removed = self.admission.unregister_pd(pd_id)?;
+        if let Err(error) = self.inner.unregister_pd(pd_id) {
+            if removed {
+                self.admission.register_pd(pd_id);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn scheduler_snapshot(&self) -> Option<SchedulerSnapshot> {
