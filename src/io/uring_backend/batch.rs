@@ -149,7 +149,7 @@ fn ensure_atomic_push_capacity(
     Ok(())
 }
 
-fn assert_ring_clean(ring: &mut IoUring, context: &str) {
+pub(super) fn assert_ring_clean(ring: &mut IoUring, context: &str) {
     let pending_cqes = ring.completion().len();
     let pending_sqes = ring.submission().len();
     if pending_cqes != 0 || pending_sqes != 0 {
@@ -248,7 +248,7 @@ fn drive_completions_observed(
     })
 }
 
-fn fatal_wait(context: &str, error: &std::io::Error) -> ! {
+pub(super) fn fatal_wait(context: &str, error: &std::io::Error) -> ! {
     tracing::error!(%error, context, "fatal io_uring wait with possibly in-flight borrowed buffers");
     eprintln!(
         "fatal: {context}: io_uring wait failed with possibly in-flight borrowed buffers: {error}"
@@ -256,7 +256,7 @@ fn fatal_wait(context: &str, error: &std::io::Error) -> ! {
     std::process::abort()
 }
 
-fn fatal_protocol(context: &str, reason: &str) -> ! {
+pub(super) fn fatal_protocol(context: &str, reason: &str) -> ! {
     tracing::error!(context, reason, "fatal dirty io_uring reuse");
     eprintln!("fatal: {context}: dirty io_uring reuse: {reason}");
     std::process::abort()

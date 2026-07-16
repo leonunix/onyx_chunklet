@@ -5,13 +5,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::io::{IoBackendKind, RawDevice, WriteCompletionObserver};
+use crate::io::{
+    DispatchedCompletion, IoBackendKind, RawDevice, WriteCompletionObserver, WriteDispatch,
+    WriteDispatchStatus,
+};
 use crate::{Pool, PoolConfig};
 
 struct CountingBackend {
     calls: AtomicUsize,
     max_ops: AtomicUsize,
 }
+
+#[derive(Default)]
+struct OneAtATimeDispatchBackend {
+    pds: Mutex<Vec<PdId>>,
+}
+
+struct DuplicateDispatchCompletionBackend;
 
 struct StreamingGateBackend {
     first_pd_done: mpsc::Sender<()>,
@@ -46,6 +56,85 @@ impl IoBackend for StreamingGateBackend {
             self.followup_done.send(()).unwrap();
             vec![Ok(())]
         }
+    }
+
+    fn submit_writes_dispatched_with_class<'a>(
+        &self,
+        _class: IoClass,
+        total_ops: usize,
+        dispatch: &mut dyn WriteDispatch<'a>,
+    ) -> Vec<ChunkletResult<()>> {
+        let mut output: Vec<Option<ChunkletResult<()>>> =
+            std::iter::repeat_with(|| None).take(total_ops).collect();
+        let initial = match dispatch.wait_ready(total_ops.max(1)) {
+            WriteDispatchStatus::Ready(initial) => initial,
+            WriteDispatchStatus::Pending => panic!("initial dispatch unexpectedly pending"),
+            WriteDispatchStatus::Complete => return Vec::new(),
+        };
+        if initial.len() == 1 {
+            let index = initial[0].index;
+            output[index] = Some(Ok(()));
+            dispatch.writes_completed(
+                &[DispatchedCompletion {
+                    index,
+                    failed: false,
+                }],
+                5,
+            );
+            self.followup_done.send(()).unwrap();
+        } else {
+            assert_eq!(initial.len(), 2);
+            let fast_position = initial
+                .iter()
+                .position(|admitted| admitted.write.data.first() == Some(&1))
+                .expect("streaming gate fast write missing");
+            let slow_position = 1 - fast_position;
+            let fast_index = initial[fast_position].index;
+            let slow_index = initial[slow_position].index;
+            output[fast_index] = Some(Err(ChunkletError::Invariant("first result".into())));
+            dispatch.writes_completed(
+                &[DispatchedCompletion {
+                    index: fast_index,
+                    failed: true,
+                }],
+                10,
+            );
+            self.first_pd_done.send(()).unwrap();
+
+            if let WriteDispatchStatus::Ready(refill) = dispatch.poll_ready(total_ops.max(1)) {
+                for admitted in refill {
+                    output[admitted.index] = Some(Ok(()));
+                    dispatch.writes_completed(
+                        &[DispatchedCompletion {
+                            index: admitted.index,
+                            failed: false,
+                        }],
+                        5,
+                    );
+                    self.followup_done.send(()).unwrap();
+                }
+            }
+
+            self.release_second_pd.lock().recv().unwrap();
+            output[slow_index] = Some(Ok(()));
+            dispatch.writes_completed(
+                &[DispatchedCompletion {
+                    index: slow_index,
+                    failed: false,
+                }],
+                80,
+            );
+        }
+        output
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(ChunkletError::Invariant(
+                        "streaming gate omitted dispatched result".into(),
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn name(&self) -> &'static str {
@@ -202,6 +291,88 @@ impl IoBackend for CountingBackend {
 
     fn name(&self) -> &'static str {
         "counting"
+    }
+}
+
+impl IoBackend for OneAtATimeDispatchBackend {
+    fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        Ok(())
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        (0..ops.len()).map(|_| Ok(())).collect()
+    }
+
+    fn submit_writes_dispatched_with_class<'a>(
+        &self,
+        _class: IoClass,
+        total_ops: usize,
+        dispatch: &mut dyn WriteDispatch<'a>,
+    ) -> Vec<ChunkletResult<()>> {
+        let mut output: Vec<Option<ChunkletResult<()>>> =
+            std::iter::repeat_with(|| None).take(total_ops).collect();
+        loop {
+            let admitted = match dispatch.wait_ready(1) {
+                WriteDispatchStatus::Ready(admitted) => admitted,
+                WriteDispatchStatus::Pending => {
+                    panic!("one-at-a-time dispatch unexpectedly pending")
+                }
+                WriteDispatchStatus::Complete => break,
+            };
+            assert_eq!(admitted.len(), 1);
+            let admitted = &admitted[0];
+            self.pds.lock().push(admitted.write.pd.pd_id());
+            output[admitted.index] = Some(Ok(()));
+            dispatch.writes_completed(
+                &[DispatchedCompletion {
+                    index: admitted.index,
+                    failed: false,
+                }],
+                1,
+            );
+        }
+        output
+            .into_iter()
+            .map(|result| result.expect("one-at-a-time backend omitted result"))
+            .collect()
+    }
+
+    fn name(&self) -> &'static str {
+        "one-at-a-time-dispatch"
+    }
+}
+
+impl IoBackend for DuplicateDispatchCompletionBackend {
+    fn submit_reads(&self, _ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        Ok(())
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        (0..ops.len()).map(|_| Ok(())).collect()
+    }
+
+    fn submit_writes_dispatched_with_class<'a>(
+        &self,
+        _class: IoClass,
+        total_ops: usize,
+        dispatch: &mut dyn WriteDispatch<'a>,
+    ) -> Vec<ChunkletResult<()>> {
+        let admitted = match dispatch.wait_ready(total_ops.max(1)) {
+            WriteDispatchStatus::Ready(admitted) => admitted,
+            WriteDispatchStatus::Pending => panic!("duplicate backend unexpectedly pending"),
+            WriteDispatchStatus::Complete => return Vec::new(),
+        };
+        let index = admitted[0].index;
+        let completion = DispatchedCompletion {
+            index,
+            failed: false,
+        };
+        dispatch.writes_completed(&[completion, completion], 1);
+        (0..total_ops).map(|_| Ok(())).collect()
+    }
+
+    fn name(&self) -> &'static str {
+        "duplicate-dispatch-completion"
     }
 }
 
@@ -1325,6 +1496,71 @@ fn streaming_completion_reclaims_fast_pd_before_slow_pd_returns() {
 }
 
 #[test]
+fn streaming_completion_refills_same_call_fast_pd_before_slow_pd_returns() {
+    let (_dir, pds) = make_test_pds(2);
+    let fast_pd = pds[0].clone();
+    let slow_pd = pds[1].clone();
+    let (first_pd_done_tx, first_pd_done_rx) = mpsc::channel();
+    let (release_second_pd_tx, release_second_pd_rx) = mpsc::channel();
+    let (followup_done_tx, followup_done_rx) = mpsc::channel();
+    let inner = Arc::new(StreamingGateBackend {
+        first_pd_done: first_pd_done_tx,
+        release_second_pd: Mutex::new(release_second_pd_rx),
+        followup_done: followup_done_tx,
+    });
+    let scheduled = Arc::new(ScheduledBackend::new(inner, SchedulerConfig::new(1)).unwrap());
+
+    let submitter = scheduled.clone();
+    let submit_fast_pd = fast_pd.clone();
+    let submit = thread::spawn(move || {
+        let first_fast_data = vec![1_u8; BLOCK_SIZE as usize];
+        let slow_data = vec![2_u8; BLOCK_SIZE as usize];
+        let second_fast_data = vec![3_u8; BLOCK_SIZE as usize];
+        let ops = [
+            StripWrite {
+                pd: submit_fast_pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &first_fast_data,
+            },
+            StripWrite {
+                pd: slow_pd,
+                chunklet_index: 0,
+                in_chunklet_off: 0,
+                data: &slow_data,
+            },
+            StripWrite {
+                pd: submit_fast_pd,
+                chunklet_index: 0,
+                in_chunklet_off: BLOCK_SIZE,
+                data: &second_fast_data,
+            },
+        ];
+        submitter.submit_writes_detailed_with_class(IoClass::DrainData, &ops)
+    });
+
+    first_pd_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let refilled_before_slow = followup_done_rx.recv_timeout(Duration::from_millis(100));
+    release_second_pd_tx.send(()).unwrap();
+    let results = submit.join().unwrap();
+
+    assert!(
+        refilled_before_slow.is_ok(),
+        "same-call fast-PD lane stayed coupled to the slow PD"
+    );
+    assert!(results[0].is_err());
+    assert!(results[1].is_ok());
+    assert!(results[2].is_ok());
+    assert!(scheduled
+        .snapshot()
+        .pds
+        .iter()
+        .all(|pd| pd.total_active_blocks == 0 && pd.total_queued_blocks == 0));
+}
+
+#[test]
 fn streaming_completion_panic_reclaims_unreported_pd_credit() {
     let (_dir, pds) = make_test_pds(2);
     let scheduled = ScheduledBackend::new(
@@ -1365,4 +1601,68 @@ fn streaming_completion_panic_reclaims_unreported_pd_credit() {
             .sum::<u64>(),
         2
     );
+}
+
+#[test]
+fn one_slot_refill_rotates_across_ready_pds() {
+    let (_dir, pds) = make_test_pds(3);
+    let inner = Arc::new(OneAtATimeDispatchBackend::default());
+    let scheduled = ScheduledBackend::new(inner.clone(), SchedulerConfig::new(2)).unwrap();
+    let data: Vec<_> = (0..6)
+        .map(|marker| vec![marker; BLOCK_SIZE as usize])
+        .collect();
+    let mut ops = Vec::new();
+    for round in 0..2 {
+        for (pd_index, pd) in pds.iter().enumerate() {
+            let index = round * pds.len() + pd_index;
+            ops.push(StripWrite {
+                pd: pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: (round as u64) * BLOCK_SIZE,
+                data: &data[index],
+            });
+        }
+    }
+
+    assert!(scheduled
+        .submit_writes_detailed_with_class(IoClass::DrainData, &ops)
+        .into_iter()
+        .all(|result| result.is_ok()));
+    let issued = inner.pds.lock();
+    assert_eq!(issued.len(), 6);
+    assert_eq!(
+        issued[..3].iter().copied().collect::<BTreeSet<_>>().len(),
+        3
+    );
+    assert_eq!(issued[0], issued[3]);
+    assert_eq!(issued[1], issued[4]);
+    assert_eq!(issued[2], issued[5]);
+}
+
+#[test]
+fn duplicate_dispatch_completion_returns_protocol_error_and_releases_credit() {
+    let (_dir, pds) = make_test_pds(1);
+    let scheduled = ScheduledBackend::new(
+        Arc::new(DuplicateDispatchCompletionBackend),
+        SchedulerConfig::new(1),
+    )
+    .unwrap();
+    let data = vec![1_u8; BLOCK_SIZE as usize];
+    let ops = [StripWrite {
+        pd: pds[0].clone(),
+        chunklet_index: 0,
+        in_chunklet_off: 0,
+        data: &data,
+    }];
+
+    let results = scheduled.submit_writes_detailed_with_class(IoClass::DrainData, &ops);
+    assert!(matches!(
+        &results[0],
+        Err(ChunkletError::Invariant(message)) if message.contains("protocol failed")
+    ));
+    let snapshot = scheduled.snapshot();
+    assert!(snapshot
+        .pds
+        .iter()
+        .all(|pd| pd.total_active_blocks == 0 && pd.total_queued_blocks == 0));
 }

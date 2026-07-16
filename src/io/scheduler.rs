@@ -765,78 +765,105 @@ impl PendingAdmission {
         Ok(())
     }
 
+    fn take_ready(
+        &mut self,
+        controller: &Arc<AdmissionController>,
+        state: &mut State,
+    ) -> Option<AdmittedSubset> {
+        let ready: Vec<_> = self
+            .tickets
+            .iter()
+            .filter_map(|(&pd_id, &ticket)| {
+                (controller.next_admissible_ticket_for_pd(state, pd_id) == Some(ticket))
+                    .then_some((pd_id, ticket))
+            })
+            .collect();
+        let ready_tickets: BTreeSet<_> = ready.iter().map(|(_, ticket)| *ticket).collect();
+        let waiting_tickets: Vec<_> = self
+            .tickets
+            .values()
+            .filter(|ticket| !ready_tickets.contains(ticket))
+            .copied()
+            .collect();
+        for ticket in waiting_tickets {
+            let waiting_on = {
+                let waiter = state
+                    .waiters
+                    .iter_mut()
+                    .find(|waiter| waiter.ticket == ticket)
+                    .expect("admission ticket disappeared");
+                if waiter.recorded_wait {
+                    None
+                } else {
+                    waiter.recorded_wait = true;
+                    Some((waiter.demand.pd_id, waiter.class.index()))
+                }
+            };
+            let Some((pd_id, class_index)) = waiting_on else {
+                continue;
+            };
+            let class_state = &mut state
+                .pds
+                .get_mut(&pd_id)
+                .expect("queued PD missing")
+                .classes[class_index];
+            class_state.wait_events = class_state.wait_events.saturating_add(1);
+        }
+        if ready.is_empty() {
+            return None;
+        }
+
+        let mut allocations = Vec::with_capacity(ready.len());
+        let mut pd_ids = Vec::with_capacity(ready.len());
+        for (pd_id, ticket) in ready {
+            let position = state
+                .waiters
+                .iter()
+                .position(|waiter| waiter.ticket == ticket)
+                .expect("admission ticket disappeared");
+            let waiter = state
+                .waiters
+                .remove(position)
+                .expect("admission ticket disappeared");
+            debug_assert_eq!(waiter.demand.pd_id, pd_id);
+            allocations.push(controller.activate(state, waiter));
+            self.tickets.remove(&pd_id);
+            pd_ids.push(pd_id);
+        }
+        Some(AdmittedSubset {
+            pd_ids,
+            permit: AdmissionPermit {
+                controller: controller.clone(),
+                allocations: Mutex::new(allocations),
+            },
+        })
+    }
+
+    fn try_admit_ready(&mut self) -> Option<AdmittedSubset> {
+        if self.tickets.is_empty() {
+            return None;
+        }
+        let controller = self.controller.clone();
+        let mut state = controller.state.lock();
+        let admitted = self.take_ready(&controller, &mut state);
+        drop(state);
+        if admitted.is_some() {
+            controller.changed.notify_all();
+        }
+        admitted
+    }
+
     fn admit_ready(&mut self) -> AdmittedSubset {
         assert!(!self.tickets.is_empty(), "no pending admission demand");
-        let mut state = self.controller.state.lock();
+        let controller = self.controller.clone();
+        let mut state = controller.state.lock();
         loop {
-            let ready: Vec<_> = self
-                .tickets
-                .iter()
-                .filter_map(|(&pd_id, &ticket)| {
-                    (self.controller.next_admissible_ticket_for_pd(&state, pd_id) == Some(ticket))
-                        .then_some((pd_id, ticket))
-                })
-                .collect();
-            let ready_tickets: BTreeSet<_> = ready.iter().map(|(_, ticket)| *ticket).collect();
-            let waiting_tickets: Vec<_> = self
-                .tickets
-                .values()
-                .filter(|ticket| !ready_tickets.contains(ticket))
-                .copied()
-                .collect();
-            for ticket in waiting_tickets {
-                let waiting_on = {
-                    let waiter = state
-                        .waiters
-                        .iter_mut()
-                        .find(|waiter| waiter.ticket == ticket)
-                        .expect("admission ticket disappeared");
-                    if waiter.recorded_wait {
-                        None
-                    } else {
-                        waiter.recorded_wait = true;
-                        Some((waiter.demand.pd_id, waiter.class.index()))
-                    }
-                };
-                let Some((pd_id, class_index)) = waiting_on else {
-                    continue;
-                };
-                let class_state = &mut state
-                    .pds
-                    .get_mut(&pd_id)
-                    .expect("queued PD missing")
-                    .classes[class_index];
-                class_state.wait_events = class_state.wait_events.saturating_add(1);
-            }
-            if !ready.is_empty() {
-                let mut allocations = Vec::with_capacity(ready.len());
-                let mut pd_ids = Vec::with_capacity(ready.len());
-                for (pd_id, ticket) in ready {
-                    let position = state
-                        .waiters
-                        .iter()
-                        .position(|waiter| waiter.ticket == ticket)
-                        .expect("admission ticket disappeared");
-                    let waiter = state
-                        .waiters
-                        .remove(position)
-                        .expect("admission ticket disappeared");
-                    debug_assert_eq!(waiter.demand.pd_id, pd_id);
-                    allocations.push(self.controller.activate(&mut state, waiter));
-                    self.tickets.remove(&pd_id);
-                    pd_ids.push(pd_id);
-                }
+            if let Some(admitted) = self.take_ready(&controller, &mut state) {
                 drop(state);
-                self.controller.changed.notify_all();
-                return AdmittedSubset {
-                    pd_ids,
-                    permit: AdmissionPermit {
-                        controller: self.controller.clone(),
-                        allocations: Mutex::new(allocations),
-                    },
-                };
+                controller.changed.notify_all();
+                return admitted;
             }
-            self.controller.changed.wait(&mut state);
+            controller.changed.wait(&mut state);
         }
     }
 }

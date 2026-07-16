@@ -31,7 +31,8 @@ use io_uring::{opcode, squeue, types, IoUring};
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::aligned::AlignedBuf;
 use crate::io::backend::{
-    IoBackend, IoExecutionSnapshot, StripRead, StripWrite, UringPoolConfig, WriteCompletionObserver,
+    submit_dispatched_blocking, IoBackend, IoExecutionSnapshot, StripRead, StripWrite,
+    UringPoolConfig, WriteCompletionObserver, WriteDispatch,
 };
 use crate::io::scheduler::{current_io_class, IoClass};
 use crate::pd::PhysicalDisk;
@@ -42,6 +43,7 @@ const MAX_COALESCED_WRITE_BYTES: usize = 256 * 1024;
 
 mod batch;
 mod execution;
+mod stream;
 
 use batch::{push_batch, wait_and_drain, wait_and_drain_observed, ValidatedCompletion};
 pub(crate) use execution::ExecutionPoolBackend;
@@ -333,6 +335,33 @@ impl IoBackend for UringBackend {
             );
         }
         Self::submit_writes_detailed_inline_observed(ops, observer, Instant::now())
+    }
+
+    fn submit_writes_dispatched_with_class<'a>(
+        &self,
+        class: IoClass,
+        total_ops: usize,
+        dispatch: &mut dyn WriteDispatch<'a>,
+    ) -> Vec<ChunkletResult<()>> {
+        if self.write_pools.has_pool(class) {
+            return submit_dispatched_blocking(self, class, total_ops, dispatch);
+        }
+        let streamed = with_ring(|access| match access {
+            RingAccess::Ready(ring) => {
+                Ok(Some(stream::submit_dispatched(ring, total_ops, dispatch)))
+            }
+            RingAccess::Degrade => Ok(None),
+        });
+        match streamed {
+            Ok(Some(results)) => results,
+            Ok(None) => submit_dispatched_blocking(self, class, total_ops, dispatch),
+            Err(error) => {
+                let message = error.to_string();
+                (0..total_ops)
+                    .map(|_| Err(ChunkletError::Io(std::io::Error::other(message.clone()))))
+                    .collect()
+            }
+        }
     }
 
     fn execution_snapshot(&self) -> Option<IoExecutionSnapshot> {

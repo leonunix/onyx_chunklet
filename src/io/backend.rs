@@ -113,6 +113,132 @@ pub trait WriteCompletionObserver: Send + Sync {
     fn writes_completed(&self, op_indices: &[usize], service_ns: u64);
 }
 
+struct IgnoreWriteCompletions;
+
+impl WriteCompletionObserver for IgnoreWriteCompletions {
+    fn writes_completed(&self, _op_indices: &[usize], _service_ns: u64) {}
+}
+
+/// One scheduler-admitted write. `index` always refers to the original input
+/// position, while `write` keeps borrowing the caller-owned payload for no
+/// longer than the surrounding synchronous backend call.
+#[derive(Clone)]
+pub struct DispatchedWrite<'a> {
+    pub index: usize,
+    pub write: StripWrite<'a>,
+}
+
+/// Terminal status reported by a driven backend after an admitted write no
+/// longer has any kernel or retry IO referencing its payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchedCompletion {
+    pub index: usize,
+    pub failed: bool,
+}
+
+/// Result of polling a synchronous write source. Backends must not call
+/// `wait_ready` while they still own in-flight writes: doing so could wait on
+/// scheduler credit while the same thread is responsible for harvesting the
+/// CQEs which release that credit.
+pub enum WriteDispatchStatus<'a> {
+    Ready(Vec<DispatchedWrite<'a>>),
+    Pending,
+    Complete,
+}
+
+/// Scoped producer used by admission wrappers to refill a caller-owned backend
+/// as individual PD completions arrive. Implementations return borrowed writes,
+/// but the backend method itself remains synchronous, so no `StripWrite` can
+/// escape the caller stack.
+pub trait WriteDispatch<'a> {
+    fn poll_ready(&mut self, max_ops: usize) -> WriteDispatchStatus<'a>;
+
+    fn wait_ready(&mut self, max_ops: usize) -> WriteDispatchStatus<'a>;
+
+    fn writes_completed(&mut self, completions: &[DispatchedCompletion], service_ns: u64);
+}
+
+pub(crate) fn submit_dispatched_blocking<'a, B: IoBackend + ?Sized>(
+    backend: &B,
+    class: IoClass,
+    total_ops: usize,
+    dispatch: &mut dyn WriteDispatch<'a>,
+) -> Vec<ChunkletResult<()>> {
+    let mut output: Vec<Option<ChunkletResult<()>>> =
+        std::iter::repeat_with(|| None).take(total_ops).collect();
+    loop {
+        match dispatch.wait_ready(usize::MAX) {
+            WriteDispatchStatus::Ready(admitted) => {
+                if admitted.is_empty() {
+                    return output
+                        .into_iter()
+                        .map(|result| {
+                            result.unwrap_or_else(|| {
+                                Err(crate::error::ChunkletError::Invariant(
+                                    "write dispatch returned an empty ready set".into(),
+                                ))
+                            })
+                        })
+                        .collect();
+                }
+                let writes: Vec<_> = admitted
+                    .iter()
+                    .map(|admitted| admitted.write.clone())
+                    .collect();
+                let service_started = std::time::Instant::now();
+                let mut results = backend
+                    .submit_writes_detailed_observed_with_class(
+                        class,
+                        &writes,
+                        &IgnoreWriteCompletions,
+                    )
+                    .into_iter();
+                let service_ns = service_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                let mut completions = Vec::with_capacity(admitted.len());
+                for admitted in admitted {
+                    let result = results.next().unwrap_or_else(|| {
+                        Err(crate::error::ChunkletError::Invariant(
+                            "driven IO backend returned too few write results".into(),
+                        ))
+                    });
+                    let failed = result.is_err();
+                    if let Some(slot) = output.get_mut(admitted.index) {
+                        *slot = Some(result);
+                    }
+                    completions.push(DispatchedCompletion {
+                        index: admitted.index,
+                        failed,
+                    });
+                }
+                dispatch.writes_completed(&completions, service_ns);
+            }
+            WriteDispatchStatus::Pending => {
+                return output
+                    .into_iter()
+                    .map(|result| {
+                        result.unwrap_or_else(|| {
+                            Err(crate::error::ChunkletError::Invariant(
+                                "write dispatch wait returned without ready work".into(),
+                            ))
+                        })
+                    })
+                    .collect();
+            }
+            WriteDispatchStatus::Complete => break,
+        }
+    }
+    output
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or_else(|| {
+                Err(crate::error::ChunkletError::Invariant(
+                    "driven IO backend omitted a write result".into(),
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Cross-PD batched IO backend. Backends MUST block until every write in
 /// `ops` is durable on its respective PD (or short-circuit on the first
 /// error and report it).
@@ -182,6 +308,19 @@ pub trait IoBackend: Send + Sync {
             );
         }
         results
+    }
+
+    /// Completion-driven synchronous write entry point. The default adapter is
+    /// intentionally conservative: it drains each ready set before requesting
+    /// another. CQE-aware backends override this to keep independent PD lanes
+    /// populated from one caller-local completion loop.
+    fn submit_writes_dispatched_with_class<'a>(
+        &self,
+        class: IoClass,
+        total_ops: usize,
+        dispatch: &mut dyn WriteDispatch<'a>,
+    ) -> Vec<ChunkletResult<()>> {
+        submit_dispatched_blocking(self, class, total_ops, dispatch)
     }
 
     /// First-error convenience over [`Self::submit_writes_detailed`]: issue and
