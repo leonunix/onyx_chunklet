@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use io_uring::{opcode, types, IoUring};
 
-use super::batch::{assert_ring_clean, fatal_protocol, fatal_wait};
+use super::batch::{assert_ring_clean, fatal_wait};
 use super::{coalesced_write_groups, elapsed_ns, is_direct_aligned, AlignedBuf};
 use crate::error::{ChunkletError, ChunkletResult};
 use crate::io::backend::{
@@ -63,6 +63,7 @@ struct DispatchState {
     source_complete: bool,
     panic: Option<Box<dyn Any + Send>>,
     failure: Option<DispatchFailure>,
+    completion_protocol_error: Option<String>,
 }
 
 impl DispatchState {
@@ -71,11 +72,12 @@ impl DispatchState {
             source_complete: false,
             panic: None,
             failure: None,
+            completion_protocol_error: None,
         }
     }
 
     fn stopped(&self) -> bool {
-        self.panic.is_some() || self.failure.is_some()
+        self.panic.is_some() || self.failure.is_some() || self.completion_protocol_error.is_some()
     }
 
     fn fail(&mut self, message: impl Into<String>) {
@@ -83,6 +85,17 @@ impl DispatchState {
             self.failure = Some(DispatchFailure {
                 message: message.into(),
             });
+        }
+    }
+
+    fn fail_completion_protocol(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        tracing::error!(
+            reason = %message,
+            "io_uring completion protocol violation; draining owned slots before failing batch"
+        );
+        if self.completion_protocol_error.is_none() {
+            self.completion_protocol_error = Some(message);
         }
     }
 }
@@ -144,39 +157,38 @@ pub(super) fn submit_dispatched<'a>(
             }
         }
 
-        harvested.extend(wait_for_completions(ring));
+        let waited = wait_for_completions(ring);
+        if let Some(message) = waited.protocol_error {
+            state.fail_completion_protocol(message);
+        }
+        harvested.extend(waited.completions);
         let mut terminal = Vec::new();
         let mut service_ns = 0_u64;
         while let Some((user_data, result)) = harvested.pop_front() {
-            let slot_index = (user_data & SLOT_MASK) as usize;
-            let generation = user_data >> SLOT_BITS;
-            let Some(slot) = slots.get_mut(slot_index) else {
-                fatal_protocol(
-                    "io_uring dispatched write",
-                    &format!("CQE slot {slot_index} outside depth {STREAM_DEPTH}"),
-                );
+            // Do not consume ownership until both slot and generation match.
+            // A malformed CQE is not proof that the current slot's borrowed
+            // payload reached a terminal state, so leave it installed and wait
+            // for its exact CQE before returning the poisoned batch.
+            let slot_index = match validate_completion_slot(user_data, slots.len(), |index| {
+                slots[index].as_ref().map(|inflight| inflight.generation)
+            }) {
+                Ok(slot_index) => slot_index,
+                Err(message) => {
+                    state.fail_completion_protocol(message);
+                    continue;
+                }
             };
-            let Some(inflight) = slot.take() else {
-                fatal_protocol(
-                    "io_uring dispatched write",
-                    &format!("duplicate or inactive CQE slot {slot_index}"),
-                );
-            };
-            if inflight.generation != generation {
-                fatal_protocol(
-                    "io_uring dispatched write",
-                    &format!(
-                        "stale CQE slot {slot_index} generation {generation}, expected {}",
-                        inflight.generation
-                    ),
-                );
+            let inflight = slots[slot_index]
+                .take()
+                .expect("validated completion slot remains active");
+            let tracked_active = slots.iter().filter(|slot| slot.is_some()).count();
+            if active != tracked_active.saturating_add(1) {
+                state.fail_completion_protocol(format!(
+                    "tracked {active} in-flight writes before CQE, but slot table held {}",
+                    tracked_active.saturating_add(1)
+                ));
             }
-            active = active.checked_sub(1).unwrap_or_else(|| {
-                fatal_protocol(
-                    "io_uring dispatched write",
-                    "CQE arrived with zero tracked in-flight writes",
-                )
-            });
+            active = tracked_active;
             service_ns = service_ns.max(elapsed_ns(inflight.submitted_at));
             let processed = catch_unwind(AssertUnwindSafe(|| {
                 let result = terminal_result(&inflight, result);
@@ -223,8 +235,25 @@ pub(super) fn submit_dispatched<'a>(
     }
 
     assert_ring_clean(ring, "io_uring dispatched write");
-    if let Some(payload) = state.panic {
+    if let Some(payload) = state.panic.take() {
         resume_unwind(payload);
+    }
+    finish_output(output, state)
+}
+
+fn finish_output(
+    output: Vec<Option<ChunkletResult<()>>>,
+    state: DispatchState,
+) -> Vec<ChunkletResult<()>> {
+    if let Some(message) = state.completion_protocol_error {
+        return output
+            .into_iter()
+            .map(|_| {
+                Err(ChunkletError::Invariant(format!(
+                    "io_uring completion protocol failed: {message}"
+                )))
+            })
+            .collect();
     }
     let failure = state.failure.map(|failure| failure.message);
     output
@@ -237,6 +266,27 @@ pub(super) fn submit_dispatched<'a>(
             })
         })
         .collect()
+}
+
+fn validate_completion_slot(
+    user_data: u64,
+    depth: usize,
+    generation_at: impl FnOnce(usize) -> Option<u64>,
+) -> Result<usize, String> {
+    let slot_index = (user_data & SLOT_MASK) as usize;
+    let generation = user_data >> SLOT_BITS;
+    if slot_index >= depth {
+        return Err(format!("CQE slot {slot_index} outside depth {depth}"));
+    }
+    let Some(expected_generation) = generation_at(slot_index) else {
+        return Err(format!("duplicate or inactive CQE slot {slot_index}"));
+    };
+    if expected_generation != generation {
+        return Err(format!(
+            "stale CQE slot {slot_index} generation {generation}, expected {expected_generation}"
+        ));
+    }
+    Ok(slot_index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -518,25 +568,37 @@ fn queue_prepared<'a>(
     Ok(())
 }
 
-fn wait_for_completions(ring: &mut IoUring) -> Vec<(u64, i32)> {
+struct WaitedCompletions {
+    completions: Vec<(u64, i32)>,
+    protocol_error: Option<String>,
+}
+
+fn wait_for_completions(ring: &mut IoUring) -> WaitedCompletions {
+    let mut empty_waits = 0_u64;
     loop {
         match ring.submit_and_wait(1) {
-            Ok(_) => break,
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => fatal_wait("io_uring dispatched write", &error),
         }
+        let completions: Vec<_> = ring
+            .completion()
+            .map(|completion| (completion.user_data(), completion.result()))
+            .collect();
+        if completions.is_empty() {
+            // Returning here could release payloads whose SQEs are still in
+            // flight. Keep their slots owned and retry the wait; if no exact
+            // completion ever arrives this caller remains isolated here.
+            empty_waits = empty_waits.saturating_add(1);
+            continue;
+        }
+        return WaitedCompletions {
+            completions,
+            protocol_error: (empty_waits != 0).then(|| {
+                format!("submit_and_wait reported success without a CQE {empty_waits} time(s)")
+            }),
+        };
     }
-    let completions: Vec<_> = ring
-        .completion()
-        .map(|completion| (completion.user_data(), completion.result()))
-        .collect();
-    if completions.is_empty() {
-        fatal_protocol(
-            "io_uring dispatched write",
-            "submit_and_wait reported success without a CQE",
-        );
-    }
-    completions
 }
 
 fn drain_after_unwind<'a>(
@@ -546,32 +608,31 @@ fn drain_after_unwind<'a>(
 ) {
     while slots.iter().any(Option::is_some) {
         if harvested.is_empty() {
-            harvested.extend(wait_for_completions(ring));
-        }
-        while let Some((user_data, result)) = harvested.pop_front() {
-            let slot_index = (user_data & SLOT_MASK) as usize;
-            let generation = user_data >> SLOT_BITS;
-            let Some(slot) = slots.get_mut(slot_index) else {
-                fatal_protocol(
-                    "io_uring dispatched panic drain",
-                    &format!("CQE slot {slot_index} outside depth {STREAM_DEPTH}"),
-                );
-            };
-            let Some(inflight) = slot.take() else {
-                fatal_protocol(
-                    "io_uring dispatched panic drain",
-                    &format!("duplicate or inactive CQE slot {slot_index}"),
-                );
-            };
-            if inflight.generation != generation {
-                fatal_protocol(
-                    "io_uring dispatched panic drain",
-                    &format!(
-                        "stale CQE slot {slot_index} generation {generation}, expected {}",
-                        inflight.generation
-                    ),
+            let waited = wait_for_completions(ring);
+            if let Some(message) = waited.protocol_error {
+                tracing::error!(
+                    reason = %message,
+                    "io_uring completion protocol violation while draining after unwind"
                 );
             }
+            harvested.extend(waited.completions);
+        }
+        while let Some((user_data, result)) = harvested.pop_front() {
+            let slot_index = match validate_completion_slot(user_data, slots.len(), |index| {
+                slots[index].as_ref().map(|inflight| inflight.generation)
+            }) {
+                Ok(slot_index) => slot_index,
+                Err(message) => {
+                    tracing::error!(
+                        reason = %message,
+                        "io_uring completion protocol violation while draining after unwind"
+                    );
+                    continue;
+                }
+            };
+            let inflight = slots[slot_index]
+                .take()
+                .expect("validated completion slot remains active");
             // A positive short CQE is not terminal until the exact fallback no
             // longer references the payload. Ignore any second panic here; the
             // original unwind is resumed only after every slot is terminal.
@@ -620,7 +681,9 @@ fn notify_completed(
     service_ns: u64,
     state: &mut DispatchState,
 ) {
-    if completions.is_empty() || state.stopped() {
+    // A malformed CQE stops refill and poisons the returned batch, but exact
+    // slot+generation matches still release scheduler credits while we drain.
+    if completions.is_empty() || state.panic.is_some() || state.failure.is_some() {
         return;
     }
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
@@ -742,6 +805,45 @@ mod tests {
             prepared[0].payload.as_slice().len(),
             2 * crate::types::BLOCK_SIZE as usize
         );
+    }
+
+    #[test]
+    fn invalid_cqe_does_not_consume_active_generation() {
+        let generations = [Some(7_u64), None];
+        let stale = (6_u64 << SLOT_BITS) | 0;
+        let error = validate_completion_slot(stale, generations.len(), |index| generations[index])
+            .unwrap_err();
+        assert!(error.contains("stale CQE slot 0"));
+
+        let inactive = (7_u64 << SLOT_BITS) | 1;
+        let error =
+            validate_completion_slot(inactive, generations.len(), |index| generations[index])
+                .unwrap_err();
+        assert!(error.contains("inactive CQE slot 1"));
+
+        let valid = (7_u64 << SLOT_BITS) | 0;
+        assert_eq!(
+            validate_completion_slot(valid, generations.len(), |index| generations[index]),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn completion_protocol_error_poisons_every_result() {
+        let mut state = DispatchState::new();
+        state.fail_completion_protocol("duplicate or inactive CQE slot 3");
+        assert!(state.stopped());
+
+        let results = finish_output(vec![Some(Ok(())), None], state);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| {
+            matches!(
+                result,
+                Err(ChunkletError::Invariant(message))
+                    if message.contains("completion protocol failed")
+                        && message.contains("inactive CQE slot 3")
+            )
+        }));
     }
 
     #[test]
