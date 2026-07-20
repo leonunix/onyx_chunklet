@@ -399,7 +399,7 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
                     "init requires at least one device".into(),
                 ));
             }
-            let raws = open_or_create_devices(&devices)?;
+            let raws = open_block_devices(&devices)?;
             let pool = Pool::create(
                 raws,
                 PoolConfig {
@@ -473,7 +473,7 @@ fn run_pool(cmd: PoolCmd) -> ChunkletResult<()> {
         } => {
             let raws = open_devices(&pool_paths)?;
             let pool = Pool::open(raws)?;
-            let new_raw = open_or_create_one(&device)?;
+            let new_raw = RawDevice::open_block_device(&device)?;
             let new_id = pool.admit(
                 new_raw,
                 PoolConfig {
@@ -1222,26 +1222,11 @@ fn open_devices(paths: &[PathBuf]) -> ChunkletResult<Vec<RawDevice>> {
     Ok(out)
 }
 
-fn open_or_create_devices(paths: &[PathBuf]) -> ChunkletResult<Vec<RawDevice>> {
-    paths.iter().map(open_or_create_one).collect()
-}
-
-/// For ergonomic test / dev usage: if a path doesn't exist, create a sparse
-/// file of `CHUNKLET_SOAK_PD_SIZE` (default 8 GiB) under that path.
-fn open_or_create_one(path: &PathBuf) -> ChunkletResult<RawDevice> {
-    if path.exists() {
-        return RawDevice::open(path);
-    }
-    let size_bytes = std::env::var("CHUNKLET_SOAK_PD_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(8 * 1024 * 1024 * 1024);
-    eprintln!(
-        "note: {} does not exist, creating sparse file of {} bytes",
-        path.display(),
-        size_bytes
-    );
-    RawDevice::open_or_create(path, size_bytes)
+fn open_block_devices(paths: &[PathBuf]) -> ChunkletResult<Vec<RawDevice>> {
+    paths
+        .iter()
+        .map(|path| RawDevice::open_block_device(path))
+        .collect()
 }
 
 fn print_pd_line(info: &onyx_chunklet::pd::PdInfo) {

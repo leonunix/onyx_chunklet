@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{ChunkletError, ChunkletResult};
@@ -25,6 +25,26 @@ impl RawDevice {
     /// Open a device or pre-existing file.
     pub fn open(path: &Path) -> ChunkletResult<Self> {
         let (file, direct_io) = Self::open_direct(path)?;
+        Self::from_open_file(file, path, direct_io)
+    }
+
+    /// Open an existing block device, rejecting files and other node types.
+    pub fn open_block_device(path: &Path) -> ChunkletResult<Self> {
+        let (file, direct_io) = Self::open_direct(path)?;
+        let metadata = file.metadata().map_err(|e| ChunkletError::Device {
+            path: path.to_path_buf(),
+            reason: format!("metadata: {}", e),
+        })?;
+        if !metadata.file_type().is_block_device() {
+            return Err(ChunkletError::Device {
+                path: path.to_path_buf(),
+                reason: "expected an existing block device".into(),
+            });
+        }
+        Self::from_open_file(file, path, direct_io)
+    }
+
+    fn from_open_file(file: File, path: &Path, direct_io: bool) -> ChunkletResult<Self> {
         let size_bytes = Self::query_size(&file, path)?;
         let sync_required = Self::detect_sync_required(&file, path, direct_io);
         Ok(Self {
@@ -325,6 +345,8 @@ impl AsRawFd for RawDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn cache_mode_only_skips_explicit_write_through() {
@@ -357,5 +379,49 @@ mod tests {
             .open(&path)
             .unwrap();
         assert!(RawDevice::detect_sync_required(&file, &path, false));
+    }
+
+    #[test]
+    fn block_device_open_does_not_create_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-pd");
+
+        let error = RawDevice::open_block_device(&path).err().unwrap();
+
+        assert!(matches!(error, ChunkletError::Device { .. }));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn block_device_open_rejects_regular_file_without_modifying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regular-pd");
+        let contents = b"must remain unchanged";
+        File::create(&path).unwrap().write_all(contents).unwrap();
+
+        let error = RawDevice::open_block_device(&path).err().unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("expected an existing block device"));
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn block_device_open_rejects_symlink_to_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("regular-pd");
+        let link = dir.path().join("by-id-pd");
+        let contents = b"must remain unchanged";
+        File::create(&target).unwrap().write_all(contents).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = RawDevice::open_block_device(&link).err().unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("expected an existing block device"));
+        assert_eq!(std::fs::read(&target).unwrap(), contents);
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
     }
 }
