@@ -346,14 +346,24 @@ impl LdRaid6 {
             Kind6::Pdw => {
                 let mut delta_p = vec![0u8; strip];
                 let mut delta_q = vec![0u8; strip];
+                // Materialize `d = old ^ new` once per position so both deltas
+                // fold it through the same SIMD primitives Full/Rw already use.
+                // The byte-at-a-time `gf256::mul` this replaces was the single
+                // largest CPU item on the small-write RMW path (perf on
+                // nvme-box: r6_compute 16.3% + gf256::mul 6.1% of all cycles at
+                // 208 k ops/s), and it left `mul_avx*_calls` at exactly 0.
+                // Scratch is hoisted so the arm still allocates only the two
+                // delta strips per segment.
+                let mut d = vec![0u8; strip];
                 for ((pos, off, nd), old) in seg.mods.iter().zip(seg.old_data.iter()) {
                     let g_i = gf256::g_pow(*pos);
                     let off = *off as usize;
-                    for i in 0..nd.len() {
-                        let d = old[i] ^ nd[i];
-                        delta_p[off + i] ^= d;
-                        delta_q[off + i] ^= gf256::mul(g_i, d);
-                    }
+                    let len = nd.len();
+                    let d = &mut d[..len];
+                    d.copy_from_slice(nd);
+                    gf256::xor_into(d, old);
+                    gf256::xor_into(&mut delta_p[off..off + len], d);
+                    gf256::mul_xor_into(&mut delta_q[off..off + len], d, g_i);
                 }
                 gf256::xor_into(&mut seg.p, &delta_p);
                 gf256::xor_into(&mut seg.q, &delta_q);

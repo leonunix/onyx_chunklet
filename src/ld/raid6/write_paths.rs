@@ -281,17 +281,19 @@ impl LdRaid6 {
             return Err(e);
         }
 
+        // Same SIMD folding as the batched PDW arm: materialize `d = old ^ new`
+        // once, then let `xor_into` / `mul_xor_into` do the vector work instead
+        // of a byte-at-a-time `gf256::mul`.
+        let mut d_scratch = vec![0u8; strip];
         for ((pos, off, range), old_data) in positions.iter().zip(old_data.iter()) {
             let new_data = &buf[range.clone()];
             let len = new_data.len();
             let g_i = gf256::g_pow(*pos);
-            let dst_p = &mut delta_p[(*off as usize)..(*off as usize) + len];
-            let dst_q = &mut delta_q[(*off as usize)..(*off as usize) + len];
-            for i in 0..len {
-                let d = old_data[i] ^ new_data[i];
-                dst_p[i] ^= d;
-                dst_q[i] ^= gf256::mul(g_i, d);
-            }
+            let d = &mut d_scratch[..len];
+            d.copy_from_slice(new_data);
+            gf256::xor_into(d, old_data);
+            gf256::xor_into(&mut delta_p[(*off as usize)..(*off as usize) + len], d);
+            gf256::mul_xor_into(&mut delta_q[(*off as usize)..(*off as usize) + len], d, g_i);
         }
         gf256::xor_into(&mut p, &delta_p);
         gf256::xor_into(&mut q, &delta_q);
