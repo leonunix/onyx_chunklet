@@ -64,6 +64,13 @@ pub struct UringPoolConfig {
     pub background_workers: usize,
     pub foreground_cpus: Vec<usize>,
     pub background_cpus: Vec<usize>,
+    /// Wait for a whole batch in one `io_uring_enter` rather than waking once
+    /// per CQE on the no-observer drain path. Default `false` (legacy wake).
+    pub coalesced_wait: bool,
+    /// SQEs per stop-and-wait wave on the batched submit paths. `0` keeps the
+    /// historical 64-op wave; larger values cut the number of drain-and-refill
+    /// barriers a many-strip write must cross (capped by the ring depth).
+    pub write_chunk_ops: usize,
 }
 
 impl UringPoolConfig {
@@ -73,6 +80,8 @@ impl UringPoolConfig {
             background_workers,
             foreground_cpus: Vec::new(),
             background_cpus: Vec::new(),
+            coalesced_wait: false,
+            write_chunk_ops: 0,
         }
     }
 }

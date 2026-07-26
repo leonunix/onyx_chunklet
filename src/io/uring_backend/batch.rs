@@ -11,6 +11,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use io_uring::{squeue, IoUring};
 
+use super::coalesced_wait_enabled;
 use crate::error::{ChunkletError, ChunkletResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,7 +88,11 @@ pub(super) fn wait_and_drain(
     expected: usize,
     context: &str,
 ) -> BatchCompletions {
-    wait_and_drain_observed(ring, expected, context, |_| {})
+    // Nothing consumes partial progress on this path, so (when enabled) wait for
+    // the WHOLE batch in one `io_uring_enter` instead of waking once per CQE.
+    // Staggered NVMe completions otherwise cost one wake round-trip each, which
+    // dominates a batch of hundreds of 4 KiB strip writes.
+    wait_and_drain_with_mode(ring, expected, context, coalesced_wait_enabled(), &mut |_| {})
 }
 
 /// Variant of [`wait_and_drain`] that publishes each CQ drain after validating
@@ -100,10 +105,31 @@ pub(super) fn wait_and_drain_observed(
     context: &str,
     mut on_drain: impl FnMut(&[ValidatedCompletion]),
 ) -> BatchCompletions {
+    // Observers exist to see arrivals as they land (streaming / scheduler
+    // accounting), so this path keeps the per-wake drain regardless of the knob.
+    wait_and_drain_with_mode(ring, expected, context, false, &mut on_drain)
+}
+
+/// Drain with an explicit wait mode. `coalesce = false` wakes once per CQE so a
+/// caller that streams arrivals (scheduler credit, progress accounting) sees
+/// them as they land; `true` waits for the whole batch in one `io_uring_enter`,
+/// which is what a caller whose observer only accumulates should use.
+pub(super) fn wait_and_drain_with_mode(
+    ring: &mut IoUring,
+    expected: usize,
+    context: &str,
+    coalesce: bool,
+    on_drain: &mut impl FnMut(&[ValidatedCompletion]),
+) -> BatchCompletions {
     match drive_completions_observed(
         expected,
-        || {
-            ring.submit_and_wait(1)?;
+        |remaining| {
+            // `remaining` counts SQEs of THIS batch that have not completed yet,
+            // so it never exceeds what is still in flight — waiting for all of
+            // them cannot block forever. Batches are capped at `URING_DEPTH` and
+            // the CQ is twice the SQ, so the harvest cannot overflow either.
+            let want = if coalesce { remaining.max(1) } else { 1 };
+            ring.submit_and_wait(want)?;
             let completions = ring
                 .completion()
                 .map(|cqe| RawCompletion {
@@ -113,7 +139,7 @@ pub(super) fn wait_and_drain_observed(
                 .collect();
             Ok(completions)
         },
-        &mut on_drain,
+        on_drain,
     ) {
         Ok(driven) => {
             assert_ring_clean(ring, context);
@@ -165,14 +191,18 @@ pub(super) fn assert_ring_clean(ring: &mut IoUring, context: &str) {
 #[cfg(test)]
 fn drive_completions(
     expected: usize,
-    wait_once: impl FnMut() -> std::io::Result<Vec<RawCompletion>>,
+    mut wait_once: impl FnMut() -> std::io::Result<Vec<RawCompletion>>,
 ) -> std::io::Result<BatchCompletions> {
-    Ok(drive_completions_observed(expected, wait_once, &mut |_| {})?.completions)
+    Ok(drive_completions_observed(expected, move |_| wait_once(), &mut |_| {})?.completions)
 }
 
+/// `wait_once` receives the number of completions still outstanding for this
+/// batch so a caller can wait for all of them in one syscall instead of one
+/// wake per CQE. Harvesting more than requested is fine — the loop counts what
+/// actually arrived.
 fn drive_completions_observed(
     expected: usize,
-    mut wait_once: impl FnMut() -> std::io::Result<Vec<RawCompletion>>,
+    mut wait_once: impl FnMut(usize) -> std::io::Result<Vec<RawCompletion>>,
     on_drain: &mut impl FnMut(&[ValidatedCompletion]),
 ) -> std::io::Result<DrivenBatch> {
     let mut results = vec![None; expected];
@@ -181,7 +211,7 @@ fn drive_completions_observed(
     let mut observer_panic = None;
 
     while completed < expected {
-        let completions = match wait_once() {
+        let completions = match wait_once(expected - completed) {
             Ok(completions) => completions,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
@@ -324,7 +354,7 @@ mod tests {
         let mut waves = Vec::new();
         let driven = drive_completions_observed(
             3,
-            || steps.pop_front().expect("injected wait step"),
+            |_| steps.pop_front().expect("injected wait step"),
             &mut |completions| waves.push(completions.to_vec()),
         )
         .unwrap();
@@ -376,7 +406,7 @@ mod tests {
         let mut published = Vec::new();
         let driven = drive_completions_observed(
             4,
-            || steps.pop_front().expect("injected wait step"),
+            |_| steps.pop_front().expect("injected wait step"),
             &mut |completions| {
                 published.extend(completions.iter().map(|completion| completion.index))
             },
@@ -399,7 +429,7 @@ mod tests {
         let unwind = catch_unwind(AssertUnwindSafe(|| {
             let driven = drive_completions_observed(
                 2,
-                || {
+                |_| {
                     let index = waits.get();
                     waits.set(index + 1);
                     Ok(vec![RawCompletion {
@@ -440,7 +470,7 @@ mod tests {
         ]);
         let driven = drive_completions_observed(
             2,
-            || steps.pop_front().expect("injected wait step"),
+            |_| steps.pop_front().expect("injected wait step"),
             &mut |_| panic!("observer panic"),
         )
         .unwrap();

@@ -22,7 +22,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,14 +38,17 @@ use crate::io::scheduler::{current_io_class, IoClass};
 use crate::pd::PhysicalDisk;
 use crate::types::BLOCK_SIZE;
 
-const URING_DEPTH: u32 = 64;
+const URING_DEPTH: u32 = 256;
 const MAX_COALESCED_WRITE_BYTES: usize = 256 * 1024;
 
 mod batch;
 mod execution;
 mod stream;
 
-use batch::{push_batch, wait_and_drain, wait_and_drain_observed, ValidatedCompletion};
+use batch::{
+    push_batch, wait_and_drain, wait_and_drain_observed, wait_and_drain_with_mode,
+    ValidatedCompletion,
+};
 pub(crate) use execution::ExecutionPoolBackend;
 use execution::ScopedWritePools;
 
@@ -104,6 +107,49 @@ thread_local! {
 /// Process-wide latch so the EMFILE downgrade logs once, not once per thread.
 static FD_EXHAUSTION_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Wait for a whole batch in one `io_uring_enter` instead of waking once per
+/// CQE (see `batch::wait_and_drain`). Process-wide because the submit path runs
+/// on thread-local rings with no backend handle in scope. Default OFF: the
+/// per-CQE wake is the long-shipped behaviour, so this stays an explicit A/B
+/// until the box run lands. Set once at pool-configure time, before any IO.
+static COALESCED_WAIT: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the coalesced CQE wait. Applies process-wide to every
+/// subsequent batch drain that has no completion observer.
+pub fn set_coalesced_wait(enabled: bool) {
+    COALESCED_WAIT.store(enabled, Ordering::Relaxed);
+}
+
+fn coalesced_wait_enabled() -> bool {
+    COALESCED_WAIT.load(Ordering::Relaxed)
+}
+
+/// SQEs submitted per stop-and-wait wave on the batched submit paths. A logical
+/// write fans out to hundreds of per-strip SQEs, and each wave must fully drain
+/// before the next is pushed, so a small wave count means many drain-and-refill
+/// barriers with the disks idle in between. Bounded by `URING_DEPTH` (the SQ
+/// must hold a whole wave atomically). Default `DEFAULT_WRITE_CHUNK_OPS`
+/// preserves the long-shipped wave size; raising it is the A/B.
+static WRITE_CHUNK_OPS: AtomicUsize = AtomicUsize::new(DEFAULT_WRITE_CHUNK_OPS);
+
+/// Historical wave size, kept as the default so the knob is opt-in.
+const DEFAULT_WRITE_CHUNK_OPS: usize = 64;
+
+/// Set the per-wave SQE count. Clamped to `1..=URING_DEPTH`; `0` restores the
+/// default. Applies process-wide to subsequent batches.
+pub fn set_write_chunk_ops(ops: usize) {
+    let clamped = if ops == 0 {
+        DEFAULT_WRITE_CHUNK_OPS
+    } else {
+        ops.clamp(1, URING_DEPTH as usize)
+    };
+    WRITE_CHUNK_OPS.store(clamped, Ordering::Relaxed);
+}
+
+fn write_chunk_ops() -> usize {
+    WRITE_CHUNK_OPS.load(Ordering::Relaxed)
+}
+
 /// True when an `IoUring::new` error is fd/memory exhaustion the caller should
 /// gracefully degrade around (vs a genuine "io_uring unsupported" error).
 fn is_resource_exhaustion(e: &std::io::Error) -> bool {
@@ -137,6 +183,8 @@ impl UringBackend {
     /// Build persistent write pools with explicit worker CPU sets.
     pub fn new_pooled_with_config(config: UringPoolConfig) -> std::io::Result<Self> {
         let _probe = IoUring::new(URING_DEPTH)?;
+        set_coalesced_wait(config.coalesced_wait);
+        set_write_chunk_ops(config.write_chunk_ops);
         Ok(Self {
             write_pools: ScopedWritePools::with_config(config)?,
         })
@@ -154,7 +202,7 @@ impl UringBackend {
                 RingAccess::Ready(ring) => {
                     let mut start = 0usize;
                     while start < n {
-                        let end = (start + URING_DEPTH as usize).min(n);
+                        let end = (start + write_chunk_ops()).min(n);
                         for (i, result) in submit_coalesced_chunk_detailed(ring, &ops[start..end])
                             .into_iter()
                             .enumerate()
@@ -198,7 +246,7 @@ impl UringBackend {
                 RingAccess::Ready(ring) => {
                     let mut start = 0usize;
                     while start < n {
-                        let end = (start + URING_DEPTH as usize).min(n);
+                        let end = (start + write_chunk_ops()).min(n);
                         let chunk_results = submit_coalesced_chunk_detailed_observed(
                             ring,
                             &ops[start..end],
@@ -293,7 +341,7 @@ impl IoBackend for UringBackend {
             RingAccess::Ready(ring) => {
                 let mut start = 0usize;
                 while start < ops.len() {
-                    let end = (start + URING_DEPTH as usize).min(ops.len());
+                    let end = (start + write_chunk_ops()).min(ops.len());
                     submit_read_chunk(ring, &mut ops[start..end])?;
                     start = end;
                 }
@@ -451,7 +499,9 @@ fn submit_coalesced_chunk_detailed(
     ring: &mut IoUring,
     ops: &[StripWrite<'_>],
 ) -> Vec<ChunkletResult<()>> {
-    submit_coalesced_chunk_detailed_with_callback(ring, ops, |_| {})
+    // No observer: the callback is a no-op, so the batch may be waited for in
+    // one `io_uring_enter` instead of one wake per completed 4 KiB strip.
+    submit_coalesced_chunk_detailed_with_callback(ring, ops, false, |_| {})
 }
 
 fn submit_coalesced_chunk_detailed_observed(
@@ -461,7 +511,7 @@ fn submit_coalesced_chunk_detailed_observed(
     observer: &dyn WriteCompletionObserver,
     service_started: Instant,
 ) -> Vec<ChunkletResult<()>> {
-    submit_coalesced_chunk_detailed_with_callback(ring, ops, |local_indices| {
+    submit_coalesced_chunk_detailed_with_callback(ring, ops, true, |local_indices| {
         let global_indices: Vec<_> = local_indices
             .iter()
             .map(|index| global_offset.saturating_add(*index))
@@ -473,11 +523,12 @@ fn submit_coalesced_chunk_detailed_observed(
 fn submit_coalesced_chunk_detailed_with_callback(
     ring: &mut IoUring,
     ops: &[StripWrite<'_>],
+    stream_arrivals: bool,
     mut on_completed: impl FnMut(&[usize]),
 ) -> Vec<ChunkletResult<()>> {
     let groups = coalesced_write_groups(ops);
     if groups.iter().all(|group| group.len() == 1) {
-        return submit_chunk_detailed_with_callback(ring, ops, |completions| {
+        return submit_chunk_detailed_with_callback(ring, ops, stream_arrivals, |completions| {
             let indices: Vec<_> = completions
                 .iter()
                 .map(|completion| completion.index)
@@ -540,7 +591,8 @@ fn submit_coalesced_chunk_detailed_with_callback(
             }
         })
         .collect();
-    let submitted_results = submit_chunk_detailed_with_callback(ring, &submitted, |completions| {
+    let submitted_results =
+        submit_chunk_detailed_with_callback(ring, &submitted, stream_arrivals, |completions| {
         let indices = map_physical_completions(&groups, completions, 0);
         on_completed(&indices);
     });
@@ -751,6 +803,7 @@ fn submit_read_chunk(ring: &mut IoUring, ops: &mut [StripRead<'_>]) -> ChunkletR
 fn submit_chunk_detailed_with_callback(
     ring: &mut IoUring,
     ops: &[StripWrite<'_>],
+    stream_arrivals: bool,
     mut on_completed: impl FnMut(&[ValidatedCompletion]),
 ) -> Vec<ChunkletResult<()>> {
     let n = ops.len();
@@ -817,10 +870,16 @@ fn submit_chunk_detailed_with_callback(
     }
     let mut callback = CompletionCallback::new(&mut on_completed);
     let mut short_indices = Vec::new();
-    let completions = wait_and_drain_observed(ring, n, "io_uring write", |arrivals| {
-        let terminal = partition_write_completions(arrivals, &ptrs, &mut short_indices);
-        callback.notify(&terminal);
-    });
+    // Short-write detection and the terminal-completion forwarding below only
+    // ACCUMULATE, so they are indifferent to whether arrivals land one at a time
+    // or in one bulk drain. Streaming callers (scheduler credit release) still
+    // opt out via `stream_arrivals`.
+    let coalesce = !stream_arrivals && coalesced_wait_enabled();
+    let completions =
+        wait_and_drain_with_mode(ring, n, "io_uring write", coalesce, &mut |arrivals| {
+            let terminal = partition_write_completions(arrivals, &ptrs, &mut short_indices);
+            callback.notify(&terminal);
+        });
 
     let mut retry_results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
     let recovered = attempt_all_indices(

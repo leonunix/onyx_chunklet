@@ -15,7 +15,7 @@ use crate::io::backend::{
 use crate::pd::PhysicalDisk;
 
 const STREAM_DEPTH: usize = super::URING_DEPTH as usize;
-const SLOT_BITS: u32 = 6;
+const SLOT_BITS: u32 = 8;
 const SLOT_MASK: u64 = (1_u64 << SLOT_BITS) - 1;
 const GENERATION_MASK: u64 = u64::MAX >> SLOT_BITS;
 const _: () = assert!(STREAM_DEPTH == 1_usize << SLOT_BITS);
