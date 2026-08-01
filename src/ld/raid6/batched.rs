@@ -1,6 +1,8 @@
 //! RAID6 batched multi-op writer (the flusher hot path) + its planner types.
 //! Split out of the parent module for the file-size limit.
 use super::*;
+use crate::write_path as wp;
+use std::time::Instant;
 
 /// Which healthy-set write path a batched segment takes. Degraded segments
 /// never reach here — [`LdRaid6::write_many_batched`] bails the whole batch to
@@ -52,6 +54,12 @@ impl LdRaid6 {
         }
         let strip = self.strip_bytes as usize;
         let k = self.data_per_set;
+        // Phase attribution (see `crate::write_path`): the caller only sees this
+        // call's wall clock, which cannot tell stripe-lock queueing from P/Q
+        // compute from the submit waves.
+        let call_started = Instant::now();
+        wp::add(&wp::R6_BATCH_CALLS, 1);
+        wp::add(&wp::R6_BATCH_OPS, ops.len() as u64);
 
         // Phase 0: decompose every op into per-position mods, GROUPED by
         // physical stripe. Two segments landing on one stripe (dense-PBA
@@ -123,9 +131,11 @@ impl LdRaid6 {
         }
 
         if serialize {
+            wp::add(&wp::R6_BATCH_SERIAL_BAILS, 1);
             for (offset, buf) in ops {
                 self.write_at(*offset, buf)?;
             }
+            wp::record_since(&wp::R6_TOTAL_NS, call_started);
             return Ok(());
         }
 
@@ -149,9 +159,11 @@ impl LdRaid6 {
                 .collect();
             spans.sort_unstable_by_key(|(s, _)| *s);
             if spans.windows(2).any(|w| w[0].1 > w[1].0) {
+                wp::add(&wp::R6_BATCH_SERIAL_BAILS, 1);
                 for (offset, buf) in ops {
                     self.write_at(*offset, buf)?;
                 }
+                wp::record_since(&wp::R6_TOTAL_NS, call_started);
                 return Ok(());
             }
 
@@ -211,9 +223,13 @@ impl LdRaid6 {
             });
         }
 
+        wp::add(&wp::R6_BATCH_STRIPES, segs.len() as u64);
+        let planned_at = wp::record_since(&wp::R6_PLAN_NS, call_started);
+
         // Hold every touched stripe lock across read+compute+write, acquired in
         // one globally-sorted batch (matches `write_key`'s bucket order).
         let guards = self.stripe_locks.write_keys(&stripe_keys);
+        let locked_at = wp::record_since(&wp::R6_LOCK_NS, planned_at);
 
         // Phase 1: one batched read submit for every segment's RMW reads.
         let mut reads: Vec<StripRead> = Vec::new();
@@ -222,6 +238,7 @@ impl LdRaid6 {
         }
         let read_result = parallel_strip_reads(&mut reads);
         drop(reads);
+        let read_at = wp::record_since(&wp::R6_READ_NS, locked_at);
         if let Err(e) = read_result {
             // A member faulted on a Phase-1 old-data/P/Q read (dead-but-not-yet-
             // isolated). We hold the batch's stripe write locks; re-entering
@@ -231,10 +248,12 @@ impl LdRaid6 {
             // flusher's spans are disjoint, so dropping the batch guards loses no
             // cross-stripe consistency.
             if is_runtime_read_fault(&e) {
+                wp::add(&wp::R6_BATCH_SERIAL_BAILS, 1);
                 drop(guards);
                 for (offset, buf) in ops {
                     self.write_at(*offset, buf)?;
                 }
+                wp::record_since(&wp::R6_TOTAL_NS, call_started);
                 return Ok(());
             }
             return Err(e);
@@ -244,6 +263,7 @@ impl LdRaid6 {
         for seg in segs.iter_mut() {
             self.r6_compute(seg);
         }
+        let computed_at = wp::record_since(&wp::R6_COMPUTE_NS, read_at);
 
         // Phase 3: one batched write submit for all data + parity strips, with
         // inline-degrade. Every segment here is HEALTHY (degraded sets bailed to
@@ -260,6 +280,12 @@ impl LdRaid6 {
         let results = submit_strip_writes_detailed(&writes);
         let suspects = absorb_degraded(&writes, &results, &group_of, &max_fail)?;
         self.report_suspects(suspects);
+        wp::record_since(&wp::R6_WRITE_NS, computed_at);
+        let total = wp::record_since(&wp::R6_TOTAL_NS, call_started);
+        wp::record_max(
+            &wp::R6_TOTAL_NS_MAX,
+            total.saturating_duration_since(call_started).as_nanos() as u64,
+        );
         Ok(())
     }
 

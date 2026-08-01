@@ -37,6 +37,7 @@ use crate::io::backend::{
 use crate::io::scheduler::{current_io_class, IoClass};
 use crate::pd::PhysicalDisk;
 use crate::types::BLOCK_SIZE;
+use crate::write_path as wp;
 
 const URING_DEPTH: u32 = 256;
 const MAX_COALESCED_WRITE_BYTES: usize = 256 * 1024;
@@ -195,6 +196,12 @@ impl UringBackend {
             return Vec::new();
         }
         let n = ops.len();
+        // One `submit_calls` per LD batch, one `submit_waves` per stop-and-wait
+        // barrier: their ratio IS the barrier count that `uring_write_chunk_ops`
+        // controls, and it is only readable from here.
+        let slot = wp::class_slot();
+        wp::add(&wp::SUBMIT_CALLS[slot], 1);
+        wp::add(&wp::SUBMIT_OPS[slot], n as u64);
         let mut results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
         let outcome = with_ring(|access| -> ChunkletResult<bool> {
             match access {
@@ -203,6 +210,7 @@ impl UringBackend {
                     let mut start = 0usize;
                     while start < n {
                         let end = (start + write_chunk_ops()).min(n);
+                        wp::add(&wp::SUBMIT_WAVES[slot], 1);
                         for (i, result) in submit_coalesced_chunk_detailed(ring, &ops[start..end])
                             .into_iter()
                             .enumerate()
@@ -526,15 +534,25 @@ fn submit_coalesced_chunk_detailed_with_callback(
     stream_arrivals: bool,
     mut on_completed: impl FnMut(&[usize]),
 ) -> Vec<ChunkletResult<()>> {
+    let slot = wp::class_slot();
+    let coalesce_started = Instant::now();
     let groups = coalesced_write_groups(ops);
     if groups.iter().all(|group| group.len() == 1) {
-        return submit_chunk_detailed_with_callback(ring, ops, stream_arrivals, |completions| {
+        // Nothing merged: every strip is its own SQE. On the dense-PBA flusher
+        // path this means the batch handed in strips that are not adjacent on
+        // any PD, so the wave is as wide as the op count.
+        wp::add(&wp::SUBMIT_SQES[slot], ops.len() as u64);
+        wp::record_since(&wp::SUBMIT_BOUNCE_NS[slot], coalesce_started);
+        let wait_started = Instant::now();
+        let results = submit_chunk_detailed_with_callback(ring, ops, stream_arrivals, |completions| {
             let indices: Vec<_> = completions
                 .iter()
                 .map(|completion| completion.index)
                 .collect();
             on_completed(&indices);
         });
+        wp::record_since(&wp::SUBMIT_WAIT_NS[slot], wait_started);
+        return results;
     }
 
     struct PlannedWrite {
@@ -569,6 +587,7 @@ fn submit_coalesced_chunk_detailed_with_callback(
             buffer.as_mut_slice()[cursor..cursor + data.len()].copy_from_slice(data);
             cursor += data.len();
         }
+        wp::add(&wp::SUBMIT_BOUNCE_BYTES[slot], total_bytes as u64);
         planned.push(PlannedWrite {
             originals: group.clone(),
             buffer: Some(buffer),
@@ -591,11 +610,15 @@ fn submit_coalesced_chunk_detailed_with_callback(
             }
         })
         .collect();
+    wp::add(&wp::SUBMIT_SQES[slot], submitted.len() as u64);
+    wp::record_since(&wp::SUBMIT_BOUNCE_NS[slot], coalesce_started);
+    let wait_started = Instant::now();
     let submitted_results =
         submit_chunk_detailed_with_callback(ring, &submitted, stream_arrivals, |completions| {
         let indices = map_physical_completions(&groups, completions, 0);
         on_completed(&indices);
     });
+    wp::record_since(&wp::SUBMIT_WAIT_NS[slot], wait_started);
     let mut results: Vec<Option<ChunkletResult<()>>> = (0..ops.len()).map(|_| None).collect();
     for (plan, result) in planned.iter().zip(submitted_results) {
         if plan.originals.len() == 1 {

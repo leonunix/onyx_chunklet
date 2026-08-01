@@ -28,6 +28,7 @@ pub mod pd;
 pub mod pool;
 pub mod superblock;
 pub mod types;
+pub mod write_path;
 
 pub use error::{ChunkletError, ChunkletResult};
 pub use ld::degrade::SuspectMember;
@@ -36,3 +37,4 @@ pub use metrics::{LdMetrics, PdMetrics, PdOperationalState, PoolMetrics};
 pub use pd::PhysicalDisk;
 pub use pool::{Pool, PoolConfig};
 pub use types::{ChunkletId, CpgId, HaDomain, LdId, LdMember, LdRole, PdId, PoolId, RaidLevel};
+pub use write_path::{stats as write_path_stats, WritePathStats};
