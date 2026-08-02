@@ -71,6 +71,16 @@ pub struct UringPoolConfig {
     /// historical 64-op wave; larger values cut the number of drain-and-refill
     /// barriers a many-strip write must cross (capped by the ring depth).
     pub write_chunk_ops: usize,
+    /// Submit an adjacency-merged group as one `IORING_OP_WRITEV` with an iovec
+    /// per strip, instead of copying the strips into one bounce buffer. Default
+    /// `false` (bounce, the long-shipped path).
+    ///
+    /// Per-PD strip data is strided in memory (24 KiB apart for a 6+2 RAID6
+    /// stripe), so a merged group can never be contiguous in the caller's buffer
+    /// — the copy is inherent to merging, and it is what made merging a net loss
+    /// on the box: raising the LV3 merge cut 0.29 ms/call of SQE wait but added
+    /// 0.94 ms/call to the materialise stage.
+    pub writev_coalesce: bool,
 }
 
 impl UringPoolConfig {
@@ -82,6 +92,7 @@ impl UringPoolConfig {
             background_cpus: Vec::new(),
             coalesced_wait: false,
             write_chunk_ops: 0,
+            writev_coalesce: false,
         }
     }
 }

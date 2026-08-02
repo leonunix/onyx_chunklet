@@ -20,7 +20,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -151,6 +151,40 @@ fn write_chunk_ops() -> usize {
     WRITE_CHUNK_OPS.load(Ordering::Relaxed)
 }
 
+/// Submit an adjacency-merged group as one vectored write instead of copying its
+/// strips into a bounce buffer. See [`UringPoolConfig::writev_coalesce`].
+static WRITEV_COALESCE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable vectored submission of merged groups. Applies process-wide to
+/// every subsequent batch.
+pub fn set_writev_coalesce(enabled: bool) {
+    WRITEV_COALESCE.store(enabled, Ordering::Relaxed);
+}
+
+/// Diagnostic override, same shape as onyx's `ONYX_ALLOCATOR_REGIONS`: it exists
+/// so the WHOLE suite can be re-run against the vectored path
+/// (`CHUNKLET_WRITEV_COALESCE=1 cargo test --release`) instead of only the
+/// dedicated writev tests, which is the only way to find a mistake in a caller
+/// nobody thought to writev-test. Overrides the config, so production must not
+/// set it.
+fn writev_coalesce_env_override() -> Option<bool> {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("CHUNKLET_WRITEV_COALESCE")
+            .ok()
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+    })
+}
+
+fn writev_coalesce_enabled() -> bool {
+    writev_coalesce_env_override().unwrap_or_else(|| WRITEV_COALESCE.load(Ordering::Relaxed))
+}
+
+/// Upper bound on iovecs in one `writev`. `IOV_MAX` is 1024 on Linux; a group is
+/// already capped at [`MAX_COALESCED_WRITE_BYTES`] / 4 KiB = 64 strips, so this
+/// only guards a future strip size below 256 bytes.
+const MAX_WRITEV_PARTS: usize = 1024;
+
 /// True when an `IoUring::new` error is fd/memory exhaustion the caller should
 /// gracefully degrade around (vs a genuine "io_uring unsupported" error).
 fn is_resource_exhaustion(e: &std::io::Error) -> bool {
@@ -186,6 +220,7 @@ impl UringBackend {
         let _probe = IoUring::new(URING_DEPTH)?;
         set_coalesced_wait(config.coalesced_wait);
         set_write_chunk_ops(config.write_chunk_ops);
+        set_writev_coalesce(config.writev_coalesce);
         Ok(Self {
             write_pools: ScopedWritePools::with_config(config)?,
         })
@@ -535,42 +570,52 @@ fn submit_coalesced_chunk_detailed_with_callback(
     mut on_completed: impl FnMut(&[usize]),
 ) -> Vec<ChunkletResult<()>> {
     let slot = wp::class_slot();
-    let coalesce_started = Instant::now();
+    let group_started = Instant::now();
     let groups = coalesced_write_groups(ops);
-    if groups.iter().all(|group| group.len() == 1) {
+    let copy_started = wp::record_since(&wp::SUBMIT_GROUP_NS[slot], group_started);
+    if groups.all_single() {
         // Nothing merged: every strip is its own SQE. On the dense-PBA flusher
         // path this means the batch handed in strips that are not adjacent on
         // any PD, so the wave is as wide as the op count.
         wp::add(&wp::SUBMIT_SQES[slot], ops.len() as u64);
-        wp::record_since(&wp::SUBMIT_BOUNCE_NS[slot], coalesce_started);
+        let parts: Vec<&[u8]> = ops.iter().map(|op| op.data).collect();
+        let submitted: Vec<PhysWrite<'_>> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| PhysWrite {
+                pd: &op.pd,
+                chunklet_index: op.chunklet_index,
+                in_chunklet_off: op.in_chunklet_off,
+                parts: &parts[i..i + 1],
+            })
+            .collect();
         let wait_started = Instant::now();
-        let results = submit_chunk_detailed_with_callback(ring, ops, stream_arrivals, |completions| {
-            let indices: Vec<_> = completions
-                .iter()
-                .map(|completion| completion.index)
-                .collect();
-            on_completed(&indices);
-        });
+        let results =
+            submit_chunk_detailed_with_callback(ring, &submitted, stream_arrivals, |completions| {
+                let indices: Vec<_> = completions
+                    .iter()
+                    .map(|completion| completion.index)
+                    .collect();
+                on_completed(&indices);
+            });
         wp::record_since(&wp::SUBMIT_WAIT_NS[slot], wait_started);
         return results;
     }
 
-    struct PlannedWrite {
-        originals: Vec<usize>,
-        buffer: Option<AlignedBuf>,
-    }
-
-    let mut planned = Vec::with_capacity(groups.len());
-    for group in &groups {
-        if group.len() == 1 {
-            planned.push(PlannedWrite {
-                originals: group.clone(),
-                buffer: None,
-            });
+    // Per group: either a bounce buffer holding its strips concatenated, or
+    // `None` meaning "submit the strips as they lie" — one iovec each when the
+    // group merged and `writev_coalesce` is on, or the single caller slice.
+    let vectored = writev_coalesce_enabled();
+    let mut buffers: Vec<Option<AlignedBuf>> = Vec::with_capacity(groups.len());
+    for group in groups.iter() {
+        if group.len() == 1 || (vectored && group_is_writev_safe(ops, group)) {
+            buffers.push(None);
             continue;
         }
         let total_bytes: usize = group.iter().map(|&idx| ops[idx].data.len()).sum();
-        let mut buffer = match AlignedBuf::new(total_bytes) {
+        // `uninit`, not `new`: the copy below fills every byte, so `new`'s
+        // zero-fill was pure waste that doubled this stage's memory traffic.
+        let mut buffer = match AlignedBuf::uninit(total_bytes) {
             Ok(buffer) => buffer,
             Err(error) => {
                 let message = format!("io_uring coalesced write allocation: {error}");
@@ -588,30 +633,38 @@ fn submit_coalesced_chunk_detailed_with_callback(
             cursor += data.len();
         }
         wp::add(&wp::SUBMIT_BOUNCE_BYTES[slot], total_bytes as u64);
-        planned.push(PlannedWrite {
-            originals: group.clone(),
-            buffer: Some(buffer),
-        });
+        wp::add(&wp::SUBMIT_BOUNCE_ALLOCS[slot], 1);
+        buffers.push(Some(buffer));
     }
+    let build_started = wp::record_since(&wp::SUBMIT_COPY_NS[slot], copy_started);
 
-    let submitted: Vec<StripWrite<'_>> = planned
+    // One shared part table for the whole wave: a bounced group contributes its
+    // single buffer slice, a vectored group contributes each strip.
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(ops.len());
+    let mut part_spans: Vec<(usize, usize)> = Vec::with_capacity(groups.len());
+    for (group, buffer) in groups.iter().zip(&buffers) {
+        let start = parts.len();
+        match buffer {
+            Some(buffer) => parts.push(buffer.as_slice()),
+            None => parts.extend(group.iter().map(|&idx| ops[idx].data)),
+        }
+        part_spans.push((start, parts.len() - start));
+    }
+    let submitted: Vec<PhysWrite<'_>> = groups
         .iter()
-        .map(|plan| {
-            let first = &ops[plan.originals[0]];
-            StripWrite {
-                pd: first.pd.clone(),
+        .zip(&part_spans)
+        .map(|(group, &(start, count))| {
+            let first = &ops[group[0]];
+            PhysWrite {
+                pd: &first.pd,
                 chunklet_index: first.chunklet_index,
                 in_chunklet_off: first.in_chunklet_off,
-                data: plan
-                    .buffer
-                    .as_ref()
-                    .map(AlignedBuf::as_slice)
-                    .unwrap_or(first.data),
+                parts: &parts[start..start + count],
             }
         })
         .collect();
     wp::add(&wp::SUBMIT_SQES[slot], submitted.len() as u64);
-    wp::record_since(&wp::SUBMIT_BOUNCE_NS[slot], coalesce_started);
+    wp::record_since(&wp::SUBMIT_BUILD_NS[slot], build_started);
     let wait_started = Instant::now();
     let submitted_results =
         submit_chunk_detailed_with_callback(ring, &submitted, stream_arrivals, |completions| {
@@ -620,20 +673,21 @@ fn submit_coalesced_chunk_detailed_with_callback(
     });
     wp::record_since(&wp::SUBMIT_WAIT_NS[slot], wait_started);
     let mut results: Vec<Option<ChunkletResult<()>>> = (0..ops.len()).map(|_| None).collect();
-    for (plan, result) in planned.iter().zip(submitted_results) {
-        if plan.originals.len() == 1 {
-            results[plan.originals[0]] = Some(result);
+    for (index, result) in submitted_results.into_iter().enumerate() {
+        let group = groups.group(index);
+        if group.len() == 1 {
+            results[group[0]] = Some(result);
             continue;
         }
         match result {
             Ok(()) => {
-                for &idx in &plan.originals {
+                for &idx in group {
                     results[idx] = Some(Ok(()));
                 }
             }
             Err(error) => {
                 let message = format!("coalesced member write failed: {error}");
-                for &idx in &plan.originals {
+                for &idx in group {
                     results[idx] = Some(Err(ChunkletError::Io(std::io::Error::other(
                         message.clone(),
                     ))));
@@ -648,62 +702,135 @@ fn submit_coalesced_chunk_detailed_with_callback(
 }
 
 fn map_physical_completions(
-    groups: &[Vec<usize>],
+    groups: &WriteGroups,
     completions: &[ValidatedCompletion],
     global_offset: usize,
 ) -> Vec<usize> {
     completions
         .iter()
-        .filter_map(|completion| groups.get(completion.index))
-        .flat_map(|originals| originals.iter().copied())
+        .filter(|completion| completion.index < groups.len())
+        .flat_map(|completion| groups.group(completion.index).iter().copied())
         .map(|index| global_offset.saturating_add(index))
         .collect()
 }
 
-fn coalesced_write_groups(ops: &[StripWrite<'_>]) -> Vec<Vec<usize>> {
-    let mut by_location: BTreeMap<(crate::types::PdId, u32), Vec<usize>> = BTreeMap::new();
-    for (idx, op) in ops.iter().enumerate() {
-        by_location
-            .entry((op.pd.pd_id(), op.chunklet_index))
-            .or_default()
-            .push(idx);
+/// Adjacency groups over one wave's ops, in TWO allocations total rather than
+/// two per group.
+///
+/// The previous shape was `Vec<Vec<usize>>` built through a
+/// `BTreeMap<(PdId, u32), Vec<usize>>`: a `Vec` per PD/chunklet key, a clone of
+/// it, and a fresh `Vec` per emitted group — then the planner cloned every group
+/// again. At the 567 strip ops per call the LV3 flusher hands in, that is ~1600
+/// small allocations per submit, and the whole pre-submit stage measured
+/// 505 µs/call on the box while merging almost nothing (merge 1.04x). `order`
+/// holds every op index once, arranged so each group is a contiguous slice.
+struct WriteGroups {
+    /// Op indices, group by group.
+    order: Vec<usize>,
+    /// `(start, len)` into `order`, one entry per physical write.
+    spans: Vec<(u32, u32)>,
+}
+
+impl WriteGroups {
+    fn len(&self) -> usize {
+        self.spans.len()
     }
 
-    let mut groups = Vec::new();
-    for (_, original_indices) in by_location {
-        let mut indices = original_indices.clone();
-        indices.sort_unstable_by_key(|&idx| ops[idx].in_chunklet_off);
+    fn group(&self, index: usize) -> &[usize] {
+        let (start, len) = self.spans[index];
+        &self.order[start as usize..start as usize + len as usize]
+    }
 
-        let overlaps = indices.windows(2).any(|pair| {
+    fn all_single(&self) -> bool {
+        self.spans.iter().all(|&(_, len)| len == 1)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[usize]> {
+        (0..self.len()).map(move |index| self.group(index))
+    }
+}
+
+/// Whether a merged group can be submitted as iovecs instead of being copied
+/// into one buffer. Every strip must be block aligned in its own right (O_DIRECT
+/// checks each iovec), and the group must fit `IOV_MAX`. Parity strips are plain
+/// `Vec<u8>` allocations, so alignment is not something the LD guarantees — a
+/// group that fails here falls back to the bounce path unchanged.
+fn group_is_writev_safe(ops: &[StripWrite<'_>], group: &[usize]) -> bool {
+    group.len() <= MAX_WRITEV_PARTS
+        && group.iter().all(|&idx| {
+            let data = ops[idx].data;
+            is_direct_aligned(0, data.len(), data.as_ptr() as usize)
+        })
+}
+
+/// Collapse writes that are adjacent within one PD chunklet into one physical
+/// write each.
+///
+/// One sort by `(pd, chunklet, offset)` replaces the per-key map + per-key sort:
+/// equal keys land in one run, so a single linear pass can both detect overlap
+/// within a key and cut the runs into groups. Selection is unchanged — same
+/// partition, same members, and a group is still capped at
+/// [`MAX_COALESCED_WRITE_BYTES`]. `write_groups_match_the_reference_grouping`
+/// pins the equivalence against the original implementation.
+fn coalesced_write_groups(ops: &[StripWrite<'_>]) -> WriteGroups {
+    let mut order: Vec<usize> = (0..ops.len()).collect();
+    order.sort_unstable_by_key(|&idx| {
+        let op = &ops[idx];
+        (op.pd.pd_id(), op.chunklet_index, op.in_chunklet_off)
+    });
+
+    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(ops.len());
+    let mut key_start = 0usize;
+    while key_start < order.len() {
+        let key = {
+            let op = &ops[order[key_start]];
+            (op.pd.pd_id(), op.chunklet_index)
+        };
+        let mut key_end = key_start + 1;
+        while key_end < order.len() {
+            let op = &ops[order[key_end]];
+            if (op.pd.pd_id(), op.chunklet_index) != key {
+                break;
+            }
+            key_end += 1;
+        }
+        // Byte overlap inside one key means the ops are not a disjoint cover of
+        // the range, so no merge is safe: degrade the WHOLE key to single-op
+        // writes, exactly as before. Restore the caller's op order for those —
+        // overlapping writes are the one shape where submission order is worth
+        // preserving, and it keeps this byte-identical to the reference.
+        let overlaps = order[key_start..key_end].windows(2).any(|pair| {
             let first = &ops[pair[0]];
             first.in_chunklet_off + first.data.len() as u64 > ops[pair[1]].in_chunklet_off
         });
         if overlaps {
-            groups.extend(original_indices.into_iter().map(|idx| vec![idx]));
+            order[key_start..key_end].sort_unstable();
+            spans.extend((key_start..key_end).map(|at| (at as u32, 1)));
+            key_start = key_end;
             continue;
         }
 
-        let mut current: Vec<usize> = Vec::new();
+        let run = &order[key_start..key_end];
+        let mut group_start = key_start;
         let mut current_end = 0u64;
         let mut current_bytes = 0usize;
-        for idx in indices {
+        for (at, &idx) in run.iter().enumerate().map(|(i, idx)| (key_start + i, idx)) {
             let op = &ops[idx];
-            let adjacent = !current.is_empty() && op.in_chunklet_off == current_end;
-            if !current.is_empty()
+            let adjacent = at > group_start && op.in_chunklet_off == current_end;
+            if at > group_start
                 && (!adjacent || current_bytes + op.data.len() > MAX_COALESCED_WRITE_BYTES)
             {
-                groups.push(std::mem::take(&mut current));
+                spans.push((group_start as u32, (at - group_start) as u32));
+                group_start = at;
                 current_bytes = 0;
             }
             current_end = op.in_chunklet_off + op.data.len() as u64;
             current_bytes += op.data.len();
-            current.push(idx);
         }
-        if !current.is_empty() {
-            groups.push(current);
-        }
+        spans.push((group_start as u32, (key_end - group_start) as u32));
+        key_start = key_end;
     }
-    groups
+    WriteGroups { order, spans }
 }
 
 fn submit_read_chunk(ring: &mut IoUring, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
@@ -818,6 +945,63 @@ fn submit_read_chunk(ring: &mut IoUring, ops: &mut [StripRead<'_>]) -> ChunkletR
     }
 }
 
+/// One physical write handed to the ring.
+///
+/// `parts` are in DEVICE order and adjacent on the device by construction, but
+/// need not be adjacent in memory: per-PD strip data is strided (24 KiB apart for
+/// a 6+2 RAID6 stripe), so a merged group is inherently scattered. One part → an
+/// `IORING_OP_WRITE`; several → one `IORING_OP_WRITEV`, which is what lets a
+/// merge happen without copying the strips together.
+struct PhysWrite<'a> {
+    pd: &'a Arc<PhysicalDisk>,
+    chunklet_index: u32,
+    in_chunklet_off: u64,
+    parts: &'a [&'a [u8]],
+}
+
+impl PhysWrite<'_> {
+    fn total_len(&self) -> usize {
+        self.parts.iter().map(|part| part.len()).sum()
+    }
+
+    /// O_DIRECT needs the device offset AND every iovec (base + length) block
+    /// aligned — checking only the first part would submit an EINVAL.
+    fn direct_aligned(&self, abs: u64) -> bool {
+        abs.is_multiple_of(BLOCK_SIZE)
+            && self
+                .parts
+                .iter()
+                .all(|part| is_direct_aligned(0, part.len(), part.as_ptr() as usize))
+    }
+
+    /// Write every part at its own device offset through the caller-thread
+    /// fallback. Used for exact recovery of a short vectored write, where there
+    /// is no single contiguous buffer to re-issue.
+    fn write_parts_exact(&self) -> ChunkletResult<()> {
+        let mut off = self.in_chunklet_off;
+        for part in self.parts {
+            self.pd
+                .write_chunklet_user_unbound(self.chunklet_index, off, part)?;
+            off += part.len() as u64;
+        }
+        Ok(())
+    }
+}
+
+/// Concatenate a scattered payload into one aligned buffer — the fallback when a
+/// vectored group cannot be submitted as iovecs (a part or the device offset is
+/// not block aligned, or there are more parts than `IOV_MAX`).
+fn bounce_parts(parts: &[&[u8]]) -> ChunkletResult<AlignedBuf> {
+    let total: usize = parts.iter().map(|part| part.len()).sum();
+    let mut buffer = AlignedBuf::uninit(total)?;
+    let mut cursor = 0;
+    for part in parts {
+        buffer.as_mut_slice()[cursor..cursor + part.len()].copy_from_slice(part);
+        cursor += part.len();
+    }
+    Ok(buffer)
+}
+
 /// Submit one NUMA-homogeneous chunk and return a per-op result in the chunk's
 /// input order (`results[i]` ↔ `ops[i]`). A pre-publication setup failure
 /// (offset geometry, bounce allocation, atomic SQ push) marks the chunk failed.
@@ -825,7 +1009,7 @@ fn submit_read_chunk(ring: &mut IoUring, ops: &mut [StripRead<'_>]) -> ChunkletR
 /// each CQE then determines its own result.
 fn submit_chunk_detailed_with_callback(
     ring: &mut IoUring,
-    ops: &[StripWrite<'_>],
+    ops: &[PhysWrite<'_>],
     stream_arrivals: bool,
     mut on_completed: impl FnMut(&[ValidatedCompletion]),
 ) -> Vec<ChunkletResult<()>> {
@@ -837,7 +1021,7 @@ fn submit_chunk_detailed_with_callback(
         match op.pd.chunklet_user_abs_offset(
             op.chunklet_index,
             op.in_chunklet_off,
-            op.data.len() as u64,
+            op.total_len() as u64,
         ) {
             Ok(abs) => targets.push((op.pd.raw_fd(), abs)),
             Err(e) => {
@@ -850,19 +1034,21 @@ fn submit_chunk_detailed_with_callback(
         }
     }
 
-    // SQEs reference either the caller's already O_DIRECT-safe buffer or
-    // one of these bounce buffers. The Vec is held until every CQE arrives.
-    let mut bounces: Vec<AlignedBuf> = Vec::with_capacity(n);
+    // SQEs reference either the caller's already O_DIRECT-safe buffers or one of
+    // these bounce buffers. Both Vecs are held until every CQE arrives.
+    let mut bounces: Vec<AlignedBuf> = Vec::new();
+    let mut iovecs: Vec<libc::iovec> = Vec::new();
+    // Per op: either one contiguous (ptr, len) or an iovec range. `len` is the
+    // total in both cases — it is what a completion must report.
     let mut ptrs: Vec<(*const u8, u32)> = Vec::with_capacity(n);
+    let mut vectored: Vec<Option<(usize, usize)>> = Vec::with_capacity(n);
     for (op, (_fd, abs)) in ops.iter().zip(targets.iter()) {
-        let ptr = op.data.as_ptr();
-        let len = op.data.len();
-        if is_direct_aligned(*abs, len, ptr as usize) {
-            ptrs.push((ptr, len as u32));
-        } else {
-            match AlignedBuf::from_slice(op.data) {
+        let total = op.total_len();
+        if !op.direct_aligned(*abs) || op.parts.len() > MAX_WRITEV_PARTS {
+            match bounce_parts(op.parts) {
                 Ok(buf) => {
-                    ptrs.push((buf.as_slice().as_ptr(), len as u32));
+                    ptrs.push((buf.as_slice().as_ptr(), total as u32));
+                    vectored.push(None);
                     bounces.push(buf);
                 }
                 Err(e) => {
@@ -873,19 +1059,43 @@ fn submit_chunk_detailed_with_callback(
                     )
                 }
             }
+            continue;
         }
+        if op.parts.len() == 1 {
+            ptrs.push((op.parts[0].as_ptr(), total as u32));
+            vectored.push(None);
+            continue;
+        }
+        let start = iovecs.len();
+        iovecs.extend(op.parts.iter().map(|part| libc::iovec {
+            iov_base: part.as_ptr() as *mut libc::c_void,
+            iov_len: part.len(),
+        }));
+        ptrs.push((op.parts[0].as_ptr(), total as u32));
+        vectored.push(Some((start, op.parts.len())));
     }
 
-    let entries: Vec<squeue::Entry> = ops
-        .iter()
-        .enumerate()
-        .map(|(i, _op)| {
+    let entries: Vec<squeue::Entry> = (0..n)
+        .map(|i| {
             let (fd, abs) = targets[i];
-            let (ptr, len) = ptrs[i];
-            opcode::Write::new(types::Fd(fd), ptr, len)
-                .offset(abs)
-                .build()
-                .user_data(i as u64)
+            match vectored[i] {
+                // SAFETY-adjacent invariant: `iovecs` is not resized after this
+                // point and outlives the CQE drain below, so the kernel's view of
+                // the array stays valid for the whole IO.
+                Some((start, count)) => {
+                    opcode::Writev::new(types::Fd(fd), iovecs[start..].as_ptr(), count as u32)
+                        .offset(abs)
+                        .build()
+                        .user_data(i as u64)
+                }
+                None => {
+                    let (ptr, len) = ptrs[i];
+                    opcode::Write::new(types::Fd(fd), ptr, len)
+                        .offset(abs)
+                        .build()
+                        .user_data(i as u64)
+                }
+            }
         })
         .collect();
     if let Err(error) = push_batch(ring, &entries, "io_uring write") {
@@ -907,11 +1117,11 @@ fn submit_chunk_detailed_with_callback(
     let mut retry_results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
     let recovered = attempt_all_indices(
         &short_indices,
-        |index| {
-            let op = &ops[index];
-            op.pd
-                .write_chunklet_user_unbound(op.chunklet_index, op.in_chunklet_off, op.data)
-        },
+        // A vectored write reports only the TOTAL bytes transferred, so a short
+        // one cannot be resumed from an offset — re-issue every part at its own
+        // device offset instead. That is exact and idempotent, and strictly more
+        // precise than re-writing a whole merged group as one buffer.
+        |index| ops[index].write_parts_exact(),
         |index, result| {
             let completion = ValidatedCompletion {
                 index,
@@ -1130,6 +1340,8 @@ mod tests {
     use crate::types::{PdId, PoolId};
     use parking_lot::Mutex;
     use std::cell::{Cell, RefCell};
+    // Only the `reference_write_groups` shadow implementation needs a map now.
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1265,12 +1477,305 @@ mod tests {
             },
         ];
 
-        assert_eq!(coalesced_write_groups(&writes), vec![vec![0, 2, 1]]);
+        assert_eq!(group_vecs(&coalesced_write_groups(&writes)), vec![vec![0, 2, 1]]);
+    }
+
+    /// The pre-2026-08-02 grouping, kept verbatim as the reference the flat
+    /// [`WriteGroups`] builder is checked against. Same partition, same member
+    /// order, same emission order — the rewrite is an allocation change only, so
+    /// any divergence here is a bug in the rewrite and not a policy choice.
+    fn reference_write_groups(ops: &[StripWrite<'_>]) -> Vec<Vec<usize>> {
+        let mut by_location: BTreeMap<(crate::types::PdId, u32), Vec<usize>> = BTreeMap::new();
+        for (idx, op) in ops.iter().enumerate() {
+            by_location
+                .entry((op.pd.pd_id(), op.chunklet_index))
+                .or_default()
+                .push(idx);
+        }
+        let mut groups = Vec::new();
+        for (_, original_indices) in by_location {
+            let mut indices = original_indices.clone();
+            indices.sort_unstable_by_key(|&idx| ops[idx].in_chunklet_off);
+            let overlaps = indices.windows(2).any(|pair| {
+                let first = &ops[pair[0]];
+                first.in_chunklet_off + first.data.len() as u64 > ops[pair[1]].in_chunklet_off
+            });
+            if overlaps {
+                groups.extend(original_indices.into_iter().map(|idx| vec![idx]));
+                continue;
+            }
+            let mut current: Vec<usize> = Vec::new();
+            let mut current_end = 0u64;
+            let mut current_bytes = 0usize;
+            for idx in indices {
+                let op = &ops[idx];
+                let adjacent = !current.is_empty() && op.in_chunklet_off == current_end;
+                if !current.is_empty()
+                    && (!adjacent || current_bytes + op.data.len() > MAX_COALESCED_WRITE_BYTES)
+                {
+                    groups.push(std::mem::take(&mut current));
+                    current_bytes = 0;
+                }
+                current_end = op.in_chunklet_off + op.data.len() as u64;
+                current_bytes += op.data.len();
+                current.push(idx);
+            }
+            if !current.is_empty() {
+                groups.push(current);
+            }
+        }
+        groups
+    }
+
+    fn group_vecs(groups: &WriteGroups) -> Vec<Vec<usize>> {
+        groups.iter().map(|group| group.to_vec()).collect()
+    }
+
+    /// Build a [`WriteGroups`] from an explicit partition, for tests that only
+    /// care about the group → original-index expansion.
+    fn groups_from(partition: &[&[usize]]) -> WriteGroups {
+        let mut order = Vec::new();
+        let mut spans = Vec::new();
+        for group in partition {
+            spans.push((order.len() as u32, group.len() as u32));
+            order.extend_from_slice(group);
+        }
+        WriteGroups { order, spans }
+    }
+
+    /// Randomised equivalence against [`reference_write_groups`] over shapes that
+    /// exercise every rule: several PDs and chunklets, adjacency runs, holes,
+    /// byte overlap (whole-key degrade), and groups long enough to hit
+    /// [`MAX_COALESCED_WRITE_BYTES`].
+    #[test]
+    fn write_groups_match_the_reference_grouping() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let pds: Vec<Arc<PhysicalDisk>> = (0..3)
+            .map(|i| test_pd(&dir, &format!("pd{i}"), i, false))
+            .collect();
+        // One page per distinct length so `data.len()` can vary independently.
+        let page4k = vec![0u8; 4096];
+        let page8k = vec![0u8; 8192];
+        let mut rng = StdRng::seed_from_u64(0xC0A1E5CE);
+
+        for round in 0..400 {
+            let n = rng.gen_range(1..40);
+            let mut ops: Vec<StripWrite<'_>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let data: &[u8] = if rng.gen_bool(0.75) { &page4k } else { &page8k };
+                // A small offset lattice makes adjacency AND overlap both common.
+                let slot: u64 = rng.gen_range(0..8);
+                ops.push(StripWrite {
+                    pd: pds[rng.gen_range(0..pds.len())].clone(),
+                    chunklet_index: rng.gen_range(0..2),
+                    in_chunklet_off: slot * 4096,
+                    data,
+                });
+            }
+            assert_eq!(
+                group_vecs(&coalesced_write_groups(&ops)),
+                reference_write_groups(&ops),
+                "round {round} diverged for {} ops",
+                ops.len()
+            );
+        }
+    }
+
+    /// The byte cap must still cut a long adjacency run, and at the same place.
+    #[test]
+    fn write_groups_respect_the_coalesce_byte_cap() {
+        let dir = TempDir::new().unwrap();
+        let pd = test_pd(&dir, "pd0", 0, false);
+        let page = vec![0u8; 4096];
+        let per_group = MAX_COALESCED_WRITE_BYTES / page.len();
+        let n = per_group + 3;
+        let ops: Vec<StripWrite<'_>> = (0..n)
+            .map(|i| StripWrite {
+                pd: pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: i as u64 * 4096,
+                data: &page,
+            })
+            .collect();
+        let groups = coalesced_write_groups(&ops);
+        assert_eq!(group_vecs(&groups), reference_write_groups(&ops));
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.group(0).len(), per_group);
+        assert_eq!(groups.group(1).len(), 3);
+    }
+
+    /// The whole point of the rewrite: no allocation per group. `order` is one
+    /// vec sized by the op count and `spans` one vec of `(start, len)`, so a
+    /// 567-op LV3 wave allocates twice rather than ~1600 times.
+    #[test]
+    fn write_groups_allocate_twice_regardless_of_group_count() {
+        let dir = TempDir::new().unwrap();
+        let pd = test_pd(&dir, "pd0", 0, false);
+        let page = vec![0u8; 4096];
+        // Stride 2 pages ⇒ nothing adjacent ⇒ one group per op, the worst case.
+        let ops: Vec<StripWrite<'_>> = (0..64)
+            .map(|i| StripWrite {
+                pd: pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: i as u64 * 8192,
+                data: &page,
+            })
+            .collect();
+        let groups = coalesced_write_groups(&ops);
+        assert_eq!(groups.len(), 64);
+        assert!(groups.all_single());
+        assert_eq!(groups.order.len(), ops.len());
+        assert!(groups.order.capacity() <= ops.len());
+        assert!(groups.spans.capacity() <= ops.len());
+    }
+
+    /// Strip slices carved out of one aligned buffer, which is what an LD hands
+    /// in on the full-stripe path. Plain arrays/`Vec`s are NOT reliably 4 KiB
+    /// aligned, and O_DIRECT checks every iovec, so a fixture built from those
+    /// would silently test the bounce fallback instead of the vectored path.
+    fn aligned_pages(count: usize) -> AlignedBuf {
+        let mut buf = AlignedBuf::new(count * 4096).unwrap();
+        for (i, byte) in buf.as_mut_slice().iter_mut().enumerate() {
+            *byte = ((i / 4096 + 1) * 7 + i % 251) as u8;
+        }
+        buf
+    }
+
+    #[test]
+    fn writev_safety_requires_every_part_to_be_block_aligned() {
+        let dir = TempDir::new().unwrap();
+        let pd = test_pd(&dir, "pd0", 0, false);
+        let pages = aligned_pages(3);
+        let aligned: Vec<StripWrite<'_>> = (0..3)
+            .map(|i| StripWrite {
+                pd: pd.clone(),
+                chunklet_index: 0,
+                in_chunklet_off: i as u64 * 4096,
+                data: &pages.as_slice()[i * 4096..(i + 1) * 4096],
+            })
+            .collect();
+        assert!(group_is_writev_safe(&aligned, &[0, 1, 2]));
+
+        // One part shifted off a block boundary in MEMORY (its device offset is
+        // still fine) must sink the whole group to the bounce path.
+        let skewed_page = &pages.as_slice()[512..512 + 4096];
+        let mut skewed = aligned.clone();
+        skewed[1] = StripWrite {
+            pd: pd.clone(),
+            chunklet_index: 0,
+            in_chunklet_off: 4096,
+            data: skewed_page,
+        };
+        assert!(!group_is_writev_safe(&skewed, &[0, 1, 2]));
+
+        // A short (non-block-multiple) part is equally unsubmittable.
+        let mut stubby = aligned.clone();
+        stubby[2] = StripWrite {
+            pd,
+            chunklet_index: 0,
+            in_chunklet_off: 8192,
+            data: &pages.as_slice()[8192..8192 + 2048],
+        };
+        assert!(!group_is_writev_safe(&stubby, &[0, 1, 2]));
+    }
+
+    #[test]
+    fn bounce_parts_concatenates_in_order_and_zeroes_the_tail() {
+        let a = [0xaa; 1000];
+        let b = [0xbb; 2000];
+        let buf = bounce_parts(&[&a, &b]).unwrap();
+        assert_eq!(buf.len(), 4096, "rounded up to one block");
+        assert!(buf.as_slice()[..1000].iter().all(|&x| x == 0xaa));
+        assert!(buf.as_slice()[1000..3000].iter().all(|&x| x == 0xbb));
+        assert!(
+            buf.as_slice()[3000..].iter().all(|&x| x == 0),
+            "the pad must be zeroed, not allocator garbage"
+        );
+    }
+
+    /// The new short-write recovery for a vectored group: there is no contiguous
+    /// buffer to re-issue, so each part must be rewritten at ITS OWN device
+    /// offset. Getting the offset arithmetic wrong here would silently duplicate
+    /// one strip over another.
+    #[test]
+    fn write_parts_exact_lands_every_part_at_its_own_offset() {
+        let dir = TempDir::new().unwrap();
+        let pd = test_pd(&dir, "pd0", 0, false);
+        let pages = aligned_pages(3);
+        let parts: Vec<&[u8]> = (0..3)
+            .map(|i| &pages.as_slice()[i * 4096..(i + 1) * 4096])
+            .collect();
+        let write = PhysWrite {
+            pd: &pd,
+            chunklet_index: 0,
+            in_chunklet_off: 4096,
+            parts: &parts,
+        };
+        write.write_parts_exact().unwrap();
+
+        let mut got = vec![0u8; 3 * 4096];
+        pd.read_chunklet_user(0, 4096, &mut got).unwrap();
+        assert_eq!(got, pages.as_slice(), "parts must be contiguous on device");
+        // ...and nothing landed at the offset the group did NOT cover.
+        let mut before = vec![0xffu8; 4096];
+        pd.read_chunklet_user(0, 0, &mut before).unwrap();
+        assert!(before.iter().all(|&b| b == 0), "wrote below the group start");
+    }
+
+    /// End-to-end: a merged group submitted as iovecs must land byte-identical to
+    /// the same strips written separately. Correctness is the gate here; the
+    /// `CHUNKLET_WRITEV_COALESCE=1` suite sweep is what proves every OTHER caller
+    /// still works when this path is taken.
+    #[test]
+    fn vectored_merged_group_round_trips_like_separate_writes() {
+        let dir = TempDir::new().unwrap();
+        let pd = test_pd(&dir, "pd0", 0, false);
+        let backend = match UringBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("io_uring unavailable; skipping vectored submit: {error}");
+                return;
+            }
+        };
+        let pages = aligned_pages(6);
+        let writes: Vec<StripWrite<'_>> = (0..6)
+            .map(|i| StripWrite {
+                pd: pd.clone(),
+                chunklet_index: 0,
+                // Interleaved arrival order, adjacent on the device: exactly the
+                // shape `coalesced_write_groups` exists to merge.
+                in_chunklet_off: [0u64, 8192, 4096, 20480, 12288, 16384][i],
+                data: &pages.as_slice()[i * 4096..(i + 1) * 4096],
+            })
+            .collect();
+        let groups = coalesced_write_groups(&writes);
+        assert_eq!(groups.len(), 1, "the fixture must merge into one group");
+        assert!(group_is_writev_safe(&writes, groups.group(0)));
+
+        let previous = writev_coalesce_enabled();
+        set_writev_coalesce(true);
+        let results = backend.submit_writes_detailed_with_class(IoClass::DrainData, &writes);
+        set_writev_coalesce(previous);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+
+        // Device order is by offset, so read back and compare against the strips
+        // re-sorted the same way.
+        let mut got = vec![0u8; 6 * 4096];
+        pd.read_chunklet_user(0, 0, &mut got).unwrap();
+        let mut expected = vec![0u8; 6 * 4096];
+        for write in &writes {
+            let at = write.in_chunklet_off as usize;
+            expected[at..at + 4096].copy_from_slice(write.data);
+        }
+        assert_eq!(got, expected);
     }
 
     #[test]
     fn physical_completions_expand_to_coalesced_originals_with_global_offset() {
-        let groups = vec![vec![2, 0], vec![1], vec![3, 4]];
+        let groups = groups_from(&[&[2, 0], &[1], &[3, 4]]);
         let completions = vec![
             ValidatedCompletion {
                 index: 2,
@@ -1302,7 +1807,7 @@ mod tests {
 
         let recovered = Cell::new(false);
         let published = RefCell::new(Vec::new());
-        let groups = vec![vec![0, 2]];
+        let groups = groups_from(&[&[0, 2]]);
         let mut observer = |completions: &[ValidatedCompletion]| {
             assert!(
                 recovered.get(),

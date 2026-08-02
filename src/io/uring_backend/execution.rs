@@ -2126,6 +2126,7 @@ mod tests {
             background_cpus: vec![1, 3, 5],
             coalesced_wait: false,
             write_chunk_ops: 0,
+            writev_coalesce: false,
         })
         .unwrap();
         let snapshot = pools.snapshot();

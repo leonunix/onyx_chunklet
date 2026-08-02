@@ -58,7 +58,10 @@ class_counters!(
     SUBMIT_OPS,
     SUBMIT_SQES,
     SUBMIT_BOUNCE_BYTES,
-    SUBMIT_BOUNCE_NS,
+    SUBMIT_BOUNCE_ALLOCS,
+    SUBMIT_GROUP_NS,
+    SUBMIT_COPY_NS,
+    SUBMIT_BUILD_NS,
     SUBMIT_WAIT_NS,
 );
 
@@ -141,10 +144,32 @@ pub struct SubmitClassStats {
     pub sqes: u64,
     /// Bytes memcpy'd into bounce buffers to merge adjacent strips.
     pub bounce_bytes: u64,
-    pub bounce_ns: u64,
+    /// Bounce buffers allocated. `copy_ns / bounce_allocs` separates "the copy is
+    /// slow" from "the allocation is slow" — the 2026-08-02 box read could not,
+    /// and 205 µs/call on the LV2 class was ~10x what a linear copy of
+    /// `bounce_bytes` can explain.
+    pub bounce_allocs: u64,
+    /// Adjacency grouping only (`coalesced_write_groups`).
+    pub group_ns: u64,
+    /// Bounce buffer allocation + fill + the strip copies into it.
+    pub copy_ns: u64,
+    /// Building the per-SQE descriptors handed to the ring.
+    pub build_ns: u64,
     /// Push + `io_uring_enter` + CQ drain, summed over waves. With
     /// `uring_coalesced_wait = false` this includes one enter per completion.
     pub wait_ns: u64,
+}
+
+impl SubmitClassStats {
+    /// The whole pre-submit stage. Was one opaque `bounce_ns` counter until
+    /// 2026-08-02; kept as a derived sum so existing readers and the box
+    /// baselines stay comparable. The three parts are mutually exclusive and
+    /// cover the stage, so a caller-side residual means a new cost centre.
+    pub fn bounce_ns(&self) -> u64 {
+        self.group_ns
+            .saturating_add(self.copy_ns)
+            .saturating_add(self.build_ns)
+    }
 }
 
 pub fn stats() -> WritePathStats {
@@ -167,7 +192,10 @@ pub fn stats() -> WritePathStats {
             ops: g(&SUBMIT_OPS[i]),
             sqes: g(&SUBMIT_SQES[i]),
             bounce_bytes: g(&SUBMIT_BOUNCE_BYTES[i]),
-            bounce_ns: g(&SUBMIT_BOUNCE_NS[i]),
+            bounce_allocs: g(&SUBMIT_BOUNCE_ALLOCS[i]),
+            group_ns: g(&SUBMIT_GROUP_NS[i]),
+            copy_ns: g(&SUBMIT_COPY_NS[i]),
+            build_ns: g(&SUBMIT_BUILD_NS[i]),
             wait_ns: g(&SUBMIT_WAIT_NS[i]),
         }),
     }
@@ -184,6 +212,17 @@ mod tests {
         record_max(&c, 3);
         record_max(&c, 9);
         assert_eq!(c.load(Ordering::Relaxed), 9);
+    }
+
+    #[test]
+    fn bounce_ns_is_the_sum_of_the_three_stage_parts() {
+        let s = SubmitClassStats {
+            group_ns: 7,
+            copy_ns: 11,
+            build_ns: 13,
+            ..Default::default()
+        };
+        assert_eq!(s.bounce_ns(), 31);
     }
 
     #[test]

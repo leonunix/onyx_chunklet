@@ -421,9 +421,9 @@ fn prepare_writes<'a>(
     let groups = coalesced_write_groups(&writes);
     let mut prepared = Vec::with_capacity(groups.len());
     let mut failures = Vec::new();
-    for group in groups {
+    for group in groups.iter() {
         let originals: Vec<_> = group.iter().map(|&index| admitted[index].index).collect();
-        match prepare_group(&writes, &group, originals.clone()) {
+        match prepare_group(&writes, group, originals.clone()) {
             Ok(write) => prepared.push(write),
             Err(message) => failures.push((originals, message)),
         }
@@ -460,7 +460,9 @@ fn prepare_group<'a>(
         });
         let total_bytes = total_bytes
             .ok_or_else(|| "io_uring dispatched coalesced write length overflow".to_string())?;
-        let mut buffer = AlignedBuf::new(total_bytes)
+        // `uninit`: the copy below fills every byte, so `new`'s zero-fill is
+        // pure waste (same reason as the inline path's bounce buffer).
+        let mut buffer = AlignedBuf::uninit(total_bytes)
             .map_err(|error| format!("io_uring dispatched coalesced alloc: {error}"))?;
         let mut cursor = 0usize;
         for &index in group {
