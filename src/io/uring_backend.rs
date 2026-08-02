@@ -714,8 +714,8 @@ fn map_physical_completions(
         .collect()
 }
 
-/// Adjacency groups over one wave's ops, in TWO allocations total rather than
-/// two per group.
+/// Adjacency groups over one wave's ops, in a fixed number of allocations rather
+/// than two per group.
 ///
 /// The previous shape was `Vec<Vec<usize>>` built through a
 /// `BTreeMap<(PdId, u32), Vec<usize>>`: a `Vec` per PD/chunklet key, a clone of
@@ -773,23 +773,30 @@ fn group_is_writev_safe(ops: &[StripWrite<'_>], group: &[usize]) -> bool {
 /// [`MAX_COALESCED_WRITE_BYTES`]. `write_groups_match_the_reference_grouping`
 /// pins the equivalence against the original implementation.
 fn coalesced_write_groups(ops: &[StripWrite<'_>]) -> WriteGroups {
+    // Extract each op's key ONCE. `PhysicalDisk::pd_id` takes that PD's state
+    // RwLock, and `sort_unstable_by_key` re-invokes its key function on every
+    // comparison, so sorting by it directly costs O(N log N) lock acquisitions —
+    // box-measured as 50% of this whole stage on the LV2 class and 88-92% on the
+    // LV3/metadb classes, i.e. worse than the map it replaced (which took the
+    // lock once per op). Comparisons below touch nothing but this array.
+    let keys: Vec<(crate::types::PdId, u32, u64)> = ops
+        .iter()
+        .map(|op| (op.pd.pd_id(), op.chunklet_index, op.in_chunklet_off))
+        .collect();
     let mut order: Vec<usize> = (0..ops.len()).collect();
-    order.sort_unstable_by_key(|&idx| {
-        let op = &ops[idx];
-        (op.pd.pd_id(), op.chunklet_index, op.in_chunklet_off)
-    });
+    order.sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]));
 
     let mut spans: Vec<(u32, u32)> = Vec::with_capacity(ops.len());
     let mut key_start = 0usize;
     while key_start < order.len() {
         let key = {
-            let op = &ops[order[key_start]];
-            (op.pd.pd_id(), op.chunklet_index)
+            let (pd, chunklet, _) = keys[order[key_start]];
+            (pd, chunklet)
         };
         let mut key_end = key_start + 1;
         while key_end < order.len() {
-            let op = &ops[order[key_end]];
-            if (op.pd.pd_id(), op.chunklet_index) != key {
+            let (pd, chunklet, _) = keys[order[key_end]];
+            if (pd, chunklet) != key {
                 break;
             }
             key_end += 1;
@@ -1607,9 +1614,9 @@ mod tests {
         assert_eq!(groups.group(1).len(), 3);
     }
 
-    /// The whole point of the rewrite: no allocation per group. `order` is one
-    /// vec sized by the op count and `spans` one vec of `(start, len)`, so a
-    /// 567-op LV3 wave allocates twice rather than ~1600 times.
+    /// The whole point of the rewrite: no allocation per group. The builder's
+    /// working set is a fixed number of op-sized vecs, so a 567-op LV3 wave
+    /// allocates a handful of times rather than ~1600.
     #[test]
     fn write_groups_allocate_twice_regardless_of_group_count() {
         let dir = TempDir::new().unwrap();

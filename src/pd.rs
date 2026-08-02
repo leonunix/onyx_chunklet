@@ -40,6 +40,13 @@ use crate::types::{
 
 pub struct PhysicalDisk {
     raw: RawDevice,
+    /// The PD's identity, immutable from construction. Duplicated OUT of
+    /// [`PdState`] because `pd_id()` is a hot grouping key on the write submit
+    /// path: chunklet's adjacency grouping keys every strip by it, so serving it
+    /// from behind `state`'s RwLock put a lock acquisition (and its cache-line
+    /// ping-pong across ~60 threads sharing 10 PDs) inside a sort comparator.
+    /// `PdState::pd_id` stays as the value the superblock round-trips.
+    pd_id: PdId,
     state: RwLock<PdState>,
     numa_node: parking_lot::RwLock<Option<u16>>,
     /// Pool-wide backend for fan-out writes. Set at PD construction
@@ -144,6 +151,7 @@ impl PhysicalDisk {
         let numa_node = crate::numa::detect_pd_node(raw.path());
         let pd = Arc::new(Self {
             raw,
+            pd_id: state.pd_id,
             state: RwLock::new(state),
             numa_node: parking_lot::RwLock::new(numa_node),
             backend: parking_lot::RwLock::new(default_backend()),
@@ -196,6 +204,7 @@ impl PhysicalDisk {
         let numa_node = crate::numa::detect_pd_node(raw.path());
         Ok(Arc::new(Self {
             raw,
+            pd_id: state.pd_id,
             state: RwLock::new(state),
             numa_node: parking_lot::RwLock::new(numa_node),
             backend: parking_lot::RwLock::new(default_backend()),
@@ -250,8 +259,9 @@ impl PhysicalDisk {
         self.state.read().pool_id
     }
 
+    /// Lock-free: see the field's comment on why this one is hoisted.
     pub fn pd_id(&self) -> PdId {
-        self.state.read().pd_id
+        self.pd_id
     }
 
     pub fn manifest_gen(&self) -> u64 {
@@ -714,6 +724,12 @@ mod tests {
         assert_eq!(info2.pool_id, pool_id);
         assert_eq!(info2.pd_id, pd_id);
         assert_eq!(info2.manifest_gen, 1);
+        // `pd_id()` is served from a field hoisted OUT of the state lock (it is a
+        // hot grouping key on the write submit path), so pin that the two copies
+        // agree on both construction paths — a silent drift would scatter one PD's
+        // strips across two adjacency groups.
+        assert_eq!(pd2.pd_id(), pd2.state.read().pd_id);
+        assert_eq!(pd2.pd_id(), pd_id);
     }
 
     #[test]
