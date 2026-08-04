@@ -72,14 +72,25 @@ pub struct UringPoolConfig {
     /// barriers a many-strip write must cross (capped by the ring depth).
     pub write_chunk_ops: usize,
     /// Submit an adjacency-merged group as one `IORING_OP_WRITEV` with an iovec
-    /// per strip, instead of copying the strips into one bounce buffer. Default
-    /// `false` (bounce, the long-shipped path).
+    /// per strip, instead of copying the strips into one bounce buffer.
     ///
-    /// Per-PD strip data is strided in memory (24 KiB apart for a 6+2 RAID6
-    /// stripe), so a merged group can never be contiguous in the caller's buffer
-    /// — the copy is inherent to merging, and it is what made merging a net loss
-    /// on the box: raising the LV3 merge cut 0.29 ms/call of SQE wait but added
-    /// 0.94 ms/call to the materialise stage.
+    /// **On by default since 2026-08-02.** Per-PD strip data is strided in memory
+    /// (24 KiB apart for a 6+2 RAID6 stripe), so a merged group can never be
+    /// contiguous in the caller's buffer — the copy is inherent to merging.
+    /// Box-accepted at the pre-submit stage per submit call, together with the
+    /// once-per-op grouping key of the same session:
+    ///
+    /// | class | 2026-08-02 before | grouping fix only | + writev |
+    /// |---|---|---|---|
+    /// | foreground (LV2) | 205.3 µs | 37.9 µs | **4.7 µs** |
+    /// | drain_data (LV3) | 505 µs | 179.5 µs | **52.2 µs** |
+    /// | drain_meta | 1262 µs | 499.0 µs | **131.8 µs** |
+    ///
+    /// `bounce_bytes` and `bounce_allocs` go to 0, `sqes` per call and the merge
+    /// factor are unchanged (it must not alter IO shape), and the LV2 `lane` /
+    /// `coord` duties fell 56.4 → 41.6 % and 41.7 → 28.8 %. `false` is the
+    /// rollback; a strip that is not itself block aligned still falls its whole
+    /// group back to the bounce path, so correctness never depends on this.
     pub writev_coalesce: bool,
 }
 
@@ -92,7 +103,7 @@ impl UringPoolConfig {
             background_cpus: Vec::new(),
             coalesced_wait: false,
             write_chunk_ops: 0,
-            writev_coalesce: false,
+            writev_coalesce: true,
         }
     }
 }

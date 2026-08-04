@@ -153,7 +153,8 @@ fn write_chunk_ops() -> usize {
 
 /// Submit an adjacency-merged group as one vectored write instead of copying its
 /// strips into a bounce buffer. See [`UringPoolConfig::writev_coalesce`].
-static WRITEV_COALESCE: AtomicBool = AtomicBool::new(false);
+/// **On by default since 2026-08-02** (box-accepted).
+static WRITEV_COALESCE: AtomicBool = AtomicBool::new(true);
 
 /// Enable/disable vectored submission of merged groups. Applies process-wide to
 /// every subsequent batch.
