@@ -669,9 +669,9 @@ fn submit_coalesced_chunk_detailed_with_callback(
     let wait_started = Instant::now();
     let submitted_results =
         submit_chunk_detailed_with_callback(ring, &submitted, stream_arrivals, |completions| {
-        let indices = map_physical_completions(&groups, completions, 0);
-        on_completed(&indices);
-    });
+            let indices = map_physical_completions(&groups, completions, 0);
+            on_completed(&indices);
+        });
     wp::record_since(&wp::SUBMIT_WAIT_NS[slot], wait_started);
     let mut results: Vec<Option<ChunkletResult<()>>> = (0..ops.len()).map(|_| None).collect();
     for (index, result) in submitted_results.into_iter().enumerate() {
@@ -1485,7 +1485,10 @@ mod tests {
             },
         ];
 
-        assert_eq!(group_vecs(&coalesced_write_groups(&writes)), vec![vec![0, 2, 1]]);
+        assert_eq!(
+            group_vecs(&coalesced_write_groups(&writes)),
+            vec![vec![0, 2, 1]]
+        );
     }
 
     /// The pre-2026-08-02 grouping, kept verbatim as the reference the flat
@@ -1730,7 +1733,10 @@ mod tests {
         // ...and nothing landed at the offset the group did NOT cover.
         let mut before = vec![0xffu8; 4096];
         pd.read_chunklet_user(0, 0, &mut before).unwrap();
-        assert!(before.iter().all(|&b| b == 0), "wrote below the group start");
+        assert!(
+            before.iter().all(|&b| b == 0),
+            "wrote below the group start"
+        );
     }
 
     /// End-to-end: a merged group submitted as iovecs must land byte-identical to

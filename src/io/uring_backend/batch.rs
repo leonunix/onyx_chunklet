@@ -92,7 +92,13 @@ pub(super) fn wait_and_drain(
     // the WHOLE batch in one `io_uring_enter` instead of waking once per CQE.
     // Staggered NVMe completions otherwise cost one wake round-trip each, which
     // dominates a batch of hundreds of 4 KiB strip writes.
-    wait_and_drain_with_mode(ring, expected, context, coalesced_wait_enabled(), &mut |_| {})
+    wait_and_drain_with_mode(
+        ring,
+        expected,
+        context,
+        coalesced_wait_enabled(),
+        &mut |_| {},
+    )
 }
 
 /// Variant of [`wait_and_drain`] that publishes each CQ drain after validating
