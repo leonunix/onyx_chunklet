@@ -183,11 +183,16 @@ pub(crate) struct LdRuntime {
 }
 
 impl LdRuntime {
-    pub fn new(suspect_tx: Sender<SuspectMember>) -> Self {
+    /// `lock_group_shift` groups consecutive keys onto one bucket in BOTH lock
+    /// tables — see [`StripeLockTable`] for why, and [`build_ld_runtime`] for how
+    /// it is chosen. Both tables must use the same shift: they are keyed in
+    /// different spaces but a batch pays each one's footprint, and the whole point
+    /// is to bound that footprint.
+    pub fn new(suspect_tx: Sender<SuspectMember>, lock_group_shift: u32) -> Self {
         Self {
             io_lock: RwLock::new(()),
-            range_locks: StripeLockTable::new(),
-            stripe_locks: Arc::new(StripeLockTable::new()),
+            range_locks: StripeLockTable::with_group_shift(lock_group_shift),
+            stripe_locks: Arc::new(StripeLockTable::with_group_shift(lock_group_shift)),
             rebuild: new_rebuild_cell(),
             suspect_tx,
             epoch: AtomicU64::new(0),
@@ -233,8 +238,31 @@ pub(crate) fn build_ld_runtime(
     ld_list
         .lds
         .iter()
-        .map(|desc| (desc.id, Arc::new(LdRuntime::new(suspect_tx.clone()))))
+        .map(|desc| {
+            let shift = lock_group_shift_for(desc.raid_level);
+            (desc.id, Arc::new(LdRuntime::new(suspect_tx.clone(), shift)))
+        })
         .collect()
+}
+
+/// Lock-table key grouping for one LD, by RAID level.
+///
+/// Parity LDs are the ones that take large batched writes — onyx's LV3 flusher
+/// hands in hundreds of stripes per `write_many_at` — so they are the ones whose
+/// lock footprint has to be bounded ([`StripeLockTable`]).
+///
+/// Mirror/plain/raid0 stay ungrouped ON PURPOSE. onyx's LV2 ring and the metadb
+/// page window are RAID10, and a ring log writes ADJACENT keys from independent
+/// callers; grouping those would put unrelated concurrent appends on one bucket
+/// and manufacture contention on the durable-ack path, which is already 90-94 %
+/// of foreground append time.
+pub(crate) fn lock_group_shift_for(raid_level: crate::RaidLevel) -> u32 {
+    match raid_level {
+        crate::RaidLevel::Raid5 | crate::RaidLevel::Raid6 => {
+            crate::ld::STRIPE_LOCK_GROUP_SHIFT_BATCHED
+        }
+        crate::RaidLevel::Plain | crate::RaidLevel::Mirror | crate::RaidLevel::Raid0 => 0,
+    }
 }
 
 /// Per-PD health enum. Phase 5 only distinguishes Healthy / Failed (PD-level).

@@ -26,6 +26,21 @@ macro_rules! counters {
     };
 }
 
+// `RuntimeLogicalDisk::write_many_at` — the wrapper the caller actually enters,
+// OUTSIDE the RAID6 ledger below. It was instrumented only as a `tracing::warn!`,
+// so on the box it showed up as 23.84 of 54.22 ms per LV3 call (44 %) that no
+// counter could attribute. Its own range-lock batch is a second footprint on top
+// of `R6_LOCK_NS`, which is exactly what needed measuring.
+counters!(
+    RT_WRITE_MANY_CALLS,
+    RT_WRITE_MANY_KEYS,
+    RT_LIFECYCLE_NS,
+    RT_KEY_BUILD_NS,
+    RT_RANGE_LOCK_NS,
+    RT_INNER_NS,
+    RT_TOTAL_NS,
+);
+
 counters!(
     R6_BATCH_CALLS,
     R6_BATCH_OPS,
@@ -75,7 +90,9 @@ pub(crate) fn class_slot() -> usize {
 pub(crate) fn record_since(counter: &AtomicU64, start: Instant) -> Instant {
     let now = Instant::now();
     counter.fetch_add(
-        now.saturating_duration_since(start).as_nanos().min(u64::MAX as u128) as u64,
+        now.saturating_duration_since(start)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64,
         Ordering::Relaxed,
     );
     now
@@ -99,6 +116,24 @@ pub(crate) fn record_max(counter: &AtomicU64, value: u64) {
 /// interval, so difference two snapshots and divide by the call/wave count.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WritePathStats {
+    /// `RuntimeLogicalDisk::write_many_at` entries (ALL raid levels — this is the
+    /// wrapper, above the per-level ledger).
+    pub rt_write_many_calls: u64,
+    /// Range-lock keys those calls built. Keyed per `max(strip, block)` unit, so
+    /// one 24 KiB op contributes 6 keys at a 4 KiB strip — `keys / calls` is the
+    /// outer lock footprint before grouping dedups it.
+    pub rt_write_many_keys: u64,
+    /// `io_lock.read()` — waiting out a rebuild/drain/drop that holds it for write.
+    pub rt_lifecycle_ns: u64,
+    pub rt_key_build_ns: u64,
+    /// `range_locks.write_keys` — the SECOND lock footprint, on top of
+    /// `r6_lock_ns`. Held across the whole inner call.
+    pub rt_range_lock_ns: u64,
+    /// The inner per-level `write_many_at`, i.e. what `r6_*` below measures.
+    pub rt_inner_ns: u64,
+    /// Whole wrapper call. `rt_total - rt_inner` is what the RAID6 ledger cannot
+    /// see, and the four legs above must cover it.
+    pub rt_total_ns: u64,
     /// `write_many_at` entries that took the batched RAID6 path.
     pub r6_batch_calls: u64,
     /// Caller-supplied ops (one per LD-level write) across those batches.
@@ -175,6 +210,13 @@ impl SubmitClassStats {
 pub fn stats() -> WritePathStats {
     let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
     WritePathStats {
+        rt_write_many_calls: g(&RT_WRITE_MANY_CALLS),
+        rt_write_many_keys: g(&RT_WRITE_MANY_KEYS),
+        rt_lifecycle_ns: g(&RT_LIFECYCLE_NS),
+        rt_key_build_ns: g(&RT_KEY_BUILD_NS),
+        rt_range_lock_ns: g(&RT_RANGE_LOCK_NS),
+        rt_inner_ns: g(&RT_INNER_NS),
+        rt_total_ns: g(&RT_TOTAL_NS),
         r6_batch_calls: g(&R6_BATCH_CALLS),
         r6_batch_ops: g(&R6_BATCH_OPS),
         r6_batch_stripes: g(&R6_BATCH_STRIPES),

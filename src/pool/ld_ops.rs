@@ -20,6 +20,7 @@ use crate::pool::{LdRuntime, Pool};
 use crate::types::{
     ChunkletState, HaDomain, LdId, LdRole, PdId, RaidLevel, CHUNKLET_HEADER_BYTES, CHUNKLET_SIZE,
 };
+use crate::write_path as wp;
 
 struct RuntimeLogicalDisk {
     inner: Arc<dyn LogicalDisk>,
@@ -119,6 +120,15 @@ impl LogicalDisk for RuntimeLogicalDisk {
         let inner_elapsed = inner_started.elapsed();
         drop(range_guards);
         let total_elapsed = total_started.elapsed();
+        // Counters, not just the warn below: this wrapper was 44 % of the LV3
+        // call on the box and no snapshot could see it.
+        wp::add(&wp::RT_WRITE_MANY_CALLS, 1);
+        wp::add(&wp::RT_WRITE_MANY_KEYS, keys.len() as u64);
+        wp::add(&wp::RT_LIFECYCLE_NS, lifecycle_wait.as_nanos() as u64);
+        wp::add(&wp::RT_KEY_BUILD_NS, key_build.as_nanos() as u64);
+        wp::add(&wp::RT_RANGE_LOCK_NS, range_wait.as_nanos() as u64);
+        wp::add(&wp::RT_INNER_NS, inner_elapsed.as_nanos() as u64);
+        wp::add(&wp::RT_TOTAL_NS, total_elapsed.as_nanos() as u64);
         if total_elapsed >= std::time::Duration::from_millis(5) {
             tracing::warn!(
                 ld = %self.id(),
@@ -642,8 +652,13 @@ impl Pool {
         }
         let mut s = self.state.write();
         s.ld_list.upsert(desc.clone());
-        s.ld_runtime
-            .insert(desc.id, Arc::new(LdRuntime::new(self.suspect_tx.clone())));
+        s.ld_runtime.insert(
+            desc.id,
+            Arc::new(LdRuntime::new(
+                self.suspect_tx.clone(),
+                super::lock_group_shift_for(desc.raid_level),
+            )),
+        );
         Ok(())
     }
 
