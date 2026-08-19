@@ -39,7 +39,9 @@ use crate::pd::PhysicalDisk;
 use crate::types::BLOCK_SIZE;
 use crate::write_path as wp;
 
-const URING_DEPTH: u32 = 256;
+/// SQ/CQ entries per thread-local ring. Also the hard cap on a submit wave: the
+/// SQ must hold a whole wave atomically (see [`set_write_chunk_ops`]).
+pub const URING_DEPTH: u32 = 256;
 const MAX_COALESCED_WRITE_BYTES: usize = 256 * 1024;
 
 mod batch;
@@ -121,7 +123,10 @@ pub fn set_coalesced_wait(enabled: bool) {
     COALESCED_WAIT.store(enabled, Ordering::Relaxed);
 }
 
-fn coalesced_wait_enabled() -> bool {
+/// Current state of the coalesced CQE wait. Public so an embedder can report
+/// what it actually flipped to (the setter has no return value, and this is a
+/// process-global latch rather than per-pool state).
+pub fn coalesced_wait_enabled() -> bool {
     COALESCED_WAIT.load(Ordering::Relaxed)
 }
 
@@ -147,7 +152,10 @@ pub fn set_write_chunk_ops(ops: usize) {
     WRITE_CHUNK_OPS.store(clamped, Ordering::Relaxed);
 }
 
-fn write_chunk_ops() -> usize {
+/// Current per-wave SQE count, i.e. the value after [`set_write_chunk_ops`]'s
+/// clamp. Public so an embedder that sets it at runtime can report the effective
+/// value instead of the requested one.
+pub fn write_chunk_ops() -> usize {
     WRITE_CHUNK_OPS.load(Ordering::Relaxed)
 }
 

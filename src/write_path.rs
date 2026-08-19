@@ -70,6 +70,7 @@ macro_rules! class_counters {
 class_counters!(
     SUBMIT_CALLS,
     SUBMIT_WAVES,
+    SUBMIT_ENTERS,
     SUBMIT_OPS,
     SUBMIT_SQES,
     SUBMIT_BOUNCE_BYTES,
@@ -172,6 +173,12 @@ pub struct SubmitClassStats {
     /// Stop-and-wait waves those calls were split into. `waves / calls` is the
     /// barrier count per batch, driven by `uring_write_chunk_ops`.
     pub waves: u64,
+    /// `io_uring_enter` calls made while waiting those waves out. This is the
+    /// direct read on `uring_coalesced_wait`: with it off, `enters` tracks `sqes`
+    /// (one wake per staggered NVMe completion); with it on, `enters` should fall
+    /// to roughly `waves`. Separating it from `wait_ns` is what distinguishes
+    /// "the syscalls went away" from "the device got faster".
+    pub enters: u64,
     /// Per-strip ops handed in, before adjacency merging.
     pub ops: u64,
     /// SQEs actually pushed. `ops / sqes` is the merge factor; `sqes / waves`
@@ -231,6 +238,7 @@ pub fn stats() -> WritePathStats {
         submit: std::array::from_fn(|i| SubmitClassStats {
             calls: g(&SUBMIT_CALLS[i]),
             waves: g(&SUBMIT_WAVES[i]),
+            enters: g(&SUBMIT_ENTERS[i]),
             ops: g(&SUBMIT_OPS[i]),
             sqes: g(&SUBMIT_SQES[i]),
             bounce_bytes: g(&SUBMIT_BOUNCE_BYTES[i]),

@@ -13,6 +13,7 @@ use io_uring::{squeue, IoUring};
 
 use super::coalesced_wait_enabled;
 use crate::error::{ChunkletError, ChunkletResult};
+use crate::write_path as wp;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RawCompletion {
@@ -127,9 +128,13 @@ pub(super) fn wait_and_drain_with_mode(
     coalesce: bool,
     on_drain: &mut impl FnMut(&[ValidatedCompletion]),
 ) -> BatchCompletions {
+    // Hoisted out of the wait closure: one thread-local read per wave instead of
+    // one per `io_uring_enter`, and the class cannot change mid-wave anyway.
+    let slot = wp::class_slot();
     match drive_completions_observed(
         expected,
         |remaining| {
+            wp::add(&wp::SUBMIT_ENTERS[slot], 1);
             // `remaining` counts SQEs of THIS batch that have not completed yet,
             // so it never exceeds what is still in flight — waiting for all of
             // them cannot block forever. Batches are capped at `URING_DEPTH` and
