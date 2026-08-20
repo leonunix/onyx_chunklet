@@ -643,6 +643,16 @@ fn write_batch_worker_loop(
         Ok(bufs) => bufs,
         Err(e) => return worker_init_error(job, lane, counters, "aligned write buffers", e),
     };
+    // Without --verify the payload bytes are never inspected, so refilling every
+    // buffer on every iteration measures the harness, not the LD:
+    // fill_verify_pattern is a byte-at-a-time loop with two 64-bit multiplies per
+    // byte (~1.5 GB/s/core), and at a multi-GB/s drain it dominated the profile.
+    // Seed each buffer once so the media does not see all zeroes, then reuse.
+    if !job.verify {
+        for (i, buf) in bufs.iter_mut().enumerate() {
+            fill_verify_pattern(&mut buf.as_mut_slice()[..job.io_len], i as u64);
+        }
+    }
     let mut offsets = vec![0u64; job.iodepth];
     // Give every batched lane a disjoint sequential region. Offsetting lanes by
     // one IO makes adjacent iodepth-wide batches overlap almost completely,
@@ -658,7 +668,9 @@ fn write_batch_worker_loop(
     while !stop.load(Ordering::Relaxed) {
         for (i, offset) in offsets.iter_mut().enumerate() {
             *offset = choose_offset(&job, &mut rng, &mut seq);
-            fill_verify_pattern(&mut bufs[i].as_mut_slice()[..job.io_len], *offset);
+            if job.verify {
+                fill_verify_pattern(&mut bufs[i].as_mut_slice()[..job.io_len], *offset);
+            }
         }
         let t0 = Instant::now();
         let ops: Vec<(u64, &[u8])> = offsets
@@ -718,6 +730,10 @@ fn worker_loop(
         Ok(buf) => buf,
         Err(e) => return worker_init_error(job, lane, counters, "aligned verify buffer", e),
     };
+    // Same reasoning as the batched path: seed once when the payload is not checked.
+    if !job.verify {
+        fill_verify_pattern(&mut write_buf.as_mut_slice()[..job.io_len], lane as u64);
+    }
     let mut seq = job.offset_bytes + ((lane as u64 * job.io_len as u64) % job.work_bytes);
     let mut stats = WorkerStats {
         job: job.name.clone(),
@@ -727,7 +743,7 @@ fn worker_loop(
     while !stop.load(Ordering::Relaxed) {
         let is_read = choose_read(job.workload, job.read_pct, &mut rng);
         let offset = choose_offset(&job, &mut rng, &mut seq);
-        if !is_read {
+        if !is_read && job.verify {
             fill_verify_pattern(&mut write_buf.as_mut_slice()[..job.io_len], offset);
         }
 
