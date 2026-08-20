@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use onyx_chunklet::io::{AlignedBuf, IoBackendKind, RawDevice};
-use onyx_chunklet::ld::{gf256, LogicalDisk};
+use onyx_chunklet::ld::{gf256, parity, LogicalDisk};
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{LdId, BLOCK_SIZE};
 use onyx_chunklet::{ChunkletResult, Pool, PoolConfig};
@@ -400,6 +400,20 @@ fn print_gf256_summary() {
     println!("gf256.mul_avx2_bytes={}", s.mul_avx2_bytes);
     println!("gf256.mul_scalar_calls={}", s.mul_scalar_calls);
     println!("gf256.mul_scalar_bytes={}", s.mul_scalar_bytes);
+    // Full-stripe and PDW syndrome work moved to the fused kernels, so the
+    // gf256.* counters above going quiet is expected — these are where it went.
+    let p = parity::stats_snapshot();
+    println!("parity.encode_calls_avx512={}", p.encode_calls_avx512);
+    println!("parity.encode_calls_avx2={}", p.encode_calls_avx2);
+    println!("parity.encode_calls_scalar={}", p.encode_calls_scalar);
+    println!("parity.encode_calls_legacy={}", p.encode_calls_legacy);
+    println!("parity.encode_src_bytes={}", p.encode_src_bytes);
+    println!("parity.delta_calls_avx512={}", p.delta_calls_avx512);
+    println!("parity.delta_calls_avx2={}", p.delta_calls_avx2);
+    println!("parity.delta_calls_scalar={}", p.delta_calls_scalar);
+    println!("parity.delta_calls_legacy={}", p.delta_calls_legacy);
+    println!("parity.delta_src_bytes={}", p.delta_src_bytes);
+    println!("parity.fused_enabled={}", parity::fused_enabled());
 }
 
 fn build_jobs(

@@ -73,6 +73,7 @@ use crate::error::{ChunkletError, ChunkletResult};
 use crate::ld::degrade::{absorb_degraded, is_runtime_read_fault, SuspectMember};
 use crate::ld::descriptor::LdDescriptor;
 use crate::ld::gf256;
+use crate::ld::parity;
 use crate::ld::{
     compute_strip_bytes, parallel_strip_reads, resolve_members, submit_strip_writes_detailed,
     LogicalDisk, ReconstructEngine, StripRead, StripWrite, StripeLockTable,

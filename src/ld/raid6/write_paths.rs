@@ -126,11 +126,11 @@ impl LdRaid6 {
         let strip = self.strip_bytes as usize;
         let mut p = vec![0u8; strip];
         let mut q = vec![0u8; strip];
-        for (pos, _off, range) in positions {
-            let data = &buf[range.clone()];
-            gf256::xor_into(&mut p, data);
-            gf256::mul_xor_into(&mut q, data, gf256::g_pow(*pos));
-        }
+        let data: Vec<(&[u8], u8)> = positions
+            .iter()
+            .map(|(pos, _off, range)| (&buf[range.clone()], gf256::g_pow(*pos)))
+            .collect();
+        parity::encode_pq(&mut p, &mut q, &data);
 
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 2);
         for (pos, off, range) in positions {

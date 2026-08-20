@@ -362,37 +362,41 @@ impl LdRaid6 {
         let strip = self.strip_bytes as usize;
         match seg.kind {
             Kind6::Full => {
-                seg.p.iter_mut().for_each(|b| *b = 0);
-                seg.q.iter_mut().for_each(|b| *b = 0);
-                for &(pos, _off, nd) in &seg.mods {
-                    gf256::xor_into(&mut seg.p, nd);
-                    gf256::mul_xor_into(&mut seg.q, nd, gf256::g_pow(pos));
-                }
+                // One pass over the data with P/Q held in vector registers.
+                // `encode_pq` writes rather than accumulates, so the strips are
+                // deliberately NOT pre-zeroed here.
+                let data: Vec<(&[u8], u8)> = seg
+                    .mods
+                    .iter()
+                    .map(|&(pos, _off, nd)| (nd, gf256::g_pow(pos)))
+                    .collect();
+                parity::encode_pq(&mut seg.p, &mut seg.q, &data);
             }
             Kind6::Pdw => {
-                let mut delta_p = vec![0u8; strip];
-                let mut delta_q = vec![0u8; strip];
-                // Materialize `d = old ^ new` once per position so both deltas
-                // fold it through the same SIMD primitives Full/Rw already use.
-                // The byte-at-a-time `gf256::mul` this replaces was the single
-                // largest CPU item on the small-write RMW path (perf on
-                // nvme-box: r6_compute 16.3% + gf256::mul 6.1% of all cycles at
-                // 208 k ops/s), and it left `mul_avx*_calls` at exactly 0.
-                // Scratch is hoisted so the arm still allocates only the two
-                // delta strips per segment.
-                let mut d = vec![0u8; strip];
-                for ((pos, off, nd), old) in seg.mods.iter().zip(seg.old_data.iter()) {
-                    let g_i = gf256::g_pow(*pos);
+                // `seg.p` / `seg.q` already hold the OLD syndromes read from
+                // disk, and each position touches a disjoint byte range, so the
+                // delta folds straight into them. That drops the two full-strip
+                // delta buffers, the `d` scratch, and the two closing full-strip
+                // XOR passes the delta buffers required — `d = new ^ old` now
+                // never reaches memory at all.
+                let Seg6 {
+                    mods,
+                    old_data,
+                    p,
+                    q,
+                    ..
+                } = &mut *seg;
+                for ((pos, off, nd), old) in mods.iter().zip(old_data.iter()) {
                     let off = *off as usize;
                     let len = nd.len();
-                    let d = &mut d[..len];
-                    d.copy_from_slice(nd);
-                    gf256::xor_into(d, old);
-                    gf256::xor_into(&mut delta_p[off..off + len], d);
-                    gf256::mul_xor_into(&mut delta_q[off..off + len], d, g_i);
+                    parity::accumulate_delta_pq(
+                        &mut p[off..off + len],
+                        &mut q[off..off + len],
+                        nd,
+                        old,
+                        gf256::g_pow(*pos),
+                    );
                 }
-                gf256::xor_into(&mut seg.p, &delta_p);
-                gf256::xor_into(&mut seg.q, &delta_q);
             }
             Kind6::Rw => {
                 for &(pos, off, nd) in &seg.mods {
@@ -403,12 +407,13 @@ impl LdRaid6 {
                         seg.new_strips[pos][off..off + nd.len()].copy_from_slice(nd);
                     }
                 }
-                seg.p.iter_mut().for_each(|b| *b = 0);
-                seg.q.iter_mut().for_each(|b| *b = 0);
-                for (i, s) in seg.new_strips.iter().enumerate() {
-                    gf256::xor_into(&mut seg.p, s);
-                    gf256::mul_xor_into(&mut seg.q, s, gf256::g_pow(i));
-                }
+                let data: Vec<(&[u8], u8)> = seg
+                    .new_strips
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.as_slice(), gf256::g_pow(i)))
+                    .collect();
+                parity::encode_pq(&mut seg.p, &mut seg.q, &data);
             }
         }
     }

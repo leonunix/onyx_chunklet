@@ -441,8 +441,10 @@ fn nibble_mul_table(c: u8, shift: u8) -> [u8; 16] {
     out
 }
 
+/// `pub(super)` so `ld::parity`'s fused kernels build the same tables instead of
+/// duplicating the nibble-split trick.
 #[inline]
-fn repeated_nibble_mul_table<const N: usize>(c: u8, shift: u8) -> [u8; N] {
+pub(super) fn repeated_nibble_mul_table<const N: usize>(c: u8, shift: u8) -> [u8; N] {
     debug_assert_eq!(N % 16, 0);
     let base = nibble_mul_table(c, shift);
     let mut out = [0u8; N];

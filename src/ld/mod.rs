@@ -17,6 +17,7 @@ pub mod degrade;
 pub mod descriptor;
 pub mod gf256;
 pub mod mirror;
+pub mod parity;
 pub mod plain;
 pub mod raid0;
 pub mod raid5;
