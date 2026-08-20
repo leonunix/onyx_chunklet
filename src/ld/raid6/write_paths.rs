@@ -222,9 +222,6 @@ impl LdRaid6 {
         budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
-        let mut delta_p = vec![0u8; strip];
-        let mut delta_q = vec![0u8; strip];
-
         let mut old_data: Vec<Vec<u8>> = positions
             .iter()
             .map(|(_pos, _off, range)| vec![0u8; range.end - range.start])
@@ -281,22 +278,22 @@ impl LdRaid6 {
             return Err(e);
         }
 
-        // Same SIMD folding as the batched PDW arm: materialize `d = old ^ new`
-        // once, then let `xor_into` / `mul_xor_into` do the vector work instead
-        // of a byte-at-a-time `gf256::mul`.
-        let mut d_scratch = vec![0u8; strip];
+        // Same single-pass folding as the batched PDW arm: `p` and `q` hold the
+        // old syndromes just read, and each position owns a disjoint byte range,
+        // so the delta goes straight in. No `d` scratch, no delta strips, no
+        // closing full-strip XOR pass.
         for ((pos, off, range), old_data) in positions.iter().zip(old_data.iter()) {
             let new_data = &buf[range.clone()];
+            let off = *off as usize;
             let len = new_data.len();
-            let g_i = gf256::g_pow(*pos);
-            let d = &mut d_scratch[..len];
-            d.copy_from_slice(new_data);
-            gf256::xor_into(d, old_data);
-            gf256::xor_into(&mut delta_p[(*off as usize)..(*off as usize) + len], d);
-            gf256::mul_xor_into(&mut delta_q[(*off as usize)..(*off as usize) + len], d, g_i);
+            parity::accumulate_delta_pq(
+                &mut p[off..off + len],
+                &mut q[off..off + len],
+                new_data,
+                old_data,
+                gf256::g_pow(*pos),
+            );
         }
-        gf256::xor_into(&mut p, &delta_p);
-        gf256::xor_into(&mut q, &delta_q);
 
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 2);
         for (pos, off, range) in positions {
