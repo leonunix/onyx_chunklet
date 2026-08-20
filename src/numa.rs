@@ -19,16 +19,80 @@ pub fn detect_pd_node(path: &Path) -> Option<u16> {
     detect_pd_node_from_root(path, Path::new("/sys"))
 }
 
+/// Resolve a PD path to its NUMA node, trying three sysfs shapes in order.
+///
+/// There is no single attribute that works across topologies, and getting
+/// `None` here is not harmless: `bind_current_to_node(None)` is a no-op, so a
+/// failed probe silently disables every affinity decision in the IO path as
+/// well as `HaDomain::Numa` allocation. Hence the ladder rather than one path.
 pub(crate) fn detect_pd_node_from_root(path: &Path, sys_root: &Path) -> Option<u16> {
     let block = block_device_name(path)?;
-    let path = sys_root
-        .join("class")
-        .join("block")
-        .join(block)
-        .join("device")
-        .join("numa_node");
-    let raw = std::fs::read_to_string(path).ok()?;
-    parse_numa_node(raw.trim())
+    let class_block = sys_root.join("class").join("block").join(&block);
+
+    // (1) Whatever the block layer's `device` link points at. Covers a
+    // directly-attached NVMe controller, SCSI/SATA, and anything else whose
+    // link lands on a node-carrying device.
+    if let Some(node) = read_numa_node(&class_block.join("device").join("numa_node")) {
+        return Some(node);
+    }
+
+    // (2) Nearest ancestor of the resolved sysfs path that carries `numa_node`
+    // — normally the PCI parent. Bounded to `sys_root` so an unrelated
+    // attribute further up can never leak in.
+    if let Some(node) = numa_node_from_ancestors(&class_block, sys_root) {
+        return Some(node);
+    }
+
+    // (3) NVMe multipath. `class/block/<ns>/device` resolves to the nvme
+    // *subsystem* (`nvme-subsysN`), which carries no `numa_node` and has no PCI
+    // ancestor at all — it lives under `devices/virtual/`. The controllers are
+    // children of that subsystem directory, so ask one of them. This is the
+    // shape on RHEL 10 / 6.12 (`nvme_core.multipath=Y`), and it is why every PD
+    // on nvme-box probed as `None` before this ladder existed.
+    numa_node_from_nvme_controllers(&class_block.join("device"))
+}
+
+fn read_numa_node(path: &Path) -> Option<u16> {
+    parse_numa_node(std::fs::read_to_string(path).ok()?.trim())
+}
+
+fn numa_node_from_ancestors(start: &Path, sys_root: &Path) -> Option<u16> {
+    let resolved = std::fs::canonicalize(start).ok()?;
+    let boundary = std::fs::canonicalize(sys_root).ok()?;
+    let mut cur = resolved.as_path();
+    while cur.starts_with(&boundary) {
+        if let Some(node) = read_numa_node(&cur.join("numa_node")) {
+            return Some(node);
+        }
+        cur = cur.parent()?;
+    }
+    None
+}
+
+/// `subsys_dir` is an nvme subsystem directory. Its children include both the
+/// controllers (`nvme0`) and the namespaces (`nvme0n1`); only a controller has a
+/// `device` link to the PCI function that knows the node. Names are matched
+/// structurally instead of derived from the namespace name, because the
+/// subsystem instance number is not guaranteed to equal the controller's.
+fn numa_node_from_nvme_controllers(subsys_dir: &Path) -> Option<u16> {
+    let mut names: Vec<String> = std::fs::read_dir(subsys_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|name| is_nvme_controller_name(name))
+        .collect();
+    names.sort();
+    names
+        .iter()
+        .find_map(|name| read_numa_node(&subsys_dir.join(name).join("device").join("numa_node")))
+}
+
+/// `nvme0` yes; `nvme0n1` / `ng0n1` / `nvme` no.
+fn is_nvme_controller_name(name: &str) -> bool {
+    match name.strip_prefix("nvme") {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
 }
 
 pub fn detect_nodes() -> Vec<NumaNode> {
@@ -198,6 +262,7 @@ fn set_current_cpus(_cpus: &[usize]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     #[test]
@@ -227,6 +292,77 @@ mod tests {
             detect_pd_node_from_root(Path::new("/dev/nvme0n1"), &dir.path().join("sys")),
             Some(1)
         );
+    }
+
+    /// Rung 2: the `device` link carries no `numa_node`, but a PCI ancestor of
+    /// the resolved path does.
+    #[test]
+    fn detects_pd_node_from_pci_ancestor() {
+        let dir = TempDir::new().unwrap();
+        let sys = dir.path().join("sys");
+        let pci = sys.join("devices").join("pci0000:16").join("0000:17:00.0");
+        let ns = pci.join("nvme").join("nvme0").join("nvme0n1");
+        std::fs::create_dir_all(&ns).unwrap();
+        std::fs::write(pci.join("numa_node"), "1\n").unwrap();
+        let class_block = sys.join("class").join("block");
+        std::fs::create_dir_all(&class_block).unwrap();
+        symlink(&ns, class_block.join("nvme0n1")).unwrap();
+        assert_eq!(
+            detect_pd_node_from_root(Path::new("/dev/nvme0n1"), &sys),
+            Some(1)
+        );
+    }
+
+    /// Rung 3: the NVMe-multipath shape seen on RHEL 10 / 6.12. The namespace
+    /// lives under `devices/virtual`, so it has no PCI ancestor at all, and
+    /// `device` points at the subsystem rather than the controller.
+    #[test]
+    fn detects_pd_node_through_nvme_multipath_subsystem() {
+        let dir = TempDir::new().unwrap();
+        let sys = dir.path().join("sys");
+        let subsys = sys
+            .join("devices")
+            .join("virtual")
+            .join("nvme-subsystem")
+            .join("nvme-subsys0");
+        std::fs::create_dir_all(subsys.join("nvme0n1")).unwrap();
+        // Decoys: a namespace and a generic char device must not be mistaken
+        // for the controller.
+        std::fs::create_dir_all(subsys.join("ng0n1")).unwrap();
+        let ctrl_pci = sys.join("devices").join("pci0000:16").join("0000:17:00.0");
+        std::fs::create_dir_all(&ctrl_pci).unwrap();
+        std::fs::write(ctrl_pci.join("numa_node"), "0\n").unwrap();
+        let ctrl = subsys.join("nvme0");
+        std::fs::create_dir_all(&ctrl).unwrap();
+        symlink(&ctrl_pci, ctrl.join("device")).unwrap();
+        // `device` hangs off the real namespace dir and points at the
+        // subsystem, exactly as the kernel lays it out under multipath.
+        symlink(&subsys, subsys.join("nvme0n1").join("device")).unwrap();
+        let class_block = sys.join("class").join("block");
+        std::fs::create_dir_all(&class_block).unwrap();
+        symlink(subsys.join("nvme0n1"), class_block.join("nvme0n1")).unwrap();
+        assert_eq!(
+            detect_pd_node_from_root(Path::new("/dev/nvme0n1"), &sys),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pd_node_is_none_when_sysfs_says_nothing() {
+        let dir = TempDir::new().unwrap();
+        let sys = dir.path().join("sys");
+        std::fs::create_dir_all(sys.join("class").join("block").join("nvme0n1")).unwrap();
+        assert_eq!(detect_pd_node_from_root(Path::new("/dev/nvme0n1"), &sys), None);
+    }
+
+    #[test]
+    fn controller_names_are_matched_structurally() {
+        assert!(is_nvme_controller_name("nvme0"));
+        assert!(is_nvme_controller_name("nvme12"));
+        assert!(!is_nvme_controller_name("nvme0n1"));
+        assert!(!is_nvme_controller_name("nvme0c0n1"));
+        assert!(!is_nvme_controller_name("ng0n1"));
+        assert!(!is_nvme_controller_name("nvme"));
     }
 
     #[test]
