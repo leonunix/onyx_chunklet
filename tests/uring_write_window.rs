@@ -129,6 +129,17 @@ fn windowed_submit_matches_the_barrier_byte_for_byte() {
         );
         return;
     }
+    // The pipelined RAID6 writer submits through the STREAMING dispatch path,
+    // not the batched one this file measures, so `waves` would be 0 and the
+    // push assertions meaningless. `tests/raid6_pipelined_writer.rs` covers
+    // that path.
+    if std::env::var_os("CHUNKLET_R6_PIPELINE_STRIPES").is_some() {
+        eprintln!(
+            "[uring_write_window] skipped: CHUNKLET_R6_PIPELINE_STRIPES routes RAID6 writes \
+             around the batched submit this test measures"
+        );
+        return;
+    }
     let mut results = Vec::new();
     let mut before = push_and_wave_totals();
     for window in [0usize, 8, 4096] {

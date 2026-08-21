@@ -13,6 +13,7 @@ use crate::io::backend::{
     DispatchedCompletion, DispatchedWrite, StripWrite, WriteDispatch, WriteDispatchStatus,
 };
 use crate::pd::PhysicalDisk;
+use crate::write_path as wp;
 
 const STREAM_DEPTH: usize = super::URING_DEPTH as usize;
 const SLOT_BITS: u32 = 8;
@@ -106,6 +107,14 @@ pub(super) fn submit_dispatched<'a>(
     dispatch: &mut dyn WriteDispatch<'a>,
 ) -> Vec<ChunkletResult<()>> {
     assert_ring_clean(ring, "io_uring dispatched write");
+    // Same submit ledger as the batched paths, so a pipelined arm is comparable
+    // to a barrier arm on `wp.submit[..]` instead of reading as all zeroes.
+    // `waves` stays 0 here: there is no stop-and-wait wave, which is the point,
+    // and `pushes` counts the SQ top-ups that replaced them.
+    let slot = wp::class_slot();
+    wp::add(&wp::SUBMIT_CALLS[slot], 1);
+    wp::add(&wp::SUBMIT_OPS[slot], total_ops as u64);
+    let wait_started = Instant::now();
     let mut output: Vec<Option<ChunkletResult<()>>> =
         std::iter::repeat_with(|| None).take(total_ops).collect();
     let mut slots: Vec<Option<InFlightWrite<'a>>> =
@@ -235,6 +244,7 @@ pub(super) fn submit_dispatched<'a>(
     }
 
     assert_ring_clean(ring, "io_uring dispatched write");
+    wp::record_since(&wp::SUBMIT_WAIT_NS[slot], wait_started);
     if let Some(payload) = state.panic.take() {
         resume_unwind(payload);
     }
@@ -449,10 +459,15 @@ fn prepare_group<'a>(
         if is_direct_aligned(abs, first.data.len(), first.data.as_ptr() as usize) {
             Payload::Borrowed(first.data)
         } else {
-            Payload::Owned(
-                AlignedBuf::from_slice(first.data)
-                    .map_err(|error| format!("io_uring dispatched bounce alloc: {error}"))?,
-            )
+            {
+                let slot = wp::class_slot();
+                wp::add(&wp::SUBMIT_BOUNCE_BYTES[slot], first.data.len() as u64);
+                wp::add(&wp::SUBMIT_BOUNCE_ALLOCS[slot], 1);
+                Payload::Owned(
+                    AlignedBuf::from_slice(first.data)
+                        .map_err(|error| format!("io_uring dispatched bounce alloc: {error}"))?,
+                )
+            }
         }
     } else {
         let total_bytes = group.iter().try_fold(0usize, |total, &index| {
@@ -470,6 +485,13 @@ fn prepare_group<'a>(
             buffer.as_mut_slice()[cursor..cursor + data.len()].copy_from_slice(data);
             cursor += data.len();
         }
+        // This path has no writev arm, so a merged group is ALWAYS a copy. A
+        // producer that hands one stripe per poll keeps its groups singleton
+        // (the strips land on distinct PDs), which is why the pipelined RAID6
+        // writer does not pay this — the counter is here to prove it.
+        let slot = wp::class_slot();
+        wp::add(&wp::SUBMIT_BOUNCE_BYTES[slot], total_bytes as u64);
+        wp::add(&wp::SUBMIT_BOUNCE_ALLOCS[slot], 1);
         Payload::Owned(buffer)
     };
     let len = payload.as_slice().len();
@@ -540,6 +562,10 @@ fn queue_prepared<'a>(
         installed_slots.push(slot_index);
     }
 
+    let slot = wp::class_slot();
+    wp::add(&wp::SUBMIT_SQES[slot], entries.len() as u64);
+    wp::add(&wp::SUBMIT_PUSHES[slot], 1);
+
     let push_result = {
         let mut submission = ring.submission();
         let capacity = submission.capacity();
@@ -577,7 +603,9 @@ struct WaitedCompletions {
 
 fn wait_for_completions(ring: &mut IoUring) -> WaitedCompletions {
     let mut empty_waits = 0_u64;
+    let slot = wp::class_slot();
     loop {
+        wp::add(&wp::SUBMIT_ENTERS[slot], 1);
         match ring.submit_and_wait(1) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,

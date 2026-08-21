@@ -462,6 +462,32 @@ pub fn submit_strip_writes_detailed(ops: &[StripWrite<'_>]) -> Vec<ChunkletResul
     backend.submit_writes_detailed_with_class(current_io_class(), ops)
 }
 
+/// LD-side entry point for a PIPELINED batch: the LD produces its ops in stages
+/// through `dispatch` while earlier ops are still in flight.
+///
+/// The point is a producer whose stages are EXPENSIVE. RAID6 computes P and Q
+/// for every segment before submitting any of them, so each member sits idle for
+/// the whole compute leg — measured at 27% of a 1-stripe call and 49% of an
+/// 8-stripe call on nvme-box. Handing segments over one at a time lets segment
+/// i+1's syndrome compute overlap segment i's device time.
+///
+/// Unlike [`submit_strip_writes_detailed`] the ops do not exist yet, so the PD
+/// carrying the backend has to be named explicitly. Results are still per-op in
+/// the order the dispatch ASSIGNED (`DispatchedWrite::index`), which the LD must
+/// keep equal to the order it would have built a flat batch in — that is what
+/// lets `absorb_degraded` map a failure back to its segment.
+pub fn submit_strip_writes_dispatched<'a>(
+    pd: &Arc<PhysicalDisk>,
+    total_ops: usize,
+    dispatch: &mut dyn WriteDispatch<'a>,
+) -> Vec<ChunkletResult<()>> {
+    if total_ops == 0 {
+        return Vec::new();
+    }
+    pd.backend()
+        .submit_writes_dispatched_with_class(current_io_class(), total_ops, dispatch)
+}
+
 /// LD-side entry point for batched reads. Picks the backend off the
 /// first op's PD, matching `submit_strip_writes`.
 pub fn submit_strip_reads(ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {

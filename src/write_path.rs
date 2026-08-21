@@ -51,6 +51,7 @@ counters!(
     R6_READ_NS,
     R6_COMPUTE_NS,
     R6_WRITE_NS,
+    R6_PIPELINE_NS,
     R6_TOTAL_NS,
     R6_TOTAL_NS_MAX,
 );
@@ -153,10 +154,20 @@ pub struct WritePathStats {
     pub r6_lock_ns: u64,
     /// Phase 1 RMW reads (zero for a clean full-stripe batch).
     pub r6_read_ns: u64,
-    /// Phase 2 P/Q recompute.
+    /// Phase 2 P/Q recompute. ⚠ When `r6_pipeline_ns` is non-zero this is a
+    /// SUB-interval of `r6_write_ns`, not disjoint from it: the pipelined writer
+    /// computes a segment's parity inside the submit leg so it overlaps device
+    /// time. `compute / write` is then the fraction of the submit leg that is
+    /// still CPU, which is the number the pipeline is trying to drive down.
     pub r6_compute_ns: u64,
-    /// Phase 3 submit + degrade absorption.
+    /// Phase 3 submit + degrade absorption. Includes the interleaved compute
+    /// when the pipelined writer is in use.
     pub r6_write_ns: u64,
+    /// Non-zero only when the pipelined (compute-interleaved-with-submit)
+    /// writer ran, and then equal to its share of `r6_write_ns`. Exists so a
+    /// snapshot says WHICH writer produced it — the phase split means something
+    /// different in each mode.
+    pub r6_pipeline_ns: u64,
     /// Whole batched call, for the covering check against the phases above.
     pub r6_total_ns: u64,
     pub r6_total_ns_max: u64,
@@ -241,6 +252,7 @@ pub fn stats() -> WritePathStats {
         r6_read_ns: g(&R6_READ_NS),
         r6_compute_ns: g(&R6_COMPUTE_NS),
         r6_write_ns: g(&R6_WRITE_NS),
+        r6_pipeline_ns: g(&R6_PIPELINE_NS),
         r6_total_ns: g(&R6_TOTAL_NS),
         r6_total_ns_max: g(&R6_TOTAL_NS_MAX),
         submit: std::array::from_fn(|i| SubmitClassStats {

@@ -1,6 +1,10 @@
 //! RAID6 batched multi-op writer (the flusher hot path) + its planner types.
 //! Split out of the parent module for the file-size limit.
 use super::*;
+use crate::io::backend::{
+    submit_strip_writes_dispatched, DispatchedCompletion, DispatchedWrite, WriteDispatch,
+    WriteDispatchStatus,
+};
 use crate::io::AlignedBuf;
 use crate::write_path as wp;
 use std::time::Instant;
@@ -278,34 +282,105 @@ impl LdRaid6 {
             return Err(e);
         }
 
-        // Phase 2: recompute P/Q per segment from the freshly-read state.
-        for seg in segs.iter_mut() {
-            self.r6_compute(seg);
-        }
-        let computed_at = wp::record_since(&wp::R6_COMPUTE_NS, read_at);
-
-        // Phase 3: one batched write submit for all data + parity strips, with
-        // inline-degrade. Every segment here is HEALTHY (degraded sets bailed to
-        // the serial `write_at` above), so each is its own redundancy group with
-        // a budget of 2 runtime member failures.
-        let mut writes: Vec<StripWrite> = Vec::new();
-        let mut group_of: Vec<u32> = Vec::new();
-        for (gi, seg) in segs.iter().enumerate() {
-            self.r6_collect_writes(seg, &mut writes);
-            // Tag every op this seg just appended with the seg's group index.
-            group_of.resize(writes.len(), gi as u32);
-        }
+        // Phases 2+3. Every segment here is HEALTHY (degraded sets bailed to the
+        // serial `write_at` above), so each is its own redundancy group with a
+        // budget of 2 runtime member failures.
         let max_fail = vec![2u32; segs.len()];
-        let results = submit_strip_writes_detailed(&writes);
-        let suspects = absorb_degraded(&writes, &results, &group_of, &max_fail)?;
-        self.report_suspects(suspects);
-        wp::record_since(&wp::R6_WRITE_NS, computed_at);
+        let results = if self.pipeline_eligible(&segs) {
+            // Interleaved: compute one segment's P/Q, hand its strips to the
+            // backend, and only then compute the next. The two-phase form below
+            // leaves every member idle for the whole compute leg.
+            self.r6_pipelined_submit(&mut segs, read_at)
+        } else {
+            for seg in segs.iter_mut() {
+                self.r6_compute(seg);
+            }
+            let computed_at = wp::record_since(&wp::R6_COMPUTE_NS, read_at);
+            let mut writes: Vec<StripWrite> = Vec::new();
+            for seg in segs.iter() {
+                self.r6_collect_writes(seg, &mut writes);
+            }
+            let results = submit_strip_writes_detailed(&writes);
+            wp::record_since(&wp::R6_WRITE_NS, computed_at);
+            results
+        };
+
+        // Absorption only reads the PD identity of FAILING ops, so rebuild the
+        // op list lazily: the all-Ok path is the overwhelming majority and would
+        // otherwise pay `ops` Arc clones for nothing. Rebuilding is exact
+        // because `r6_collect_writes` is the same producer the submit used, in
+        // the same segment order.
+        if results.iter().any(|result| result.is_err()) {
+            let mut writes: Vec<StripWrite> = Vec::new();
+            let mut group_of: Vec<u32> = Vec::new();
+            for (gi, seg) in segs.iter().enumerate() {
+                self.r6_collect_writes(seg, &mut writes);
+                // Tag every op this seg just appended with the seg's group index.
+                group_of.resize(writes.len(), gi as u32);
+            }
+            let suspects = absorb_degraded(&writes, &results, &group_of, &max_fail)?;
+            self.report_suspects(suspects);
+        }
         let total = wp::record_since(&wp::R6_TOTAL_NS, call_started);
         wp::record_max(
             &wp::R6_TOTAL_NS_MAX,
             total.saturating_duration_since(call_started).as_nanos() as u64,
         );
         Ok(())
+    }
+
+    /// Whether this batch may take the pipelined writer. Requires the knob and a
+    /// geometry whose per-segment op count fits one dispatch hand-off; a single
+    /// segment must be admissible in one go or the backend's slot table could
+    /// refuse it and the dispatch would stall.
+    fn pipeline_eligible(&self, segs: &[Seg6<'_>]) -> bool {
+        let window = super::pipeline_window_stripes();
+        window > 0
+            && segs.len() > 1
+            && self.data_per_set + 2 <= MAX_PIPELINE_SEGMENT_OPS
+            && !self.members.iter().any(|member| member.is_none())
+    }
+
+    /// Compute + submit interleaved. Returns per-op results in the same order
+    /// the two-phase arm would have produced them, so the caller's absorption
+    /// and group mapping are identical.
+    fn r6_pipelined_submit(
+        &self,
+        segs: &mut [Seg6<'_>],
+        read_at: Instant,
+    ) -> Vec<ChunkletResult<()>> {
+        let total_ops: usize = segs.iter().map(|seg| seg.mods.len() + 2).sum();
+        let window_ops = super::pipeline_window_stripes()
+            .saturating_mul(self.data_per_set + 2)
+            .max(self.data_per_set + 2);
+        // Any member serves as the backend handle: every PD in one LD belongs to
+        // one pool and shares one backend Arc. `pipeline_eligible` already
+        // established that none is missing.
+        let pd = self.members[0]
+            .as_ref()
+            .expect("pipeline requires every member present")
+            .clone();
+        let results = {
+            let mut pipeline = Raid6Pipeline {
+                ld: self,
+                remaining: segs,
+                in_flight: 0,
+                window_ops,
+                next_index: 0,
+                compute_ns: 0,
+            };
+            let results = submit_strip_writes_dispatched(&pd, total_ops, &mut pipeline);
+            // The compute legs happened INSIDE the submit, so report them as an
+            // overlapping sub-interval rather than pretending they are disjoint.
+            wp::add(&wp::R6_COMPUTE_NS, pipeline.compute_ns);
+            results
+        };
+        let done_at = wp::record_since(&wp::R6_WRITE_NS, read_at);
+        wp::add(
+            &wp::R6_PIPELINE_NS,
+            done_at.saturating_duration_since(read_at).as_nanos() as u64,
+        );
+        results
     }
 
     /// Append `seg`'s RMW reads (into its owned scratch) to the shared batch.
@@ -466,5 +541,102 @@ impl LdRaid6 {
             in_chunklet_off: strip_base,
             data: seg.q.as_slice(),
         });
+    }
+}
+
+/// Ops one segment may contribute in a single dispatch hand-off. The backend's
+/// streaming submit tracks in-flight writes in a fixed slot table, so a segment
+/// that could not be admitted whole would stall the pipeline; this keeps the
+/// eligibility check honest for absurd geometries instead of discovering it at
+/// runtime.
+const MAX_PIPELINE_SEGMENT_OPS: usize = 64;
+
+/// Pull-based producer for the pipelined RAID6 writer.
+///
+/// The backend asks for work whenever it has ring room, so this is where the P/Q
+/// compute for the NEXT segment happens — while the previous segment's strips
+/// are still in flight. Throttling is `Pending`: without it the backend would
+/// drain the whole plan into its slot table in one `fill_ready` loop, which is
+/// just the two-phase writer again with extra steps.
+///
+/// `remaining` is a `&mut` slice consumed head-first. Handing out
+/// `StripWrite<'a>` borrowed from a segment while still holding `&mut` to the
+/// segments AFTER it is what `split_at_mut` is for: the head is reborrowed as
+/// shared for `'a` and the tail stays mutable. No `unsafe`, and the borrow
+/// checker enforces that a segment is never mutated once its strips are in
+/// flight.
+struct Raid6Pipeline<'a, 'd> {
+    ld: &'a LdRaid6,
+    remaining: &'a mut [Seg6<'d>],
+    /// Ops handed out whose completion has not been reported back.
+    in_flight: usize,
+    /// Cap on `in_flight`. The whole point of the struct.
+    window_ops: usize,
+    /// Next `DispatchedWrite::index`. Assigned in the same order the two-phase
+    /// arm builds its flat batch, which is what makes the results comparable.
+    next_index: usize,
+    /// Compute time spent inside the submit, for the overlapping sub-measure.
+    compute_ns: u64,
+}
+
+impl<'a, 'd> Raid6Pipeline<'a, 'd> {
+    /// Compute the head segment's syndromes and hand out its strips.
+    fn produce(&mut self, max_ops: usize) -> WriteDispatchStatus<'a> {
+        if self.remaining.is_empty() {
+            return WriteDispatchStatus::Complete;
+        }
+        if self.remaining[0].mods.len() + 2 > max_ops {
+            // Cannot admit a whole segment right now. Never happens under
+            // `pipeline_eligible` (a segment is at most
+            // `MAX_PIPELINE_SEGMENT_OPS` and the backend's table is far larger),
+            // but returning Pending keeps it a stall rather than a contract
+            // violation.
+            return WriteDispatchStatus::Pending;
+        }
+        let taken = std::mem::take(&mut self.remaining);
+        let (head, tail) = taken.split_at_mut(1);
+        self.remaining = tail;
+
+        let started = Instant::now();
+        self.ld.r6_compute(&mut head[0]);
+        self.compute_ns = self
+            .compute_ns
+            .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+
+        // Move the `&mut` into a shared reborrow so the strips can be lent for
+        // the whole `'a`, then the segment is frozen for as long as its ops are
+        // in flight.
+        let head: &'a [Seg6<'d>] = head;
+        let mut writes: Vec<StripWrite<'a>> = Vec::with_capacity(head[0].mods.len() + 2);
+        self.ld.r6_collect_writes(&head[0], &mut writes);
+        let admitted: Vec<DispatchedWrite<'a>> = writes
+            .into_iter()
+            .map(|write| {
+                let index = self.next_index;
+                self.next_index += 1;
+                DispatchedWrite { index, write }
+            })
+            .collect();
+        self.in_flight += admitted.len();
+        WriteDispatchStatus::Ready(admitted)
+    }
+}
+
+impl<'a, 'd> WriteDispatch<'a> for Raid6Pipeline<'a, 'd> {
+    fn poll_ready(&mut self, max_ops: usize) -> WriteDispatchStatus<'a> {
+        if self.in_flight >= self.window_ops {
+            return WriteDispatchStatus::Pending;
+        }
+        self.produce(max_ops)
+    }
+
+    fn wait_ready(&mut self, max_ops: usize) -> WriteDispatchStatus<'a> {
+        // Only called when the backend owns nothing, so the window cannot be the
+        // thing to wait for — ignoring it here is what guarantees progress.
+        self.produce(max_ops)
+    }
+
+    fn writes_completed(&mut self, completions: &[DispatchedCompletion], _service_ns: u64) {
+        self.in_flight = self.in_flight.saturating_sub(completions.len());
     }
 }

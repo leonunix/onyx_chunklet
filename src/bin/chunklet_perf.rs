@@ -163,6 +163,13 @@ struct Cli {
     /// being the max of the whole wave's latencies. Clamped to the SQ depth.
     #[arg(long, default_value_t = 0)]
     uring_write_window: usize,
+
+    /// Stripes in flight in the PIPELINED RAID6 writer. 0 keeps the two-phase
+    /// writer (compute every segment's P/Q, then submit the batch), which
+    /// leaves every member idle for the whole compute leg. Non-zero hands each
+    /// segment to the backend as its syndromes finish.
+    #[arg(long, default_value_t = 0)]
+    r6_pipeline_stripes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
@@ -372,6 +379,9 @@ fn run(cli: Cli) -> ChunkletResult<()> {
     if cli.uring_write_window > 0 {
         onyx_chunklet::io::uring_backend::set_write_window_sqes(cli.uring_write_window);
     }
+    if cli.r6_pipeline_stripes > 0 {
+        onyx_chunklet::ld::raid6::set_pipeline_window_stripes(cli.r6_pipeline_stripes);
+    }
     println!(
         "uring: chunk_ops={} coalesced_wait={} writev_coalesce={} coalesce_max_bytes={} write_window={}",
         onyx_chunklet::io::uring_backend::write_chunk_ops(),
@@ -381,6 +391,10 @@ fn run(cli: Cli) -> ChunkletResult<()> {
             .unwrap_or_else(|| "default".into()),
         onyx_chunklet::io::uring_backend::coalesce_max_bytes(),
         onyx_chunklet::io::uring_backend::write_window_sqes(),
+    );
+    println!(
+        "raid6: pipeline_stripes={}",
+        onyx_chunklet::ld::raid6::pipeline_window_stripes()
     );
 
     let file_jobs = perf_file.as_ref().map(|f| f.jobs.as_slice()).unwrap_or(&[]);
@@ -519,6 +533,17 @@ fn print_write_path_summary() {
         per(w.r6_write_ns, bc),
         w.r6_total_ns_max as f64 / 1000.0,
     );
+    if w.r6_pipeline_ns > 0 {
+        // In pipelined mode `compute` is a SUB-interval of `write`, not disjoint
+        // from it, so print the split that actually means something: how much of
+        // the submit leg is still CPU.
+        println!(
+            "wp.r6_pipeline us/call={:.1} ({:.1}% of write, compute inside it {:.1}%)",
+            per(w.r6_pipeline_ns, bc),
+            100.0 * w.r6_pipeline_ns as f64 / w.r6_write_ns.max(1) as f64,
+            100.0 * w.r6_compute_ns as f64 / w.r6_write_ns.max(1) as f64,
+        );
+    }
     for (i, s) in w.submit.iter().enumerate() {
         if s.calls == 0 {
             continue;

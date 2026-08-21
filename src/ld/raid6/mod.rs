@@ -90,6 +90,44 @@ mod write_paths;
 
 const CHUNKLET_USER_BYTES: u64 = CHUNKLET_SIZE - CHUNKLET_HEADER_BYTES;
 
+/// Stripes whose strips may be in flight at once in the PIPELINED batched
+/// writer. `0` (the default) keeps the two-phase writer: compute EVERY segment's
+/// P/Q, then submit the whole batch. That leaves each member idle for the entire
+/// compute leg — measured on nvme-box at 27% of a 1-stripe call and 49% of an
+/// 8-stripe call, i.e. a 1.39x / 2.00x ceiling that no submission-side knob can
+/// reach (see the windowed-submit result: inert).
+///
+/// Non-zero hands segments to the backend one at a time as their syndromes
+/// finish, so segment i+1's compute overlaps segment i's device time. Only the
+/// clean healthy full-stripe/RMW batch is eligible; every bail (degraded set,
+/// rebuild, overlapping stripe, Phase-1 read fault) is unchanged.
+static PIPELINE_WINDOW_STRIPES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the pipelined-writer window in stripes. `0` restores the two-phase
+/// writer. Applies process-wide to subsequent batches.
+pub fn set_pipeline_window_stripes(stripes: usize) {
+    PIPELINE_WINDOW_STRIPES.store(stripes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Diagnostic override, same shape as `CHUNKLET_WRITEV_COALESCE`: it exists so
+/// the WHOLE suite can be re-run pipelined (`CHUNKLET_R6_PIPELINE_STRIPES=2
+/// cargo test --release`) instead of only the dedicated pipeline test.
+fn pipeline_window_env_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("CHUNKLET_R6_PIPELINE_STRIPES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+    })
+}
+
+/// Effective pipelined-writer window in stripes.
+pub fn pipeline_window_stripes() -> usize {
+    pipeline_window_env_override()
+        .unwrap_or_else(|| PIPELINE_WINDOW_STRIPES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 pub struct LdRaid6 {
     desc: LdDescriptor,
     members: Vec<Option<Arc<PhysicalDisk>>>,
