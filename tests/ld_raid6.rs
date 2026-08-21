@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread;
 
 use onyx_chunklet::error::ChunkletResult;
-use onyx_chunklet::io::{IoBackend, RawDevice, StripRead, StripWrite};
+use onyx_chunklet::io::{AlignedBuf, IoBackend, RawDevice, StripRead, StripWrite};
 use onyx_chunklet::ld::raid6::LdRaid6;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE};
@@ -45,6 +45,64 @@ impl IoBackend for CountingReadBackend {
     }
 
     fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        self.inner.submit_writes_detailed(ops)
+    }
+}
+
+/// Records how many of the buffers chunklet hands the backend are NOT block
+/// aligned. O_DIRECT requires an aligned base for every iovec, so an unaligned
+/// buffer does not fail — it silently sinks the op into the uring backend's
+/// bounce copy (and, on the read side, into a zeroed scratch plus a copy back).
+/// That is invisible to every correctness test, which is exactly why the RAID6
+/// parity strips sat on `Vec<u8>` (alignment 1) long enough to cost 21 ms of
+/// memcpy per 8-stripe call on nvme-box.
+struct AlignmentRecordingBackend {
+    inner: Arc<dyn IoBackend>,
+    reads: AtomicUsize,
+    writes: AtomicUsize,
+    unaligned_reads: AtomicUsize,
+    unaligned_writes: AtomicUsize,
+}
+
+impl AlignmentRecordingBackend {
+    fn new(inner: Arc<dyn IoBackend>) -> Self {
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            unaligned_reads: AtomicUsize::new(0),
+            unaligned_writes: AtomicUsize::new(0),
+        }
+    }
+
+    fn aligned(ptr: usize, len: usize) -> bool {
+        let bs = BLOCK_SIZE as usize;
+        ptr.is_multiple_of(bs) && len.is_multiple_of(bs)
+    }
+}
+
+impl IoBackend for AlignmentRecordingBackend {
+    fn name(&self) -> &'static str {
+        "alignment-recording"
+    }
+
+    fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        for op in ops.iter() {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if !Self::aligned(op.data.as_ptr() as usize, op.data.len()) {
+                self.unaligned_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.inner.submit_reads(ops)
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        for op in ops {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if !Self::aligned(op.data.as_ptr() as usize, op.data.len()) {
+                self.unaligned_writes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.inner.submit_writes_detailed(ops)
     }
 }
@@ -1025,4 +1083,54 @@ fn raid6_write_many_batched_same_stripe_merge_partial_preserves_untouched() {
 
     drop(ld);
     assert_r6_stripe_parity(&pool, id, 0, strip);
+}
+
+/// Every buffer the batched RAID6 writer allocates itself must be block
+/// aligned, on both the full-stripe path (P/Q) and the PDW path (P/Q plus the
+/// old-data reads). The caller payload comes from an `AlignedBuf`, so an
+/// unaligned op here can only be one chunklet owns.
+#[test]
+fn raid6_batched_write_buffers_are_block_aligned() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let full_stripe = 3 * strip;
+
+    let mut payload = AlignedBuf::new(full_stripe).unwrap();
+    for (i, b) in payload.as_mut_slice().iter_mut().enumerate() {
+        *b = ((i * 31 + 7) % 251) as u8;
+    }
+
+    let inner = pool.pd(pool.list_pds()[0].pd_id).unwrap().backend();
+    let recorder = Arc::new(AlignmentRecordingBackend::new(inner));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(recorder.clone());
+    }
+
+    // Full path: 3 data strips + P + Q, no RMW reads.
+    ld.write_many_at(&[(0, payload.as_slice())]).unwrap();
+    assert!(recorder.writes.load(Ordering::Relaxed) >= 5);
+    assert_eq!(recorder.unaligned_writes.load(Ordering::Relaxed), 0);
+
+    // PDW path: a single block-sized mod, so the batch reads old data + old
+    // P/Q into chunklet-owned buffers and writes the new P/Q back out.
+    ld.write_many_at(&[(0, &payload.as_slice()[..block])])
+        .unwrap();
+    assert!(recorder.reads.load(Ordering::Relaxed) >= 3);
+    assert_eq!(recorder.unaligned_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(recorder.unaligned_writes.load(Ordering::Relaxed), 0);
+
+    // The serial `write_at` arm allocates its own copies of the same scratch,
+    // and `write_many_at` bails to it, so hold it to the same invariant.
+    ld.write_at(0, payload.as_slice()).unwrap();
+    ld.write_at(0, &payload.as_slice()[..block]).unwrap();
+    assert_eq!(recorder.unaligned_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(recorder.unaligned_writes.load(Ordering::Relaxed), 0);
+
+    let mut readback = vec![0u8; full_stripe];
+    ld.read_at(0, &mut readback).unwrap();
+    assert_eq!(readback.as_slice(), payload.as_slice());
 }

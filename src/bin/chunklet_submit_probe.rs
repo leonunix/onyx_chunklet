@@ -135,7 +135,7 @@ fn main() {
             // submission shape, but must not be all-zero in case anything
             // downstream ever compresses; a single fill is enough.
             let slots = w * width;
-            let mut bufs: Vec<AlignedBuf> = (0..slots)
+            let bufs: Vec<AlignedBuf> = (0..slots)
                 .map(|i| {
                     let mut b = AlignedBuf::new(strip).expect("aligned buffer");
                     b.as_mut_slice().fill((i as u8) | 1);

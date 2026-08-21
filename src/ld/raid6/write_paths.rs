@@ -1,6 +1,13 @@
 //! RAID6 stripe write paths: full-stripe / data-only / partial PDW / RW.
 //! Split out of the parent module for the file-size limit.
+//!
+//! Every strip-sized scratch buffer here is an [`AlignedBuf`], not a `Vec<u8>`:
+//! O_DIRECT needs a block-aligned base, and an unaligned one does not fail — it
+//! silently drops the op into the uring backend's bounce copy. These are the
+//! cold paths (`write_many_at` bails here), so unlike the batched writer they
+//! keep the zero-fill rather than reason about which fills are total.
 use super::*;
+use crate::io::AlignedBuf;
 
 fn parity_delta_read_cost(positions: &[(usize, u64, std::ops::Range<usize>)]) -> usize {
     positions.len() + 2
@@ -124,13 +131,13 @@ impl LdRaid6 {
         budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
-        let mut p = vec![0u8; strip];
-        let mut q = vec![0u8; strip];
+        let mut p = AlignedBuf::new(strip)?;
+        let mut q = AlignedBuf::new(strip)?;
         let data: Vec<(&[u8], u8)> = positions
             .iter()
             .map(|(pos, _off, range)| (&buf[range.clone()], gf256::g_pow(*pos)))
             .collect();
-        parity::encode_pq(&mut p, &mut q, &data);
+        parity::encode_pq(p.as_mut_slice(), q.as_mut_slice(), &data);
 
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 2);
         for (pos, off, range) in positions {
@@ -150,7 +157,7 @@ impl LdRaid6 {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[pm].chunklet_index,
                 in_chunklet_off: strip_base,
-                data: &p,
+                data: p.as_slice(),
             });
         }
         let qm = self.member_idx_q(set_idx);
@@ -159,7 +166,7 @@ impl LdRaid6 {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[qm].chunklet_index,
                 in_chunklet_off: strip_base,
-                data: &q,
+                data: q.as_slice(),
             });
         }
         self.submit_set_absorb(ops, budget)?;
@@ -170,9 +177,9 @@ impl LdRaid6 {
             if pos < self.data_per_set {
                 buf[pos * strip..pos * strip + strip].to_vec()
             } else if pos == self.data_per_set {
-                p.clone()
+                p.as_slice().to_vec()
             } else {
-                q.clone()
+                q.as_slice().to_vec()
             }
         });
         Ok(())
@@ -222,24 +229,27 @@ impl LdRaid6 {
         budget: u32,
     ) -> ChunkletResult<()> {
         let strip = self.strip_bytes as usize;
-        let mut old_data: Vec<Vec<u8>> = positions
+        let mut old_data: Vec<AlignedBuf> = positions
             .iter()
-            .map(|(_pos, _off, range)| vec![0u8; range.end - range.start])
-            .collect();
-        let mut p = vec![0u8; strip];
-        let mut q = vec![0u8; strip];
+            .map(|(_pos, _off, range)| AlignedBuf::new(range.end - range.start))
+            .collect::<ChunkletResult<Vec<_>>>()?;
+        let mut p = AlignedBuf::new(strip)?;
+        let mut q = AlignedBuf::new(strip)?;
 
         let mut read_ops: Vec<StripRead> = Vec::with_capacity(positions.len() + 2);
-        for ((pos, off, _range), old) in positions.iter().zip(old_data.iter_mut()) {
+        for ((pos, off, range), old) in positions.iter().zip(old_data.iter_mut()) {
             let m = self.member_idx_data(set_idx, *pos);
             let pd = self.members[m]
                 .as_ref()
                 .expect("PDW path requires all data PDs healthy");
+            // Slice to the position's length: `AlignedBuf` rounds up, a mod can
+            // be sub-block.
+            let len = range.end - range.start;
             read_ops.push(StripRead {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[m].chunklet_index,
                 in_chunklet_off: strip_base + off,
-                data: old,
+                data: &mut old.as_mut_slice()[..len],
             });
         }
         let pm = self.member_idx_p(set_idx);
@@ -250,7 +260,7 @@ impl LdRaid6 {
             pd: pd_p.clone(),
             chunklet_index: self.desc.members[pm].chunklet_index,
             in_chunklet_off: strip_base,
-            data: &mut p,
+            data: p.as_mut_slice(),
         });
         let qm = self.member_idx_q(set_idx);
         let pd_q = self.members[qm]
@@ -260,7 +270,7 @@ impl LdRaid6 {
             pd: pd_q.clone(),
             chunklet_index: self.desc.members[qm].chunklet_index,
             in_chunklet_off: strip_base,
-            data: &mut q,
+            data: q.as_mut_slice(),
         });
         let read_result = parallel_strip_reads(&mut read_ops);
         drop(read_ops);
@@ -287,10 +297,10 @@ impl LdRaid6 {
             let off = *off as usize;
             let len = new_data.len();
             parity::accumulate_delta_pq(
-                &mut p[off..off + len],
-                &mut q[off..off + len],
+                &mut p.as_mut_slice()[off..off + len],
+                &mut q.as_mut_slice()[off..off + len],
                 new_data,
-                old_data,
+                &old_data.as_slice()[..len],
                 gf256::g_pow(*pos),
             );
         }
@@ -312,13 +322,13 @@ impl LdRaid6 {
             pd: pd_p.clone(),
             chunklet_index: self.desc.members[pm].chunklet_index,
             in_chunklet_off: strip_base,
-            data: &p,
+            data: p.as_slice(),
         });
         ops.push(StripWrite {
             pd: pd_q.clone(),
             chunklet_index: self.desc.members[qm].chunklet_index,
             in_chunklet_off: strip_base,
-            data: &q,
+            data: q.as_slice(),
         });
         // Healthy-set path (budget 2): the new P/Q reflect the new data, so a
         // ≤2-member EIO here still reconstructs the modified data on read.
@@ -353,7 +363,9 @@ impl LdRaid6 {
             .map(|(p, off, r)| (*p, (*off, r.clone())))
             .collect();
 
-        let mut new_strips: Vec<Vec<u8>> = (0..k).map(|_| vec![0u8; strip]).collect();
+        let mut new_strips: Vec<AlignedBuf> = (0..k)
+            .map(|_| AlignedBuf::new(strip))
+            .collect::<ChunkletResult<Vec<_>>>()?;
         let mut copy_after_reads: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
         let mut read_ops: Vec<StripRead> = Vec::with_capacity(k);
         // (set_idx, data_pos) aligned to `read_ops`, so a runtime read fault can
@@ -368,11 +380,16 @@ impl LdRaid6 {
                     let off = *off as usize;
                     let len = new_data.len();
                     if off == 0 && len == strip {
-                        strip_buf.copy_from_slice(new_data);
+                        strip_buf.as_mut_slice().copy_from_slice(new_data);
                     } else {
                         if pd_failed {
-                            self.reconstruct_unmodified_data(set_idx, pos, strip_base, strip_buf)?;
-                            strip_buf[off..off + len].copy_from_slice(new_data);
+                            self.reconstruct_unmodified_data(
+                                set_idx,
+                                pos,
+                                strip_base,
+                                strip_buf.as_mut_slice(),
+                            )?;
+                            strip_buf.as_mut_slice()[off..off + len].copy_from_slice(new_data);
                         } else {
                             let m = self.member_idx_data(set_idx, pos);
                             let pd = self.members[m]
@@ -382,7 +399,7 @@ impl LdRaid6 {
                                 pd: pd.clone(),
                                 chunklet_index: self.desc.members[m].chunklet_index,
                                 in_chunklet_off: strip_base,
-                                data: strip_buf,
+                                data: strip_buf.as_mut_slice(),
                             });
                             read_ctxs.push((set_idx, pos));
                             copy_after_reads.push((pos, off, range.clone()));
@@ -391,7 +408,12 @@ impl LdRaid6 {
                 }
                 None => {
                     if pd_failed {
-                        self.reconstruct_unmodified_data(set_idx, pos, strip_base, strip_buf)?;
+                        self.reconstruct_unmodified_data(
+                            set_idx,
+                            pos,
+                            strip_base,
+                            strip_buf.as_mut_slice(),
+                        )?;
                     } else {
                         let m = self.member_idx_data(set_idx, pos);
                         let pd = self.members[m]
@@ -401,7 +423,7 @@ impl LdRaid6 {
                             pd: pd.clone(),
                             chunklet_index: self.desc.members[m].chunklet_index,
                             in_chunklet_off: strip_base,
-                            data: strip_buf,
+                            data: strip_buf.as_mut_slice(),
                         });
                         read_ctxs.push((set_idx, pos));
                     }
@@ -423,15 +445,17 @@ impl LdRaid6 {
         drop(read_ops);
         for (pos, off, range) in copy_after_reads {
             let new_data = &buf[range];
-            new_strips[pos][off..off + new_data.len()].copy_from_slice(new_data);
+            new_strips[pos].as_mut_slice()[off..off + new_data.len()].copy_from_slice(new_data);
         }
 
-        let mut p = vec![0u8; strip];
-        let mut q = vec![0u8; strip];
-        for (i, s) in new_strips.iter().enumerate() {
-            gf256::xor_into(&mut p, s);
-            gf256::mul_xor_into(&mut q, s, gf256::g_pow(i));
-        }
+        let mut p = AlignedBuf::new(strip)?;
+        let mut q = AlignedBuf::new(strip)?;
+        let data: Vec<(&[u8], u8)> = new_strips
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_slice(), gf256::g_pow(i)))
+            .collect();
+        parity::encode_pq(p.as_mut_slice(), q.as_mut_slice(), &data);
 
         let mut ops: Vec<StripWrite> = Vec::with_capacity(positions.len() + 2);
         for (pos, off, range) in positions {
@@ -451,7 +475,7 @@ impl LdRaid6 {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[pm].chunklet_index,
                 in_chunklet_off: strip_base,
-                data: &p,
+                data: p.as_slice(),
             });
         }
         let qm = self.member_idx_q(set_idx);
@@ -460,7 +484,7 @@ impl LdRaid6 {
                 pd: pd.clone(),
                 chunklet_index: self.desc.members[qm].chunklet_index,
                 in_chunklet_off: strip_base,
-                data: &q,
+                data: q.as_slice(),
             });
         }
         self.submit_set_absorb(ops, budget)?;
@@ -468,11 +492,11 @@ impl LdRaid6 {
         // new strip for every data position plus P and Q.
         self.write_forward(set_idx, strip_base, |pos| {
             if pos < self.data_per_set {
-                new_strips[pos].clone()
+                new_strips[pos].as_slice().to_vec()
             } else if pos == self.data_per_set {
-                p.clone()
+                p.as_slice().to_vec()
             } else {
-                q.clone()
+                q.as_slice().to_vec()
             }
         });
         Ok(())

@@ -1,6 +1,7 @@
 //! RAID6 batched multi-op writer (the flusher hot path) + its planner types.
 //! Split out of the parent module for the file-size limit.
 use super::*;
+use crate::io::AlignedBuf;
 use crate::write_path as wp;
 use std::time::Instant;
 
@@ -30,12 +31,22 @@ struct Seg6<'a> {
     mods: Vec<(usize, u64, &'a [u8])>,
     /// New P / Q strip. Full/Rw compute it from scratch; Pdw reads the old
     /// value here then applies the delta in place.
-    p: Vec<u8>,
-    q: Vec<u8>,
-    /// Pdw only: old data per modified position (each sized to its mod's len).
-    old_data: Vec<Vec<u8>>,
+    ///
+    /// Block-aligned, NOT `Vec<u8>`: these are the only strips in a batched
+    /// write that chunklet allocates itself (data payloads belong to the
+    /// caller), and O_DIRECT needs every iovec base block aligned. With
+    /// `Vec<u8>`'s alignment of 1 the uring backend sank every merged group
+    /// carrying a parity strip into `bounce_parts` — 21 ms of memcpy per
+    /// 8-stripe call on nvme-box — and bounced each parity READ individually
+    /// through a zeroed scratch buffer plus a copy back.
+    p: AlignedBuf,
+    q: AlignedBuf,
+    /// Pdw only: old data per modified position. Allocated block-aligned for
+    /// the read path; only `[..mod_len]` is ever used, since `AlignedBuf`
+    /// rounds its allocation up and a mod can be sub-block.
+    old_data: Vec<AlignedBuf>,
     /// Rw only: K full new-data strips, parity recomputed from them.
-    new_strips: Vec<Vec<u8>>,
+    new_strips: Vec<AlignedBuf>,
 }
 
 impl LdRaid6 {
@@ -198,16 +209,24 @@ impl LdRaid6 {
                     Kind6::Pdw
                 }
             };
+            // `uninit` throughout: every one of these buffers is fully written
+            // before it is read (P/Q by `encode_pq`, or read back off the
+            // members in Phase 1), so the zero-fill only bought first-touch
+            // page faults. A read that fails takes the whole batch to the
+            // serial path or to an error, so no uninitialised byte can reach a
+            // device.
             let old_data = match kind {
                 Kind6::Pdw => raw
                     .mods
                     .iter()
-                    .map(|(_p, _o, nd)| vec![0u8; nd.len()])
-                    .collect(),
+                    .map(|(_p, _o, nd)| AlignedBuf::uninit(nd.len()))
+                    .collect::<ChunkletResult<Vec<_>>>()?,
                 _ => Vec::new(),
             };
             let new_strips = match kind {
-                Kind6::Rw => (0..k).map(|_| vec![0u8; strip]).collect(),
+                Kind6::Rw => (0..k)
+                    .map(|_| AlignedBuf::uninit(strip))
+                    .collect::<ChunkletResult<Vec<_>>>()?,
                 _ => Vec::new(),
             };
             stripe_keys.push(key);
@@ -216,8 +235,8 @@ impl LdRaid6 {
                 strip_base: raw.strip_base,
                 kind,
                 mods: raw.mods,
-                p: vec![0u8; strip],
-                q: vec![0u8; strip],
+                p: AlignedBuf::uninit(strip)?,
+                q: AlignedBuf::uninit(strip)?,
                 old_data,
                 new_strips,
             });
@@ -304,14 +323,17 @@ impl LdRaid6 {
                     q,
                     ..
                 } = &mut *seg;
-                for ((pos, off, _nd), old) in mods.iter().zip(old_data.iter_mut()) {
+                for ((pos, off, nd), old) in mods.iter().zip(old_data.iter_mut()) {
                     let m = self.member_idx_data(set_idx, *pos);
                     let pd = self.members[m].as_ref().expect("healthy PDW data PD");
+                    let len = nd.len();
                     reads.push(StripRead {
                         pd: pd.clone(),
                         chunklet_index: self.desc.members[m].chunklet_index,
                         in_chunklet_off: strip_base + off,
-                        data: old.as_mut_slice(),
+                        // Slice to the mod's length, not the buffer's: `uninit`
+                        // rounds up to a block for a sub-block mod.
+                        data: &mut old.as_mut_slice()[..len],
                     });
                 }
                 let pm = self.member_idx_p(set_idx);
@@ -359,7 +381,6 @@ impl LdRaid6 {
 
     /// Recompute the segment's P/Q from the read-phase results.
     fn r6_compute(&self, seg: &mut Seg6<'_>) {
-        let strip = self.strip_bytes as usize;
         match seg.kind {
             Kind6::Full => {
                 // One pass over the data with P/Q held in vector registers.
@@ -370,7 +391,7 @@ impl LdRaid6 {
                     .iter()
                     .map(|&(pos, _off, nd)| (nd, gf256::g_pow(pos)))
                     .collect();
-                parity::encode_pq(&mut seg.p, &mut seg.q, &data);
+                parity::encode_pq(seg.p.as_mut_slice(), seg.q.as_mut_slice(), &data);
             }
             Kind6::Pdw => {
                 // `seg.p` / `seg.q` already hold the OLD syndromes read from
@@ -390,10 +411,10 @@ impl LdRaid6 {
                     let off = *off as usize;
                     let len = nd.len();
                     parity::accumulate_delta_pq(
-                        &mut p[off..off + len],
-                        &mut q[off..off + len],
+                        &mut p.as_mut_slice()[off..off + len],
+                        &mut q.as_mut_slice()[off..off + len],
                         nd,
-                        old,
+                        &old.as_slice()[..len],
                         gf256::g_pow(*pos),
                     );
                 }
@@ -401,11 +422,7 @@ impl LdRaid6 {
             Kind6::Rw => {
                 for &(pos, off, nd) in &seg.mods {
                     let off = off as usize;
-                    if off == 0 && nd.len() == strip {
-                        seg.new_strips[pos].copy_from_slice(nd);
-                    } else {
-                        seg.new_strips[pos][off..off + nd.len()].copy_from_slice(nd);
-                    }
+                    seg.new_strips[pos].as_mut_slice()[off..off + nd.len()].copy_from_slice(nd);
                 }
                 let data: Vec<(&[u8], u8)> = seg
                     .new_strips
@@ -413,7 +430,7 @@ impl LdRaid6 {
                     .enumerate()
                     .map(|(i, s)| (s.as_slice(), gf256::g_pow(i)))
                     .collect();
-                parity::encode_pq(&mut seg.p, &mut seg.q, &data);
+                parity::encode_pq(seg.p.as_mut_slice(), seg.q.as_mut_slice(), &data);
             }
         }
     }
@@ -439,7 +456,7 @@ impl LdRaid6 {
             pd: pdp.clone(),
             chunklet_index: self.desc.members[pm].chunklet_index,
             in_chunklet_off: strip_base,
-            data: &seg.p,
+            data: seg.p.as_slice(),
         });
         let qm = self.member_idx_q(set_idx);
         let pdq = self.members[qm].as_ref().expect("healthy write Q");
@@ -447,7 +464,7 @@ impl LdRaid6 {
             pd: pdq.clone(),
             chunklet_index: self.desc.members[qm].chunklet_index,
             in_chunklet_off: strip_base,
-            data: &seg.q,
+            data: seg.q.as_slice(),
         });
     }
 }
