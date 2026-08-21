@@ -133,6 +133,23 @@ struct Cli {
     /// Seed for deterministic random workloads.
     #[arg(long, default_value_t = 0xc0ffee)]
     seed: u64,
+
+    /// Ops per stop-and-wait submit wave. 0 keeps the built-in default (64).
+    /// A batched write of N stripes hands in N*(K+2) ops, so leaving this at 64
+    /// splits anything past ~6 stripes into serial barriers — which is what
+    /// makes raising `--iodepth` look like it does not help.
+    #[arg(long, default_value_t = 0)]
+    uring_chunk_ops: usize,
+
+    /// Wait for a whole wave in one `io_uring_enter` instead of waking per CQE.
+    #[arg(long)]
+    uring_coalesced_wait: Option<bool>,
+
+    /// Submit adjacency-merged groups as one writev. Merging caps a group at
+    /// 256 KiB, so with a 128 KiB strip it halves the SQE count — set false to
+    /// keep one SQE per strip and trade request size for concurrency.
+    #[arg(long)]
+    uring_writev_coalesce: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
@@ -325,6 +342,25 @@ fn run(cli: Cli) -> ChunkletResult<()> {
         pool.set_io_backend(backend_kind);
         pool
     };
+    // AFTER the pool: constructing the uring backend installs the pool config's
+    // own values for these, so setting them earlier would be overwritten.
+    if cli.uring_chunk_ops > 0 {
+        onyx_chunklet::io::uring_backend::set_write_chunk_ops(cli.uring_chunk_ops);
+    }
+    if let Some(v) = cli.uring_coalesced_wait {
+        onyx_chunklet::io::uring_backend::set_coalesced_wait(v);
+    }
+    if let Some(v) = cli.uring_writev_coalesce {
+        onyx_chunklet::io::uring_backend::set_writev_coalesce(v);
+    }
+    println!(
+        "uring: chunk_ops={} coalesced_wait={} writev_coalesce={}",
+        onyx_chunklet::io::uring_backend::write_chunk_ops(),
+        onyx_chunklet::io::uring_backend::coalesced_wait_enabled(),
+        cli.uring_writev_coalesce
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "default".into()),
+    );
 
     let file_jobs = perf_file.as_ref().map(|f| f.jobs.as_slice()).unwrap_or(&[]);
     let jobs = build_jobs(
