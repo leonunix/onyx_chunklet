@@ -21,7 +21,15 @@
 //!
 //!   barrier  — push `width` SQEs, wait for all `width`, repeat. What chunklet does.
 //!   window   — keep `window` stripes' SQEs outstanding, reaping only enough to
-//!              stay under the cap. What an async submit path would allow.
+//!              stay under the cap. What a cross-call async submit would allow,
+//!              at the price of deferred error reporting.
+//!   batch    — per "call", stream `batch` stripes through a `window`-deep
+//!              pipeline and drain ALL of them before the call returns. Keeps
+//!              today's synchronous contract (no deferred errors, parity strips
+//!              only need to outlive one call) and pays only a `window`-deep
+//!              drain tail per call, which is negligible when batch >> window.
+//!              If this matches `window`, the async refactor does not need to
+//!              change the caller-visible contract at all.
 //!
 //! ⚠ Writes directly to the named block devices. Destructive by design.
 
@@ -56,6 +64,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Mode::Barrier)]
     mode: Mode,
 
+    /// Stripes per simulated `write_many_at` call. Only used by `batch`.
+    #[arg(long, default_value_t = 64)]
+    batch: usize,
+
     #[arg(long, default_value_t = 16)]
     runtime_secs: u64,
 
@@ -72,6 +84,7 @@ struct Cli {
 enum Mode {
     Barrier,
     Window,
+    Batch,
 }
 
 fn main() {
@@ -108,15 +121,20 @@ fn main() {
         let fds = Arc::clone(&fds);
         let stop = Arc::clone(&stop);
         let stripes = Arc::clone(&stripes);
-        let (mode, window) = (cli.mode, cli.window.max(1));
+        let (mode, window, batch) = (cli.mode, cli.window.max(1), cli.batch);
         let base = cli.offset_bytes + t as u64 * cli.region_bytes;
         let region = cli.region_bytes;
         handles.push(std::thread::spawn(move || {
             let mut ring = IoUring::new(depth).expect("io_uring init");
+            // `barrier` is the window-of-1 special case, so one loop covers all
+            // three modes: how deep the pipeline runs, and how often the call
+            // boundary forces it empty.
+            let w = if mode == Mode::Barrier { 1 } else { window };
+            let drain_every = if mode == Mode::Batch { batch.max(1) } else { usize::MAX };
             // One buffer per in-flight strip. Contents are irrelevant to the
             // submission shape, but must not be all-zero in case anything
             // downstream ever compresses; a single fill is enough.
-            let slots = if mode == Mode::Barrier { width } else { window * width };
+            let slots = w * width;
             let mut bufs: Vec<AlignedBuf> = (0..slots)
                 .map(|i| {
                     let mut b = AlignedBuf::new(strip).expect("aligned buffer");
@@ -128,6 +146,7 @@ fn main() {
             let mut inflight = 0usize;
             let mut local = 0u64;
             let mut slot = 0usize;
+            let mut since_drain = 0usize;
 
             while !stop.load(Ordering::Relaxed) {
                 // Push one stripe: one strip-sized write per device.
@@ -152,25 +171,35 @@ fn main() {
                 }
                 inflight += width;
                 off = (off + strip as u64) % region;
-                slot = if mode == Mode::Barrier {
+                slot = (slot + width) % slots;
+                since_drain += 1;
+
+                // A call boundary forces the pipeline empty; otherwise keep at
+                // most `w` stripes outstanding so the slot we reuse next has
+                // certainly been reaped.
+                let target = if since_drain >= drain_every {
+                    since_drain = 0;
                     0
                 } else {
-                    (slot + width) % (window * width)
+                    (w - 1) * width
                 };
-
-                let target = if mode == Mode::Barrier { 0 } else { (window - 1) * width };
-                // `submit_and_wait(n)` returns once at least n CQEs are ready.
-                let need = inflight.saturating_sub(target);
-                ring.submit_and_wait(need).expect("submit_and_wait");
-                let mut reaped = 0usize;
-                for cqe in ring.completion() {
-                    if cqe.result() < 0 {
-                        panic!("write failed: {}", std::io::Error::from_raw_os_error(-cqe.result()));
+                while inflight > target {
+                    // `submit_and_wait(n)` returns once at least n CQEs are ready.
+                    ring.submit_and_wait(inflight - target)
+                        .expect("submit_and_wait");
+                    let mut reaped = 0usize;
+                    for cqe in ring.completion() {
+                        if cqe.result() < 0 {
+                            panic!(
+                                "write failed: {}",
+                                std::io::Error::from_raw_os_error(-cqe.result())
+                            );
+                        }
+                        reaped += 1;
                     }
-                    reaped += 1;
+                    inflight -= reaped;
+                    local += reaped as u64;
                 }
-                inflight -= reaped;
-                local += reaped as u64;
             }
             // Drain so the buffers are not freed under in-flight DMA.
             while inflight > 0 {
