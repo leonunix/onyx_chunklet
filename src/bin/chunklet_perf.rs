@@ -156,6 +156,13 @@ struct Cli {
     /// request size for request count.
     #[arg(long, default_value_t = 0)]
     uring_coalesce_max_bytes: usize,
+
+    /// Cap on SQEs published but unreaped. 0 keeps the stop-and-wait barrier
+    /// (push a whole wave, wait for ALL of it). Non-zero refills the ring as
+    /// completions land, so submission overlaps completion instead of the wait
+    /// being the max of the whole wave's latencies. Clamped to the SQ depth.
+    #[arg(long, default_value_t = 0)]
+    uring_write_window: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
@@ -362,14 +369,18 @@ fn run(cli: Cli) -> ChunkletResult<()> {
     if cli.uring_coalesce_max_bytes > 0 {
         onyx_chunklet::io::uring_backend::set_coalesce_max_bytes(cli.uring_coalesce_max_bytes);
     }
+    if cli.uring_write_window > 0 {
+        onyx_chunklet::io::uring_backend::set_write_window_sqes(cli.uring_write_window);
+    }
     println!(
-        "uring: chunk_ops={} coalesced_wait={} writev_coalesce={} coalesce_max_bytes={}",
+        "uring: chunk_ops={} coalesced_wait={} writev_coalesce={} coalesce_max_bytes={} write_window={}",
         onyx_chunklet::io::uring_backend::write_chunk_ops(),
         onyx_chunklet::io::uring_backend::coalesced_wait_enabled(),
         cli.uring_writev_coalesce
             .map(|v| v.to_string())
             .unwrap_or_else(|| "default".into()),
         onyx_chunklet::io::uring_backend::coalesce_max_bytes(),
+        onyx_chunklet::io::uring_backend::write_window_sqes(),
     );
 
     let file_jobs = perf_file.as_ref().map(|f| f.jobs.as_slice()).unwrap_or(&[]);
@@ -513,10 +524,11 @@ fn print_write_path_summary() {
             continue;
         }
         println!(
-            "wp.submit[{}] calls={} waves/call={:.2} enters/call={:.1} ops/call={:.1} sqes/call={:.1} merge={:.2} wait_us/call={:.1} bounce_us/call={:.1}",
+            "wp.submit[{}] calls={} waves/call={:.2} pushes/call={:.2} enters/call={:.1} ops/call={:.1} sqes/call={:.1} merge={:.2} wait_us/call={:.1} bounce_us/call={:.1}",
             i,
             s.calls,
             s.waves as f64 / s.calls as f64,
+            s.pushes as f64 / s.calls as f64,
             s.enters as f64 / s.calls as f64,
             s.ops as f64 / s.calls as f64,
             s.sqes as f64 / s.calls as f64,

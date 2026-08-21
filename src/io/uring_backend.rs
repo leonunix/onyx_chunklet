@@ -49,7 +49,7 @@ mod execution;
 mod stream;
 
 use batch::{
-    push_batch, wait_and_drain, wait_and_drain_observed, wait_and_drain_with_mode,
+    push_and_drain_windowed, push_batch, wait_and_drain, wait_and_drain_with_mode,
     ValidatedCompletion,
 };
 pub(crate) use execution::ExecutionPoolBackend;
@@ -157,6 +157,59 @@ pub fn set_write_chunk_ops(ops: usize) {
 /// value instead of the requested one.
 pub fn write_chunk_ops() -> usize {
     WRITE_CHUNK_OPS.load(Ordering::Relaxed)
+}
+
+/// Ops per wave for a batch of `n`. Chunking exists so one wave fits the SQ
+/// atomically; a windowed submit publishes in window-sized slices instead, so it
+/// needs no chunk bound at all — and chunking a windowed batch would reinstate
+/// exactly the barrier the window removes, once per chunk boundary.
+fn wave_ops(n: usize) -> usize {
+    if write_window_sqes() == 0 {
+        write_chunk_ops()
+    } else {
+        n.max(1)
+    }
+}
+
+/// Cap on SQEs published but unreaped on the batched write paths. `0` keeps the
+/// historical stop-and-wait barrier: hand the kernel a whole wave, then wait for
+/// ALL of it. That makes the wait the max of the wave's latencies, so every
+/// device that finishes early idles through the tail — on nvme-box's ten drives
+/// a RAID6 8+2 full-stripe write held per-drive queue depth at ~9 with 64
+/// submitting threads. Non-zero keeps at most that many SQEs outstanding and
+/// refills as completions land, which the standalone probe measured at 2.16x
+/// (barrier 8.10 -> 8-stripe window 17.47 GB/s, 97% of what raw fio gets from
+/// the same drives at the same request size).
+///
+/// Off by default until the box A/B; `window >= batch` degenerates to the
+/// barrier, so `1` is not the disabled value — `0` is.
+static WRITE_WINDOW_SQES: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the windowed-submit cap. Clamped to `URING_DEPTH` (the window must fit
+/// the SQ, or a top-up would find no room and the window would silently collapse
+/// back into a barrier). `0` disables windowing.
+pub fn set_write_window_sqes(sqes: usize) {
+    WRITE_WINDOW_SQES.store(sqes.min(URING_DEPTH as usize), Ordering::Relaxed);
+}
+
+/// Diagnostic override, same shape as `CHUNKLET_WRITEV_COALESCE`: it exists so
+/// the WHOLE suite can be re-run windowed (`CHUNKLET_WRITE_WINDOW_SQES=8 cargo
+/// test --release`) instead of only the dedicated window test, which is the only
+/// way to catch a caller nobody thought to window-test.
+fn write_window_sqes_env_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("CHUNKLET_WRITE_WINDOW_SQES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|sqes| sqes.min(URING_DEPTH as usize))
+    })
+}
+
+/// Effective windowed-submit cap. Public so an embedder that sets it at runtime
+/// can report the value after the clamp instead of the requested one.
+pub fn write_window_sqes() -> usize {
+    write_window_sqes_env_override().unwrap_or_else(|| WRITE_WINDOW_SQES.load(Ordering::Relaxed))
 }
 
 /// Submit an adjacency-merged group as one vectored write instead of copying its
@@ -286,8 +339,9 @@ impl UringBackend {
                 RingAccess::Degrade => Ok(true),
                 RingAccess::Ready(ring) => {
                     let mut start = 0usize;
+                    let wave = wave_ops(n);
                     while start < n {
-                        let end = (start + write_chunk_ops()).min(n);
+                        let end = (start + wave).min(n);
                         wp::add(&wp::SUBMIT_WAVES[slot], 1);
                         for (i, result) in submit_coalesced_chunk_detailed(ring, &ops[start..end])
                             .into_iter()
@@ -331,8 +385,9 @@ impl UringBackend {
                 RingAccess::Degrade => Ok(true),
                 RingAccess::Ready(ring) => {
                     let mut start = 0usize;
+                    let wave = wave_ops(n);
                     while start < n {
-                        let end = (start + write_chunk_ops()).min(n);
+                        let end = (start + wave).min(n);
                         let chunk_results = submit_coalesced_chunk_detailed_observed(
                             ring,
                             &ops[start..end],
@@ -1149,8 +1204,15 @@ fn submit_chunk_detailed_with_callback(
             }
         })
         .collect();
-    if let Err(error) = push_batch(ring, &entries, "io_uring write") {
-        return failed_chunk_results(n, error.to_string(), &mut on_completed);
+    // Every buffer these SQEs point at (`bounces`, `iovecs`, and the caller's
+    // own payloads) is already held alive until this function returns, so
+    // windowing only changes WHEN entries reach the kernel — it adds no
+    // ownership or lifetime surface over the barrier form.
+    let window = write_window_sqes();
+    if window == 0 {
+        if let Err(error) = push_batch(ring, &entries, "io_uring write") {
+            return failed_chunk_results(n, error.to_string(), &mut on_completed);
+        }
     }
     let mut callback = CompletionCallback::new(&mut on_completed);
     let mut short_indices = Vec::new();
@@ -1159,11 +1221,15 @@ fn submit_chunk_detailed_with_callback(
     // or in one bulk drain. Streaming callers (scheduler credit release) still
     // opt out via `stream_arrivals`.
     let coalesce = !stream_arrivals && coalesced_wait_enabled();
-    let completions =
-        wait_and_drain_with_mode(ring, n, "io_uring write", coalesce, &mut |arrivals| {
-            let terminal = partition_write_completions(arrivals, &ptrs, &mut short_indices);
-            callback.notify(&terminal);
-        });
+    let mut on_arrivals = |arrivals: &[ValidatedCompletion]| {
+        let terminal = partition_write_completions(arrivals, &ptrs, &mut short_indices);
+        callback.notify(&terminal);
+    };
+    let completions = if window == 0 {
+        wait_and_drain_with_mode(ring, n, "io_uring write", coalesce, &mut on_arrivals)
+    } else {
+        push_and_drain_windowed(ring, &entries, window, "io_uring write", &mut on_arrivals)
+    };
 
     let mut retry_results: Vec<Option<ChunkletResult<()>>> = (0..n).map(|_| None).collect();
     let recovered = attempt_all_indices(

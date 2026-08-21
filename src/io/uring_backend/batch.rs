@@ -80,6 +80,122 @@ pub(super) fn push_batch(
     Ok(())
 }
 
+/// Publish `entries` incrementally, keeping at most `window` SQEs published but
+/// unreaped, and return once every one has completed.
+///
+/// This is the same caller-visible contract as `push_batch` + [`wait_and_drain`]
+/// -- it blocks until the whole batch is terminal, so every borrowed buffer is
+/// still owned by the caller for exactly the call. The difference is purely
+/// *when* SQEs reach the kernel: the barrier form hands the kernel one wave and
+/// then waits for ALL of it, so the wait is the max of that wave's latencies and
+/// every device that finishes early idles through the tail. Here a completion
+/// immediately makes room for the next SQE, so submission overlaps completion
+/// and a fast device keeps going. Measured 2.16x on nvme-box's ten drives
+/// (`chunklet-submit-probe`: barrier 8.10 -> 8-stripe window 17.47 GB/s).
+///
+/// A `window` at or above `entries.len()` degenerates to one push followed by the
+/// drain, i.e. the barrier's submission shape, so there is no cliff between the
+/// two -- but the disabled value is `0`, which routes to `push_batch` +
+/// [`wait_and_drain`] so that `coalesced_wait` (one `io_uring_enter` for a whole
+/// wave) still applies. Windowing implies waking per completion, since the whole
+/// point is to refill as soon as there is room.
+///
+/// Once the first slice is published, unwinding is not a valid error path (the
+/// kernel may still dereference those pointers), so a top-up that cannot fit --
+/// impossible, since the SQ is fully submitted at every top-up and `window` is
+/// clamped to its capacity -- is a fail-stop, not an error return.
+pub(super) fn push_and_drain_windowed(
+    ring: &mut IoUring,
+    entries: &[squeue::Entry],
+    window: usize,
+    context: &str,
+    on_drain: &mut impl FnMut(&[ValidatedCompletion]),
+) -> BatchCompletions {
+    let expected = entries.len();
+    debug_assert!(expected > 0 && window > 0);
+    assert_ring_clean(ring, context);
+    let slot = wp::class_slot();
+    let mut pushed = 0usize;
+
+    let driven = drive_completions_observed(
+        expected,
+        |remaining| {
+            // `remaining` counts SQEs of this batch not yet completed, so
+            // `expected - remaining` is what has completed and the difference
+            // from `pushed` is what the kernel currently owns.
+            let completed = expected - remaining;
+            let inflight = pushed - completed;
+            if inflight < window && pushed < expected {
+                let room = (window - inflight).min(expected - pushed);
+                let capacity = {
+                    let sq = ring.submission();
+                    sq.capacity() - sq.len()
+                };
+                let take = room.min(capacity);
+                if take == 0 {
+                    // `window <= capacity` and the SQ is empty after every
+                    // submit, so this cannot happen; treat it as a lost
+                    // invariant rather than spinning.
+                    fatal_protocol(
+                        context,
+                        &format!(
+                            "windowed push stalled with {inflight} in flight, \
+                             {} unpushed and no SQ room",
+                            expected - pushed
+                        ),
+                    );
+                }
+                // SAFETY: identical to `push_batch` -- the caller retains every
+                // fd and referenced buffer until this function has collected the
+                // whole batch, and capacity was checked immediately above so the
+                // push cannot partially fail.
+                unsafe {
+                    if ring
+                        .submission()
+                        .push_multiple(&entries[pushed..pushed + take])
+                        .is_err()
+                    {
+                        fatal_protocol(
+                            context,
+                            "windowed SQ push failed despite reserved capacity",
+                        );
+                    }
+                }
+                pushed += take;
+                wp::add(&wp::SUBMIT_PUSHES[slot], 1);
+            }
+            // Wake on the first completion rather than the whole batch: the
+            // point of a window is to refill as soon as there is room, and
+            // `coalesced_wait`'s "one enter per wave" only makes sense when the
+            // wave is a barrier. A wake still harvests the WHOLE CQ.
+            wp::add(&wp::SUBMIT_ENTERS[slot], 1);
+            ring.submit_and_wait(1)?;
+            Ok(ring
+                .completion()
+                .map(|cqe| RawCompletion {
+                    user_data: cqe.user_data(),
+                    result: cqe.result(),
+                })
+                .collect())
+        },
+        on_drain,
+    );
+
+    match driven {
+        Ok(driven) => {
+            assert_ring_clean(ring, context);
+            if let Some(error) = &driven.completions.protocol_error {
+                fatal_protocol(context, error);
+            }
+            if let Some(payload) = driven.observer_panic {
+                resume_unwind(payload);
+            }
+            driven.completions
+        }
+        Err(error) => fatal_wait(context, &error),
+    }
+}
+
 /// Wait for and collect every completion belonging to the just-pushed batch.
 /// A fatal `io_uring_enter` error is ambiguous: some SQEs may already be in
 /// flight. Returning would release borrowed/bounce buffers and cause UAF, so
