@@ -150,6 +150,12 @@ struct Cli {
     /// keep one SQE per strip and trade request size for concurrency.
     #[arg(long)]
     uring_writev_coalesce: Option<bool>,
+
+    /// Byte cap on one adjacency-merged group. 0 keeps the built-in 256 KiB.
+    /// Setting it to the strip size stops merging for that geometry, trading
+    /// request size for request count.
+    #[arg(long, default_value_t = 0)]
+    uring_coalesce_max_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
@@ -353,13 +359,17 @@ fn run(cli: Cli) -> ChunkletResult<()> {
     if let Some(v) = cli.uring_writev_coalesce {
         onyx_chunklet::io::uring_backend::set_writev_coalesce(v);
     }
+    if cli.uring_coalesce_max_bytes > 0 {
+        onyx_chunklet::io::uring_backend::set_coalesce_max_bytes(cli.uring_coalesce_max_bytes);
+    }
     println!(
-        "uring: chunk_ops={} coalesced_wait={} writev_coalesce={}",
+        "uring: chunk_ops={} coalesced_wait={} writev_coalesce={} coalesce_max_bytes={}",
         onyx_chunklet::io::uring_backend::write_chunk_ops(),
         onyx_chunklet::io::uring_backend::coalesced_wait_enabled(),
         cli.uring_writev_coalesce
             .map(|v| v.to_string())
             .unwrap_or_else(|| "default".into()),
+        onyx_chunklet::io::uring_backend::coalesce_max_bytes(),
     );
 
     let file_jobs = perf_file.as_ref().map(|f| f.jobs.as_slice()).unwrap_or(&[]);

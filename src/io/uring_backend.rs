@@ -189,6 +189,40 @@ fn writev_coalesce_enabled() -> bool {
     writev_coalesce_env_override().unwrap_or_else(|| WRITEV_COALESCE.load(Ordering::Relaxed))
 }
 
+/// Byte cap on one adjacency-merged group. Runtime-settable because it trades
+/// request SIZE against request COUNT, and which side wins is a property of the
+/// device, not of the code: at the default 256 KiB a 128 KiB strip always merges
+/// exactly 2:1, and nvme-box's drives deliver 17% LESS at 256 KiB than at
+/// 128 KiB, so that merge halves the concurrent request count for a request size
+/// the drives handle worse. Setting this to the strip size disables merging for
+/// that geometry without touching the merge logic.
+static COALESCE_MAX_BYTES: AtomicUsize = AtomicUsize::new(MAX_COALESCED_WRITE_BYTES);
+
+/// `0` restores [`MAX_COALESCED_WRITE_BYTES`]. Applies process-wide to every
+/// subsequent batch.
+pub fn set_coalesce_max_bytes(bytes: usize) {
+    let value = if bytes == 0 {
+        MAX_COALESCED_WRITE_BYTES
+    } else {
+        bytes.max(BLOCK_SIZE as usize)
+    };
+    COALESCE_MAX_BYTES.store(value, Ordering::Relaxed);
+}
+
+fn coalesce_max_bytes_env_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("CHUNKLET_COALESCE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&bytes| bytes >= BLOCK_SIZE as usize)
+    })
+}
+
+pub fn coalesce_max_bytes() -> usize {
+    coalesce_max_bytes_env_override().unwrap_or_else(|| COALESCE_MAX_BYTES.load(Ordering::Relaxed))
+}
+
 /// Upper bound on iovecs in one `writev`. `IOV_MAX` is 1024 on Linux; a group is
 /// already capped at [`MAX_COALESCED_WRITE_BYTES`] / 4 KiB = 64 strips, so this
 /// only guards a future strip size below 256 bytes.
@@ -782,6 +816,9 @@ fn group_is_writev_safe(ops: &[StripWrite<'_>], group: &[usize]) -> bool {
 /// [`MAX_COALESCED_WRITE_BYTES`]. `write_groups_match_the_reference_grouping`
 /// pins the equivalence against the original implementation.
 fn coalesced_write_groups(ops: &[StripWrite<'_>]) -> WriteGroups {
+    // Read once: the inner comparison runs per op, and the same reasoning that
+    // put the PD key extraction outside the sort applies to an atomic load.
+    let max_group_bytes = coalesce_max_bytes();
     // Extract each op's key ONCE. `PhysicalDisk::pd_id` takes that PD's state
     // RwLock, and `sort_unstable_by_key` re-invokes its key function on every
     // comparison, so sorting by it directly costs O(N log N) lock acquisitions —
@@ -833,9 +870,7 @@ fn coalesced_write_groups(ops: &[StripWrite<'_>]) -> WriteGroups {
         for (at, &idx) in run.iter().enumerate().map(|(i, idx)| (key_start + i, idx)) {
             let op = &ops[idx];
             let adjacent = at > group_start && op.in_chunklet_off == current_end;
-            if at > group_start
-                && (!adjacent || current_bytes + op.data.len() > MAX_COALESCED_WRITE_BYTES)
-            {
+            if at > group_start && (!adjacent || current_bytes + op.data.len() > max_group_bytes) {
                 spans.push((group_start as u32, (at - group_start) as u32));
                 group_start = at;
                 current_bytes = 0;
@@ -1529,8 +1564,11 @@ mod tests {
             for idx in indices {
                 let op = &ops[idx];
                 let adjacent = !current.is_empty() && op.in_chunklet_off == current_end;
+                // Reads the same knob as production on purpose: otherwise the
+                // equivalence test silently stops testing anything as soon as
+                // the suite is re-run under CHUNKLET_COALESCE_MAX_BYTES.
                 if !current.is_empty()
-                    && (!adjacent || current_bytes + op.data.len() > MAX_COALESCED_WRITE_BYTES)
+                    && (!adjacent || current_bytes + op.data.len() > coalesce_max_bytes())
                 {
                     groups.push(std::mem::take(&mut current));
                     current_bytes = 0;
@@ -1609,7 +1647,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let pd = test_pd(&dir, "pd0", 0, false);
         let page = vec![0u8; 4096];
-        let per_group = MAX_COALESCED_WRITE_BYTES / page.len();
+        // The EFFECTIVE cap, not the constant: this test asserts the cut is
+        // made at the cap, which is now runtime-settable. Reading the constant
+        // here made the case pass only at the default and fail under
+        // CHUNKLET_COALESCE_MAX_BYTES, which is precisely the run that is
+        // supposed to prove the knob does not break any caller.
+        let per_group = coalesce_max_bytes() / page.len();
         let n = per_group + 3;
         let ops: Vec<StripWrite<'_>> = (0..n)
             .map(|i| StripWrite {
