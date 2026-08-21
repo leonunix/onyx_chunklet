@@ -414,6 +414,71 @@ fn print_gf256_summary() {
     println!("parity.delta_calls_legacy={}", p.delta_calls_legacy);
     println!("parity.delta_src_bytes={}", p.delta_src_bytes);
     println!("parity.fused_enabled={}", parity::fused_enabled());
+    print_write_path_summary();
+}
+
+/// Phase ledger for the write path. Raw totals are summed across every worker,
+/// so the useful reading is the per-call microseconds: the four `rt_*` legs must
+/// cover `rt_total - rt_inner`, and the `r6_*` phases must cover `r6_total`. A
+/// residual means an unmeasured cost centre, which is the whole point of
+/// printing the covering totals alongside the parts.
+fn print_write_path_summary() {
+    let w = onyx_chunklet::write_path::stats();
+    let per = |ns: u64, calls: u64| -> f64 {
+        if calls == 0 {
+            0.0
+        } else {
+            ns as f64 / calls as f64 / 1000.0
+        }
+    };
+    let rc = w.rt_write_many_calls;
+    println!("wp.rt_calls={} rt_keys_per_call={:.2}", rc, {
+        if rc == 0 {
+            0.0
+        } else {
+            w.rt_write_many_keys as f64 / rc as f64
+        }
+    });
+    println!(
+        "wp.rt_us_per_call total={:.1} inner={:.1} lifecycle={:.1} key_build={:.1} range_lock={:.1}",
+        per(w.rt_total_ns, rc),
+        per(w.rt_inner_ns, rc),
+        per(w.rt_lifecycle_ns, rc),
+        per(w.rt_key_build_ns, rc),
+        per(w.rt_range_lock_ns, rc),
+    );
+    let bc = w.r6_batch_calls;
+    println!(
+        "wp.r6_calls={} ops={} stripes={} serial_bails={}",
+        bc, w.r6_batch_ops, w.r6_batch_stripes, w.r6_batch_serial_bails
+    );
+    println!(
+        "wp.r6_us_per_call total={:.1} plan={:.1} lock={:.1} read={:.1} compute={:.1} write={:.1} max_total={:.1}",
+        per(w.r6_total_ns, bc),
+        per(w.r6_plan_ns, bc),
+        per(w.r6_lock_ns, bc),
+        per(w.r6_read_ns, bc),
+        per(w.r6_compute_ns, bc),
+        per(w.r6_write_ns, bc),
+        w.r6_total_ns_max as f64 / 1000.0,
+    );
+    for (i, s) in w.submit.iter().enumerate() {
+        if s.calls == 0 {
+            continue;
+        }
+        println!(
+            "wp.submit[{}] calls={} waves/call={:.2} enters/call={:.1} ops/call={:.1} sqes/call={:.1} merge={:.2} wait_us/call={:.1} bounce_us/call={:.1}",
+            i,
+            s.calls,
+            s.waves as f64 / s.calls as f64,
+            s.enters as f64 / s.calls as f64,
+            s.ops as f64 / s.calls as f64,
+            s.sqes as f64 / s.calls as f64,
+            if s.sqes == 0 { 0.0 } else { s.ops as f64 / s.sqes as f64 },
+            per(s.wait_ns, s.calls),
+            per(s.bounce_ns(), s.calls),
+        );
+    }
 }
 
 fn build_jobs(
