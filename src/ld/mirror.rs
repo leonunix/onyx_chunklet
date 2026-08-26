@@ -676,7 +676,22 @@ impl LogicalDisk for LdMirror {
                     continue;
                 }
                 let bytes: usize = group.iter().map(|&idx| ops[idx].1.len()).sum();
-                let mut buffer = AlignedBuf::new(bytes)?;
+                // `uninit`, not `new`: the loop below overwrites `[0, bytes)`
+                // byte for byte (the group is adjacent, so concatenating its
+                // payloads in order exactly covers the span this write is
+                // issued at), and `uninit` still zeroes the block round-up tail
+                // so nothing uninitialised can reach the device. `new`'s
+                // zero-fill was pure waste and DOUBLED the memory traffic of
+                // every merged group — the exact reason `uninit` exists, which
+                // only the RAID6 batched path had been converted to use.
+                //
+                // Box 2026-08-26, LV2's RAID10 LD under RWMIX=0 QD256: the
+                // `coalesce` phase of the >=5 ms mirror-write tail was 1534 us
+                // mean / 9207 us p99 = 17.2% of the call, moving a mean 898 KiB
+                // at an effective 3.4 GB/s — about a third of what a plain copy
+                // should manage, which is what a zero-fill plus first-touch
+                // faults on a fresh allocation costs.
+                let mut buffer = AlignedBuf::uninit(bytes)?;
                 let mut cursor = 0;
                 for &idx in &group {
                     let data = ops[idx].1;
