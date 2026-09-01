@@ -265,6 +265,161 @@ fn raid6_read_many_substrip_two_data_failures_reconstruct_via_pq() {
     assert_eq!(got, payload[offset as usize..offset as usize + block]);
 }
 
+/// A read wider than the strip it starts in must still be ONE submit.
+///
+/// This is the regression the onyx read path was paying for: `read_many_at`
+/// used to hand any strip-crossing op to the serial `read_at`, which issued one
+/// direct `read_chunklet_user` per strip — invisible to `submit_reads`, so the
+/// batch degenerated into N sequential device IOs. LV3 compression units are
+/// several strips wide, which made that the common case.
+///
+/// `CountingReadBackend` only sees the batched path, so `ops` counts exactly
+/// the segments that were submitted together: before the fix this asserted 0.
+#[test]
+fn raid6_read_many_batches_strip_crossing_ops_in_one_submit() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let full_stripe = 3 * strip;
+    let payload: Vec<u8> = (0..2 * full_stripe)
+        .map(|i| ((i * 23 + 5) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+
+    let inner = pool.pd(pool.list_pds()[0].pd_id).unwrap().backend();
+    let counting = Arc::new(CountingReadBackend::new(inner));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(counting.clone());
+    }
+
+    // (offset, len, expected strip segments): one op straddling a strip
+    // boundary, one spanning a whole full stripe, one that crosses the
+    // full-stripe boundary, and one non-crossing op for contrast.
+    let cases: [(u64, usize, usize); 4] = [
+        ((strip - block) as u64, 2 * block, 2),
+        (0, full_stripe, 3),
+        ((full_stripe - block) as u64, 2 * block, 2),
+        ((strip + 4 * block) as u64, block, 1),
+    ];
+    let expected_segments: usize = cases.iter().map(|&(_, _, segs)| segs).sum();
+
+    let mut bufs: Vec<Vec<u8>> = cases.iter().map(|&(_, len, _)| vec![0u8; len]).collect();
+    let mut ops: Vec<(u64, &mut [u8])> = cases
+        .iter()
+        .map(|&(offset, _, _)| offset)
+        .zip(bufs.iter_mut().map(Vec::as_mut_slice))
+        .collect();
+    ld.read_many_at(&mut ops).unwrap();
+    drop(ops);
+
+    for (&(offset, len, _), got) in cases.iter().zip(&bufs) {
+        assert_eq!(got, &payload[offset as usize..offset as usize + len]);
+    }
+    assert_eq!(counting.submits.load(Ordering::Relaxed), 1);
+    assert_eq!(counting.ops.load(Ordering::Relaxed), expected_segments);
+}
+
+/// The same carve-then-submit applies to a single multi-strip `read_at`, which
+/// used to walk its strips one device IO at a time.
+#[test]
+fn raid6_read_at_multi_strip_is_one_submit() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let payload: Vec<u8> = (0..3 * strip)
+        .map(|i| ((i * 29 + 3) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+
+    let inner = pool.pd(pool.list_pds()[0].pd_id).unwrap().backend();
+    let counting = Arc::new(CountingReadBackend::new(inner));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(counting.clone());
+    }
+
+    // Starts mid-strip and runs past two boundaries: 3 segments.
+    let offset = (strip - block) as u64;
+    let len = strip + 2 * block;
+    let mut got = vec![0u8; len];
+    ld.read_at(offset, &mut got).unwrap();
+
+    assert_eq!(got, payload[offset as usize..offset as usize + len]);
+    assert_eq!(counting.submits.load(Ordering::Relaxed), 1);
+    assert_eq!(counting.ops.load(Ordering::Relaxed), 3);
+}
+
+/// Degraded set: a strip-crossing read whose segments include an open-failed
+/// data position. The failed segment is reconstructed inline (at its own
+/// sub-strip offset — it is not a whole strip) and the healthy ones still go out
+/// in one batch.
+#[test]
+fn raid6_read_many_strip_crossing_over_failed_position() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let full_stripe = 3 * strip;
+    let payload: Vec<u8> = (0..full_stripe)
+        .map(|i| ((i * 37 + 17) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let mut pds = pds_map(&pool);
+    pds.remove(&desc.members[0].pd);
+    let r6 = LdRaid6::open(desc, &pds).unwrap();
+
+    // Spans data positions 0 (failed), 1 and 2, starting mid-strip so the
+    // reconstructed segment is a partial strip.
+    let offset = (strip / 2) as u64;
+    let len = full_stripe - strip / 2;
+    let mut got = vec![0u8; len];
+    let mut ops = [(offset, got.as_mut_slice())];
+    r6.read_many_at(&mut ops).unwrap();
+    drop(ops);
+    assert_eq!(got, payload[offset as usize..offset as usize + len]);
+}
+
+/// Runtime fault (member still believed healthy) on a strip-crossing batch:
+/// the whole carved batch falls back to the per-segment reconstruct, which must
+/// rebuild each sub-strip range rather than assuming full strips.
+#[test]
+fn raid6_read_many_strip_crossing_runtime_fault_reconstructs() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 5);
+    let id = pool.create_ld(LdSpec::raid6(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let full_stripe = 3 * strip;
+    let payload: Vec<u8> = (0..full_stripe)
+        .map(|i| ((i * 41 + 19) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    pool.pd(desc.members[1].pd).unwrap().set_read_faulting(true);
+    let r6 = LdRaid6::open(desc, &pds_map(&pool)).unwrap();
+
+    let offset = (strip - block) as u64;
+    let len = strip + 2 * block;
+    let mut got = vec![0u8; len];
+    let mut ops = [(offset, got.as_mut_slice())];
+    r6.read_many_at(&mut ops).unwrap();
+    drop(ops);
+    assert_eq!(got, payload[offset as usize..offset as usize + len]);
+}
+
 #[test]
 fn raid6_concurrent_disjoint_full_stripe_writes() {
     let dir = TempDir::new().unwrap();
