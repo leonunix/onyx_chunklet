@@ -215,6 +215,13 @@ impl StripeLockTable {
         (mixed >> (u64::BITS - STRIPE_LOCK_BUCKETS.trailing_zeros())) as usize
     }
 
+    /// The shift this table was built with. Read by `Pool::lock_group_shift_of`
+    /// so a caller (and a test) can confirm which policy a live LD actually got,
+    /// rather than which one it asked for.
+    pub(crate) fn group_shift(&self) -> u32 {
+        self.group_shift
+    }
+
     pub(crate) fn write_key(&self, key: u64) -> RwLockWriteGuard<'_, ()> {
         self.buckets[self.bucket(key)].write()
     }
@@ -447,8 +454,43 @@ mod stripe_lock_tests {
         }
     }
 
-    /// Pins the policy: only the parity levels group. Regressing this would
-    /// serialize onyx's LV2 ack path.
+    /// The LV2 shape, which is why a mirror LD may be given a grouped table via
+    /// `pool::LockGroupOverrides`: one write lane per buffer shard, each shard a
+    /// disjoint 768 MiB slice, ~512 contiguous 4 KiB keys per call. Grouping must
+    /// collapse the call to ~1 bucket while keeping the shards apart — otherwise
+    /// bounding the footprint would just move the contention.
+    #[test]
+    fn grouping_bounds_a_mirror_batch_without_aliasing_shards() {
+        let table = StripeLockTable::with_group_shift(STRIPE_LOCK_GROUP_SHIFT_BATCHED);
+        // `LdMirror::stripe_key` is `((row * row_size + set) << 32) | strip`, so
+        // one shard's run lives in one set's low 32 bits.
+        let key = |set: u64, strip: u64| (set << 32) | strip;
+        let shard_stride = 768 * 1024 * 1024 / 4096; // 768 MiB of 4 KiB strips
+        let mut all_buckets = HashSet::new();
+        for shard in 0..16u64 {
+            let base = shard * shard_stride;
+            let keys: Vec<u64> = (base..base + 512).map(|s| key(0, s)).collect();
+            let footprint = table.footprint(&keys);
+            assert!(
+                footprint <= 2,
+                "shard {shard}: 512 contiguous keys took {footprint} buckets (a run may \
+                 straddle one group boundary, hence 2)"
+            );
+            for k in &keys {
+                all_buckets.insert(table.bucket(*k));
+            }
+        }
+        assert!(
+            all_buckets.len() >= 16,
+            "16 shards 768 MiB apart collapsed onto {} buckets — grouping would \
+             manufacture contention between independent write lanes",
+            all_buckets.len()
+        );
+    }
+
+    /// Pins the DEFAULT policy: only the parity levels group by RAID level. A
+    /// mirror LD that wants grouping gets it per-id
+    /// (`pool::LockGroupOverrides`), never by regressing this.
     #[test]
     fn only_parity_levels_group_their_lock_keys() {
         use crate::RaidLevel;

@@ -35,6 +35,6 @@ pub use ld::degrade::SuspectMember;
 pub use ld::{LdDescriptor, LdList, LdMirror, LdPlain, LdRaid0, LdRaid5, LdRaid6, LogicalDisk};
 pub use metrics::{LdMetrics, PdMetrics, PdOperationalState, PoolMetrics};
 pub use pd::PhysicalDisk;
-pub use pool::{Pool, PoolConfig};
+pub use pool::{LockGroupOverrides, Pool, PoolConfig, MAX_LOCK_GROUP_SHIFT};
 pub use types::{ChunkletId, CpgId, HaDomain, LdId, LdMember, LdRole, PdId, PoolId, RaidLevel};
 pub use write_path::{stats as write_path_stats, WritePathStats};

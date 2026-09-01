@@ -656,7 +656,14 @@ impl Pool {
             desc.id,
             Arc::new(LdRuntime::new(
                 self.suspect_tx.clone(),
-                super::lock_group_shift_for(desc.raid_level),
+                // Same policy the open path applied to the pre-existing LDs, so
+                // an LD created mid-life is not locked differently from the same
+                // LD after the next reopen.
+                super::lock_group_shift_for_ld(
+                    desc.id,
+                    desc.raid_level,
+                    &self.lock_group_overrides,
+                ),
             )),
         );
         Ok(())

@@ -92,6 +92,13 @@ pub struct Pool {
     /// which case sends simply accumulate harmlessly.
     suspect_tx: Sender<SuspectMember>,
     suspect_rx: Receiver<SuspectMember>,
+    /// Per-LD lock-group-shift overrides supplied at open time, kept so the
+    /// create-LD path ([`ld_ops::commit_new_ld`]) builds its `LdRuntime` under
+    /// the same policy as the ones built by [`build_ld_runtime`].
+    ///
+    /// Immutable for the pool's life ON PURPOSE — see
+    /// [`LockGroupOverrides`].
+    lock_group_overrides: LockGroupOverrides,
 }
 
 pub(crate) struct PoolState {
@@ -231,31 +238,91 @@ impl LdRuntime {
     }
 }
 
+/// Per-LD lock-group-shift overrides, chosen by the caller at pool open.
+///
+/// The default policy is per RAID LEVEL ([`lock_group_shift_for`]), which cannot
+/// separate two LDs of the same level with opposite access patterns — and onyx
+/// has exactly that pair: its LV2 ring log and the metadb page window are BOTH
+/// RAID10. LV2 hands in ~512 contiguous 4 KiB keys per `write_many_at` and wants
+/// them collapsed onto ~1 bucket; the metadb window writes scattered single pages
+/// where grouping would only manufacture false sharing. So the discriminator has
+/// to be the LD id, and only the caller knows which id plays which role.
+///
+/// ⚠ **Open-time only, and immutable afterwards.** A shift is not a tunable that
+/// can be flipped while IO is in flight: [`StripeLockTable::bucket`] is the sole
+/// key→bucket mapping, and two callers running under different shifts map the
+/// same key to different buckets, i.e. exclude on different buckets — which is
+/// not excluding at all. (They cannot AB-BA deadlock, since every acquisition
+/// helper sorts bucket indices, but they do lose mutual exclusion.) Passing the
+/// value into `open` makes immutability structural rather than a precondition
+/// nobody can enforce.
+pub type LockGroupOverrides = BTreeMap<LdId, u32>;
+
+/// Largest accepted [`LockGroupOverrides`] shift.
+///
+/// Stripe keys are `(set_or_row_idx << 32) | strip_index` (`LdRaid6::stripe_key`,
+/// `LdMirror::stripe_key`), so a shift of 32 or more erases the strip index
+/// entirely and collapses a whole RAID set / mirror row onto ONE bucket — every
+/// write to that set would serialize. `key >> shift` also has to stay a defined
+/// u64 shift. 31 is therefore the mechanical wall, not a taste judgement;
+/// useful values are small (the batched default is 10 = a 4 MiB group).
+pub const MAX_LOCK_GROUP_SHIFT: u32 = 31;
+
+fn validate_lock_group_overrides(overrides: &LockGroupOverrides) -> ChunkletResult<()> {
+    for (ld_id, shift) in overrides {
+        if *shift > MAX_LOCK_GROUP_SHIFT {
+            return Err(ChunkletError::Config(format!(
+                "lock_group_shift {} for LD {} exceeds the maximum {}",
+                shift, ld_id, MAX_LOCK_GROUP_SHIFT
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_ld_runtime(
     ld_list: &LdList,
     suspect_tx: &Sender<SuspectMember>,
+    overrides: &LockGroupOverrides,
 ) -> BTreeMap<LdId, Arc<LdRuntime>> {
     ld_list
         .lds
         .iter()
         .map(|desc| {
-            let shift = lock_group_shift_for(desc.raid_level);
+            let shift = lock_group_shift_for_ld(desc.id, desc.raid_level, overrides);
             (desc.id, Arc::new(LdRuntime::new(suspect_tx.clone(), shift)))
         })
         .collect()
 }
 
-/// Lock-table key grouping for one LD, by RAID level.
+/// Lock-table key grouping for one LD: the caller's per-id override if it named
+/// this LD, else the per-RAID-level default.
+pub(crate) fn lock_group_shift_for_ld(
+    ld_id: LdId,
+    raid_level: crate::RaidLevel,
+    overrides: &LockGroupOverrides,
+) -> u32 {
+    match overrides.get(&ld_id) {
+        Some(shift) => *shift,
+        None => lock_group_shift_for(raid_level),
+    }
+}
+
+/// Lock-table key grouping for one LD, by RAID level — the DEFAULT, overridable
+/// per LD via [`LockGroupOverrides`].
 ///
 /// Parity LDs are the ones that take large batched writes — onyx's LV3 flusher
 /// hands in hundreds of stripes per `write_many_at` — so they are the ones whose
 /// lock footprint has to be bounded ([`StripeLockTable`]).
 ///
-/// Mirror/plain/raid0 stay ungrouped ON PURPOSE. onyx's LV2 ring and the metadb
-/// page window are RAID10, and a ring log writes ADJACENT keys from independent
-/// callers; grouping those would put unrelated concurrent appends on one bucket
-/// and manufacture contention on the durable-ack path, which is already 90-94 %
-/// of foreground append time.
+/// Mirror/plain/raid0 default to ungrouped because a mirror LD *may* be carrying
+/// scattered single-page traffic from independent callers (onyx's metadb page
+/// window), where grouping only manufactures false sharing. It is NOT a
+/// statement that mirrors never want grouping: a mirror LD whose concurrent
+/// callers write far-apart contiguous RUNS (onyx's LV2 ring — one write lane per
+/// buffer shard, shards 768 MiB apart, ~512 contiguous keys per call) has the
+/// same unbounded-footprint problem as RAID6 and is the reason
+/// [`LockGroupOverrides`] exists.
 pub(crate) fn lock_group_shift_for(raid_level: crate::RaidLevel) -> u32 {
     match raid_level {
         crate::RaidLevel::Raid5 | crate::RaidLevel::Raid6 => {
@@ -336,6 +403,9 @@ impl Pool {
             manifest_lock: Mutex::new(()),
             suspect_tx,
             suspect_rx,
+            // A fresh pool has no LDs yet; `create_ld` takes the per-level
+            // default. The overrides ride the OPEN that follows.
+            lock_group_overrides: LockGroupOverrides::new(),
         }))
     }
 
@@ -346,6 +416,17 @@ impl Pool {
     /// Phase 7 task — for now we enforce strict consistency and reject the
     /// open if it fails.
     pub fn open(devices: Vec<RawDevice>) -> ChunkletResult<Arc<Self>> {
+        Self::open_with_lock_group_overrides(devices, LockGroupOverrides::new())
+    }
+
+    /// [`Pool::open`] with per-LD lock-group-shift overrides. See
+    /// [`LockGroupOverrides`] for why this is an open-time parameter and not a
+    /// setter.
+    pub fn open_with_lock_group_overrides(
+        devices: Vec<RawDevice>,
+        lock_group_overrides: LockGroupOverrides,
+    ) -> ChunkletResult<Arc<Self>> {
+        validate_lock_group_overrides(&lock_group_overrides)?;
         if devices.is_empty() {
             return Err(ChunkletError::Config("open: no devices".into()));
         }
@@ -476,7 +557,7 @@ impl Pool {
                 pds,
                 pd_seq_to_id,
                 draining: std::collections::BTreeSet::new(),
-                ld_runtime: build_ld_runtime(&ld_list, &suspect_tx),
+                ld_runtime: build_ld_runtime(&ld_list, &suspect_tx, &lock_group_overrides),
                 ld_list,
                 cpg_list,
                 last_reconciliation_count: reconciled,
@@ -485,6 +566,7 @@ impl Pool {
             manifest_lock: Mutex::new(()),
             suspect_tx,
             suspect_rx,
+            lock_group_overrides,
         }))
     }
 
@@ -502,6 +584,16 @@ impl Pool {
     /// majority of the declared pool_pd_count, this returns
     /// `PoolMismatch` (no quorum).
     pub fn open_with_missing(devices: Vec<RawDevice>) -> ChunkletResult<Arc<Self>> {
+        Self::open_with_missing_and_lock_group_overrides(devices, LockGroupOverrides::new())
+    }
+
+    /// [`Pool::open_with_missing`] with per-LD lock-group-shift overrides. See
+    /// [`LockGroupOverrides`].
+    pub fn open_with_missing_and_lock_group_overrides(
+        devices: Vec<RawDevice>,
+        lock_group_overrides: LockGroupOverrides,
+    ) -> ChunkletResult<Arc<Self>> {
+        validate_lock_group_overrides(&lock_group_overrides)?;
         if devices.is_empty() {
             return Err(ChunkletError::Config(
                 "open_with_missing: no devices".into(),
@@ -612,7 +704,7 @@ impl Pool {
                 pd_seq_to_id,
                 pd_health,
                 draining: std::collections::BTreeSet::new(),
-                ld_runtime: build_ld_runtime(&ld_list, &suspect_tx),
+                ld_runtime: build_ld_runtime(&ld_list, &suspect_tx, &lock_group_overrides),
                 ld_list,
                 cpg_list,
                 last_reconciliation_count: reconciled,
@@ -621,6 +713,7 @@ impl Pool {
             manifest_lock: Mutex::new(()),
             suspect_tx,
             suspect_rx,
+            lock_group_overrides,
         }))
     }
 
@@ -633,6 +726,18 @@ impl Pool {
     /// queue harmlessly (unbounded).
     pub fn suspect_events(&self) -> Receiver<SuspectMember> {
         self.suspect_rx.clone()
+    }
+
+    /// Lock-group shift in force for a live LD, read off the LD's actual
+    /// `StripeLockTable` — i.e. what the LD got, not what was requested.
+    /// `None` if the pool holds no such LD. Both of an LD's tables always carry
+    /// the same shift ([`LdRuntime::new`]).
+    pub fn lock_group_shift_of(&self, ld_id: LdId) -> Option<u32> {
+        self.state
+            .read()
+            .ld_runtime
+            .get(&ld_id)
+            .map(|rt| rt.stripe_locks.group_shift())
     }
 
     /// Public read accessor for PD health. Phase 5 only ever returns
@@ -1181,6 +1286,78 @@ mod tests {
 
     fn collect_paths(dir: &TempDir, names: &[&str]) -> Vec<std::path::PathBuf> {
         names.iter().map(|n| dir.path().join(n)).collect()
+    }
+
+    /// The whole point of a per-ID override: onyx's LV2 ring and its metadb page
+    /// window are BOTH RAID10, so a policy keyed on the RAID level cannot tell
+    /// them apart. Overriding one must not move the other, and must survive into
+    /// the LD's live lock table.
+    #[test]
+    fn lock_group_override_reaches_only_the_named_ld() {
+        let dir = TempDir::new().unwrap();
+        let names = ["pd0", "pd1", "pd2", "pd3"];
+        let pool = Pool::create(
+            names.iter().map(|n| sparse(&dir, n)).collect(),
+            PoolConfig::default(),
+        )
+        .unwrap();
+        // Two mirror LDs — the LV2-vs-metadb shape.
+        let lv2 = pool.create_ld(ld_ops::LdSpec::mirror(2, 2, 1, 0)).unwrap();
+        let meta = pool.create_ld(ld_ops::LdSpec::mirror(2, 2, 1, 0)).unwrap();
+        // create_ld with no overrides installed keeps the per-level default.
+        assert_eq!(pool.lock_group_shift_of(lv2), Some(0));
+        drop(pool);
+
+        let paths = collect_paths(&dir, &names);
+        let mut overrides = LockGroupOverrides::new();
+        overrides.insert(lv2, crate::ld::STRIPE_LOCK_GROUP_SHIFT_BATCHED);
+        let pool =
+            Pool::open_with_lock_group_overrides(open_paths(&paths).unwrap(), overrides).unwrap();
+        assert_eq!(
+            pool.lock_group_shift_of(lv2),
+            Some(crate::ld::STRIPE_LOCK_GROUP_SHIFT_BATCHED),
+            "the named mirror LD must pick up the override"
+        );
+        assert_eq!(
+            pool.lock_group_shift_of(meta),
+            Some(0),
+            "the OTHER mirror LD must keep the per-level default"
+        );
+        assert_eq!(pool.lock_group_shift_of(LdId::new_v4()), None);
+        drop(pool);
+
+        // A plain reopen with no overrides is back to the default everywhere.
+        let pool = Pool::open(open_paths(&paths).unwrap()).unwrap();
+        assert_eq!(pool.lock_group_shift_of(lv2), Some(0));
+    }
+
+    #[test]
+    fn lock_group_override_beyond_the_key_space_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let names = ["pd0", "pd1"];
+        let pool = Pool::create(
+            names.iter().map(|n| sparse(&dir, n)).collect(),
+            PoolConfig::default(),
+        )
+        .unwrap();
+        drop(pool);
+
+        let paths = collect_paths(&dir, &names);
+        let mut overrides = LockGroupOverrides::new();
+        // 32 erases the strip index out of `(set << 32) | strip` entirely.
+        overrides.insert(LdId::new_v4(), MAX_LOCK_GROUP_SHIFT + 1);
+        match Pool::open_with_lock_group_overrides(open_paths(&paths).unwrap(), overrides.clone()) {
+            Err(ChunkletError::Config(_)) => {}
+            Err(other) => panic!("expected a Config rejection, got {other:?}"),
+            Ok(_) => panic!("an out-of-range lock_group_shift must be rejected"),
+        }
+        // Rejected before the devices are claimed, and by both entry points.
+        assert!(Pool::open_with_missing_and_lock_group_overrides(
+            open_paths(&paths).unwrap(),
+            overrides
+        )
+        .is_err());
+        assert!(Pool::open(open_paths(&paths).unwrap()).is_ok());
     }
 
     #[test]
