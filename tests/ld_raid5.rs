@@ -8,10 +8,12 @@
 //! "this PD is gone" via direct chunklet IO.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use onyx_chunklet::io::RawDevice;
+use onyx_chunklet::error::ChunkletResult;
+use onyx_chunklet::io::{IoBackend, RawDevice, StripRead, StripWrite};
 use onyx_chunklet::ld::raid5::LdRaid5;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::{ChunkletState, BLOCK_SIZE};
@@ -20,6 +22,41 @@ use onyx_chunklet::{Pool, PoolConfig};
 use tempfile::TempDir;
 
 const PD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Counts batched read submits and the ops folded into them. The serial
+/// per-strip path goes straight to `read_chunklet_user` and never reaches
+/// `submit_reads`, so `ops` is exactly what was submitted together.
+struct CountingReadBackend {
+    inner: Arc<dyn IoBackend>,
+    submits: AtomicUsize,
+    ops: AtomicUsize,
+}
+
+impl CountingReadBackend {
+    fn new(inner: Arc<dyn IoBackend>) -> Self {
+        Self {
+            inner,
+            submits: AtomicUsize::new(0),
+            ops: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl IoBackend for CountingReadBackend {
+    fn name(&self) -> &'static str {
+        "counting-read"
+    }
+
+    fn submit_reads(&self, ops: &mut [StripRead<'_>]) -> ChunkletResult<()> {
+        self.submits.fetch_add(1, Ordering::Relaxed);
+        self.ops.fetch_add(ops.len(), Ordering::Relaxed);
+        self.inner.submit_reads(ops)
+    }
+
+    fn submit_writes_detailed(&self, ops: &[StripWrite<'_>]) -> Vec<ChunkletResult<()>> {
+        self.inner.submit_writes_detailed(ops)
+    }
+}
 
 fn make_pool(dir: &TempDir, n_pds: usize) -> (Arc<Pool>, Vec<PathBuf>) {
     let mut raws = Vec::new();
@@ -178,6 +215,156 @@ fn raid5_partial_rmw_preserves_other_positions() {
         .read_chunklet_user(parity_member.chunklet_index, 0, &mut new_d1)
         .unwrap();
     assert!(new_d1.iter().all(|&b| b == 0xbb));
+}
+
+/// A read wider than the strip it starts in must still be ONE submit.
+///
+/// `read_many_at` used to batch an op only when it was *exactly* one strip *at*
+/// a strip boundary; everything else fell to `read_at`'s strip-by-strip walk,
+/// which issues one direct `read_chunklet_user` per strip and never reaches
+/// `submit_reads`. So a "batched" read of N strips was N sequential device IOs.
+/// R6 was measured paying exactly that on the onyx read path; R5 carried the
+/// same defect. `ops` below asserted 0 before the fix.
+#[test]
+fn raid5_read_many_batches_strip_crossing_ops_in_one_submit() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let full_stripe = 3 * strip;
+    let payload: Vec<u8> = (0..2 * full_stripe)
+        .map(|i| ((i * 23 + 5) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+
+    let inner = pool.pd(pool.list_pds()[0].pd_id).unwrap().backend();
+    let counting = Arc::new(CountingReadBackend::new(inner));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(counting.clone());
+    }
+
+    // (offset, len, expected strip segments): straddling a strip boundary, a
+    // whole full stripe, crossing the full-stripe boundary, and one
+    // non-crossing op for contrast.
+    let cases: [(u64, usize, usize); 4] = [
+        ((strip - block) as u64, 2 * block, 2),
+        (0, full_stripe, 3),
+        ((full_stripe - block) as u64, 2 * block, 2),
+        ((strip + 4 * block) as u64, block, 1),
+    ];
+    let expected_segments: usize = cases.iter().map(|&(_, _, segs)| segs).sum();
+
+    let mut bufs: Vec<Vec<u8>> = cases.iter().map(|&(_, len, _)| vec![0u8; len]).collect();
+    let mut ops: Vec<(u64, &mut [u8])> = cases
+        .iter()
+        .map(|&(offset, _, _)| offset)
+        .zip(bufs.iter_mut().map(Vec::as_mut_slice))
+        .collect();
+    ld.read_many_at(&mut ops).unwrap();
+    drop(ops);
+
+    for (&(offset, len, _), got) in cases.iter().zip(&bufs) {
+        assert_eq!(got, &payload[offset as usize..offset as usize + len]);
+    }
+    assert_eq!(counting.submits.load(Ordering::Relaxed), 1);
+    assert_eq!(counting.ops.load(Ordering::Relaxed), expected_segments);
+}
+
+/// The same carve-then-submit applies to a single multi-strip `read_at`.
+#[test]
+fn raid5_read_at_multi_strip_is_one_submit() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let payload: Vec<u8> = (0..3 * strip)
+        .map(|i| ((i * 29 + 3) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+
+    let inner = pool.pd(pool.list_pds()[0].pd_id).unwrap().backend();
+    let counting = Arc::new(CountingReadBackend::new(inner));
+    for info in pool.list_pds() {
+        pool.pd(info.pd_id).unwrap().set_backend(counting.clone());
+    }
+
+    // Starts mid-strip and runs past two boundaries: 3 segments.
+    let offset = (strip - block) as u64;
+    let len = strip + 2 * block;
+    let mut got = vec![0u8; len];
+    ld.read_at(offset, &mut got).unwrap();
+
+    assert_eq!(got, payload[offset as usize..offset as usize + len]);
+    assert_eq!(counting.submits.load(Ordering::Relaxed), 1);
+    assert_eq!(counting.ops.load(Ordering::Relaxed), 3);
+}
+
+/// Degraded set: a strip-crossing read whose segments include the open-failed
+/// data position. That segment is reconstructed inline at its own sub-strip
+/// offset (no full-strip scratch), the healthy ones still batch.
+#[test]
+fn raid5_read_many_strip_crossing_over_failed_position() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let full_stripe = 3 * strip;
+    let payload: Vec<u8> = (0..full_stripe)
+        .map(|i| ((i * 37 + 17) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    let mut pds = pds_map(&pool);
+    pds.remove(&desc.members[0].pd);
+    let r5 = LdRaid5::open(desc, &pds).unwrap();
+
+    // Spans data positions 0 (failed), 1 and 2, starting mid-strip so the
+    // reconstructed segment is a partial strip.
+    let offset = (strip / 2) as u64;
+    let len = full_stripe - strip / 2;
+    let mut got = vec![0u8; len];
+    let mut ops = [(offset, got.as_mut_slice())];
+    r5.read_many_at(&mut ops).unwrap();
+    drop(ops);
+    assert_eq!(got, payload[offset as usize..offset as usize + len]);
+}
+
+/// Runtime fault (member still believed healthy) on a strip-crossing batch:
+/// the carved batch falls back to the per-segment reconstruct, which must
+/// rebuild each sub-strip range rather than assuming full strips.
+#[test]
+fn raid5_read_many_strip_crossing_runtime_fault_reconstructs() {
+    let dir = TempDir::new().unwrap();
+    let (pool, _) = make_pool(&dir, 4);
+    let id = pool.create_ld(LdSpec::raid5(3, 1, 1, 16)).unwrap();
+    let ld = pool.open_ld(id).unwrap();
+    let block = BLOCK_SIZE as usize;
+    let strip = 16 * block;
+    let payload: Vec<u8> = (0..3 * strip)
+        .map(|i| ((i * 41 + 19) % 251) as u8)
+        .collect();
+    ld.write_at(0, &payload).unwrap();
+    drop(ld);
+
+    let desc = pool.find_ld(id).unwrap();
+    pool.pd(desc.members[1].pd).unwrap().set_read_faulting(true);
+    let r5 = LdRaid5::open(desc, &pds_map(&pool)).unwrap();
+
+    let offset = (strip - block) as u64;
+    let len = strip + 2 * block;
+    let mut got = vec![0u8; len];
+    let mut ops = [(offset, got.as_mut_slice())];
+    r5.read_many_at(&mut ops).unwrap();
+    drop(ops);
+    assert_eq!(got, payload[offset as usize..offset as usize + len]);
 }
 
 #[test]

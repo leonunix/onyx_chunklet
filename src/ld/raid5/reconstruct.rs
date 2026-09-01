@@ -86,9 +86,10 @@ impl LdRaid5 {
         Ok(())
     }
 
-    /// Fallback for the fast batched read (`read_many_at`) when a member returns
-    /// a runtime read fault: re-read each full-strip op, reconstructing any that
-    /// fault from parity + surviving data (R5 budget 1). Good ops just re-read
+    /// Fallback for the fast batched read (`read_at` / `read_many_at`) when a
+    /// member returns a runtime read fault: re-read each carved segment (any
+    /// block-aligned range within one strip), reconstructing the ones that fault
+    /// from parity + surviving data (R5 budget 1). Good ops just re-read
     /// (bounded extra IO on the error path). A 2nd fault in a set — an
     /// open-failed data member, or a fault on parity/another strip during
     /// reconstruct — surfaces the error (over budget). Suspects are reported on

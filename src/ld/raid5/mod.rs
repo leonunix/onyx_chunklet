@@ -251,6 +251,70 @@ impl LdRaid5 {
         }
     }
 
+    /// Carve one op's `buf` into its strip-bounded segments and push the healthy
+    /// ones onto `out` as `StripRead`s, so a caller can submit every segment of
+    /// every op in ONE cross-PD batch. Mirrors `LdRaid6::carve_reads`.
+    ///
+    /// Without this, `read_many_at` only batched an op that was *exactly* one
+    /// strip *at* a strip boundary; everything else fell to `read_at`'s
+    /// strip-by-strip walk, which issues one direct `read_chunklet_user` per
+    /// strip and never reaches `submit_reads`. A batch of N strips then cost N
+    /// sequential device IOs. R6 was measured paying exactly that on the onyx
+    /// read path (4 KiB strips vs. multi-strip compression units).
+    ///
+    /// Segments on an open-failed data position have no strip to read, so they
+    /// are reconstructed inline here and left out of the batch —
+    /// `reconstruct_data` accepts any block-aligned length at
+    /// `in_chunklet_off`, so a partial strip needs no scratch buffer.
+    fn carve_reads<'b>(
+        &self,
+        offset: u64,
+        buf: &'b mut [u8],
+        out: &mut Vec<StripRead<'b>>,
+        ctxs: &mut Vec<(usize, usize)>,
+    ) -> ChunkletResult<()> {
+        let mut cursor = offset;
+        let mut rest: &'b mut [u8] = buf;
+        while !rest.is_empty() {
+            let addr = self.locate(cursor);
+            let strip_remaining = self.strip_bytes - addr.in_strip_off;
+            let take = std::cmp::min(rest.len() as u64, strip_remaining) as usize;
+            let (head, tail) = rest.split_at_mut(take);
+            rest = tail;
+            cursor += take as u64;
+            if self.data_position_failed(addr.set_idx, addr.data_pos) {
+                self.reconstruct_data(addr.set_idx, addr.data_pos, addr.in_chunklet_off, head)?;
+                continue;
+            }
+            let m = self.member_idx_data(addr.set_idx, addr.data_pos);
+            let pd = self.member_pd(m)?;
+            out.push(StripRead {
+                pd: pd.clone(),
+                chunklet_index: self.desc.members[m].chunklet_index,
+                in_chunklet_off: addr.in_chunklet_off,
+                data: head,
+            });
+            // Parallel to `out`: the reconstruct-on-EIO fallback rebuilds exactly
+            // this sub-strip range from parity + survivors (R5 budget 1).
+            ctxs.push((addr.set_idx, addr.data_pos));
+        }
+        Ok(())
+    }
+
+    /// Submit a carved batch, falling back to the per-segment reconstruct when a
+    /// member faults at runtime.
+    fn submit_carved_reads(
+        &self,
+        reads: &mut [StripRead<'_>],
+        ctxs: &[(usize, usize)],
+    ) -> ChunkletResult<()> {
+        match parallel_strip_reads(reads) {
+            Ok(()) => Ok(()),
+            Err(e) if is_runtime_read_fault(&e) => self.reconstruct_read_batch(reads, ctxs),
+            Err(e) => Err(e),
+        }
+    }
+
     fn set_being_rebuilt(&self, set_idx: usize) -> bool {
         self.rebuild
             .read()
@@ -473,107 +537,28 @@ impl LogicalDisk for LdRaid5 {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ChunkletResult<()> {
         self.ensure_aligned(offset, buf.len())?;
-        let mut remaining = buf.len();
-        let mut cursor = offset;
-        let mut buf_start = 0usize;
-        while remaining > 0 {
-            let addr = self.locate(cursor);
-            let strip_remain = self.strip_bytes - addr.in_strip_off;
-            let take = std::cmp::min(remaining as u64, strip_remain) as usize;
-            if self.data_position_failed(addr.set_idx, addr.data_pos) {
-                // Degraded read: reconstruct the full strip on a temp buffer,
-                // then slice out the in_strip_off..in_strip_off+take range.
-                let strip_len = self.strip_bytes as usize;
-                let mut tmp = vec![0u8; strip_len];
-                self.reconstruct_data(
-                    addr.set_idx,
-                    addr.data_pos,
-                    addr.in_chunklet_off - addr.in_strip_off,
-                    &mut tmp,
-                )?;
-                buf[buf_start..buf_start + take].copy_from_slice(
-                    &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
-                );
-            } else {
-                match self.read_data_strip(
-                    addr.set_idx,
-                    addr.data_pos,
-                    addr.in_chunklet_off,
-                    &mut buf[buf_start..buf_start + take],
-                ) {
-                    Ok(()) => {}
-                    Err(e) if is_runtime_read_fault(&e) => {
-                        // The data member faulted although the LD still believes
-                        // it healthy (dead-but-not-yet-isolated). Within R5's
-                        // budget of 1 — i.e. no data position is already
-                        // open-failed — reconstruct the strip from parity + the
-                        // surviving data. A 2nd fault (open-failed member, or a
-                        // fault on parity/another strip mid-reconstruct) surfaces
-                        // the error (over budget). Emit a suspect so the fault
-                        // also drives isolation from the read side.
-                        if !self.failed_data_positions(addr.set_idx).is_empty() {
-                            return Err(e);
-                        }
-                        let strip_len = self.strip_bytes as usize;
-                        let mut tmp = vec![0u8; strip_len];
-                        self.reconstruct_data(
-                            addr.set_idx,
-                            addr.data_pos,
-                            addr.in_chunklet_off - addr.in_strip_off,
-                            &mut tmp,
-                        )?;
-                        buf[buf_start..buf_start + take].copy_from_slice(
-                            &tmp[addr.in_strip_off as usize..addr.in_strip_off as usize + take],
-                        );
-                        self.report_read_suspect(self.member_idx_data(addr.set_idx, addr.data_pos));
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            buf_start += take;
-            cursor += take as u64;
-            remaining -= take;
-        }
-        Ok(())
+        // A contiguous op walks distinct strips, so its segments never collide:
+        // carve them all and submit once instead of one device IO per strip.
+        let mut reads: Vec<StripRead> = Vec::new();
+        let mut ctxs: Vec<(usize, usize)> = Vec::new();
+        self.carve_reads(offset, buf, &mut reads, &mut ctxs)?;
+        self.submit_carved_reads(&mut reads, &ctxs)
     }
 
     fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> ChunkletResult<()> {
         for (offset, buf) in ops.iter() {
             self.ensure_aligned(*offset, buf.len())?;
         }
-        let mut reads = Vec::with_capacity(ops.len());
-        // Parallel to `reads`: (set_idx, data_pos) so the reconstruct-on-EIO
-        // fallback can rebuild a faulting strip from parity + survivors. Every
-        // batched read is a full strip at a strip boundary of a healthy data
-        // position, so reconstruct writes straight into the read's buffer.
+        // Carve every op into strip segments and submit all of them together.
+        // `mem::take` lifts each `&mut [u8]` out of `ops` at its original
+        // lifetime so the carved segments outlive the per-op iteration.
+        let mut reads: Vec<StripRead> = Vec::with_capacity(ops.len());
         let mut ctxs: Vec<(usize, usize)> = Vec::new();
-        for (offset, buf) in ops.iter_mut() {
-            if buf.len() != self.strip_bytes as usize {
-                self.read_at(*offset, buf)?;
-                continue;
-            }
-            let addr = self.locate(*offset);
-            if addr.in_strip_off != 0 || self.data_position_failed(addr.set_idx, addr.data_pos) {
-                self.read_at(*offset, buf)?;
-                continue;
-            }
-            let m = self.member_idx_data(addr.set_idx, addr.data_pos);
-            let pd = self.members[m]
-                .as_ref()
-                .expect("healthy read_many path requires data PD healthy");
-            reads.push(StripRead {
-                pd: pd.clone(),
-                chunklet_index: self.desc.members[m].chunklet_index,
-                in_chunklet_off: addr.in_chunklet_off,
-                data: &mut **buf,
-            });
-            ctxs.push((addr.set_idx, addr.data_pos));
+        for (offset, buf_ref) in ops.iter_mut() {
+            let buf: &mut [u8] = std::mem::take(buf_ref);
+            self.carve_reads(*offset, buf, &mut reads, &mut ctxs)?;
         }
-        match parallel_strip_reads(&mut reads) {
-            Ok(()) => Ok(()),
-            Err(e) if is_runtime_read_fault(&e) => self.reconstruct_read_batch(&mut reads, &ctxs),
-            Err(e) => Err(e),
-        }
+        self.submit_carved_reads(&mut reads, &ctxs)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> ChunkletResult<()> {
