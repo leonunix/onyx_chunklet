@@ -18,6 +18,10 @@ name = "chunklet-soak"
 path = "src/bin/chunklet_soak.rs"
 
 [[bin]]
+name = "chunklet-parity-bench"
+path = "src/bin/parity_bench.rs"
+
+[[bin]]
 name = "chunklet-perf"
 path = "src/bin/chunklet_perf.rs"
 
